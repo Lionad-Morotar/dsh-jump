@@ -2,7 +2,7 @@
  * Client wiring: folds real KeyboardEvents through matchKey and owns every DOM
  * side effect, so the state machine stays pure and realm-agnostic.
  *
- * The keydown listener is capture-phase and eats every consumed stroke with
+ * The keydown listener is capture-phase and eats every stroke it owns with
  * preventDefault plus stopPropagation: dsh-vscode-keyboard listens on window
  * bubble and forwards keydowns whose defaultPrevented is false, so an
  * unconsumed Cmd+H/Cmd+U or label stroke would leak into the embedded VS Code
@@ -124,10 +124,20 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           shiftKey: event.shiftKey,
           isComposing: event.isComposing,
         };
+        const wasActive = state.mode !== "idle";
         const action = matchKey(state, like, hints.map((hint) => hint.label));
-        if (action.type === "ignore") return;
-        event.preventDefault();
-        event.stopPropagation();
+        // While a mode is active every keydown belongs to jump, even the
+        // ones matchKey ignores (Enter, arrows, off-row keys): a leaked
+        // Enter would submit a focused composer and arrow scrolling would
+        // move the page under the frozen label snapshot.
+        if (wasActive || action.type !== "ignore") {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        if (action.type === "ignore") {
+          if (state.pending !== before) overlay.render(hints, state.pending);
+          return;
+        }
 
         if (action.type === "activate-click" || action.type === "activate-focus") {
           hints = collectRound();
@@ -138,10 +148,12 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           overlay.destroy();
           return;
         }
-        if (state.pending !== "") {
+        if (state.pending !== before) {
+          // The prefix changed (extended, or reset by a dead-end key), so
+          // the lit/dim split must mirror the live prefix again.
           overlay.render(hints, state.pending);
-          return;
         }
+        if (state.pending !== "") return;
         // A completed label ends the round: matchKey already cleared the
         // prefix, so the full typed label is the pre-stroke prefix plus key.
         const typed = before + action.key;

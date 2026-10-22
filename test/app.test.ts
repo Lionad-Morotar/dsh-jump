@@ -149,3 +149,86 @@ describe("createApp wiring", () => {
     teardown();
   });
 });
+
+describe("active-mode key swallowing", () => {
+  it("Enter in a focused input is eaten while click mode is active", () => {
+    const input = doc.createElement("input");
+    input.value = "draft";
+    place(input, 5, 5);
+    doc.body.append(input);
+    const pageClick = vi.fn();
+    doc.body.addEventListener("click", pageClick);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    input.focus();
+
+    activate();
+    const e = keydown({ key: "Enter" });
+    input.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(true);
+    expect(input.value).toBe("draft");
+    expect(pageClick).not.toHaveBeenCalled();
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    teardown();
+    doc.body.removeEventListener("click", pageClick);
+  });
+
+  it("a dead-end key clears pending and relights every badge", () => {
+    buttons(12);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    activate();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    let root = overlayRoot();
+    const dim = (label: string): string | undefined => {
+      const kids = [...(root?.children ?? [])] as HTMLElement[];
+      return kids.find((b) => b.dataset.jumpLabel === label)?.style.opacity;
+    };
+    expect(dim("ad")).toBe("1");
+    expect(dim("sd")).toBe("0.3");
+
+    // "x" is off the home row, so it can never extend "a" to a label.
+    win.dispatchEvent(keydown({ key: "x" }));
+    root = overlayRoot();
+    expect(root).not.toBeNull();
+    expect(dim("ad")).toBe("1");
+    expect(dim("sd")).toBe("1");
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    teardown();
+  });
+});
+
+describe("focus mode (Cmd+U)", () => {
+  it("Cmd+U then full label focuses the target and tears down overlay", () => {
+    const input = doc.createElement("input");
+    place(input, 5, 5);
+    doc.body.append(input);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    expect(overlayRoot()).not.toBeNull();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(doc.activeElement).toBe(input);
+    expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+
+  it("after a focus hit the mode is idle: bare keys are not eaten", () => {
+    const input = doc.createElement("input");
+    place(input, 5, 5);
+    doc.body.append(input);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(doc.activeElement).toBe(input);
+
+    const e = keydown({ key: "a" });
+    win.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(false);
+    expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+});
