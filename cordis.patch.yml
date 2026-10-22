@@ -1,0 +1,4 @@
+# Enable dsh-jump by inserting its Loader row.
+- insert:
+    - id: jump
+      name: 'dsh-jump'
