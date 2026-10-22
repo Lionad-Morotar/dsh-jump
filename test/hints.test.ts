@@ -101,20 +101,21 @@ describe("label assignment", () => {
     expect(hints.map((h) => h.label)).toEqual([...HOME_ROW_KEYS]);
   });
 
-  it("goes to ordered two-key labels from the tenth hint", () => {
+  it("gives every hint an equal-length two-key label once there are more than nine", () => {
     const els = buttons(11);
     const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
     const labels = hints.map((h) => h.label);
-    expect(labels[9]).toBe("as");
-    expect(labels[10]).toBe("ad");
+    expect(labels.every((label) => label.length === 2)).toBe(true);
+    expect(labels[0]).toBe("as");
+    expect(labels[1]).toBe("ad");
   });
 
   it("extends to three-key labels after the two-key space is exhausted", () => {
-    const els = buttons(9 + 81 + 1);
+    const els = buttons(81 + 1);
     const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
     const labels = hints.map((h) => h.label);
-    expect(labels[9 + 81 - 1]).toBe("ll");
-    expect(labels[9 + 81]).toBe("asa");
+    expect(labels[81 - 1]).toBe("ll");
+    expect(labels[81]).toBe("asa");
   });
 
   it("produces unique labels", () => {

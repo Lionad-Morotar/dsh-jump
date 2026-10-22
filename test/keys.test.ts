@@ -63,6 +63,18 @@ describe("label prefix matching", () => {
     expect(state.pending).toBe("");
   });
 
+  it("treats a pure two-key label set as prefixes until the second key lands", () => {
+    // collectHints hands out equal-length two-key labels past nine hints, so
+    // the first character must stay pending instead of completing a hit.
+    const labels = ["as", "ad", "sd"];
+    const state = createKeyState();
+    matchKey(state, key(ACTIVATION_CLICK, { metaKey: true }));
+    expect(matchKey(state, key("s"), labels)).toEqual({ type: "label", key: "s" });
+    expect(state.pending).toBe("s");
+    expect(matchKey(state, key("d"), labels)).toEqual({ type: "label", key: "d" });
+    expect(state.pending).toBe("");
+  });
+
   it("a key matching no label resets the pending prefix", () => {
     const labels = ["as"];
     const state = createKeyState();

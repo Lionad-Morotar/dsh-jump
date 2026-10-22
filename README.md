@@ -3,7 +3,9 @@
 Keyboard jump navigation for the DeepSeek Harness Web GUI.
 
 - **Cmd+H** activates click mode: every interactive element in the viewport
-  gets a home-row label (`a s d f g h j k l`, then ordered two-key labels).
+  gets a home-row label (up to nine hints get `a s d f g h j k l`; past nine,
+  every hint gets an equal-length ordered two-key label so no single-key
+  label can shadow the first character of a longer one).
   Type a label to click that element.
 - **Cmd+U** activates focus mode: same labels, but the matched element is
   focused instead of clicked.
