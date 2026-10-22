@@ -21,13 +21,10 @@ export interface JumpConfig {
   activationFocus: string;
   /** Selector that enumerates labelable elements. */
   candidateSelector: string;
-  /** Extra selector whose matches are also labelable. */
-  extraSelector: string;
 }
 
 export const DEFAULT_CONFIG: JumpConfig = {
   activationClick: ACTIVATION_CLICK,
   activationFocus: ACTIVATION_FOCUS,
   candidateSelector: "a[href], button, input, select, textarea, [role=button], [role=link], [role=tab], [tabindex]",
-  extraSelector: "",
 };
