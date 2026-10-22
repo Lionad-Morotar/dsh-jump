@@ -12,9 +12,53 @@ Keyboard jump navigation for the DeepSeek Harness Web GUI.
 - **Esc** (or any meta chord, or pressing the activation key again) leaves
   jump mode.
 
-This slice ships the pure logic (viewport/visibility filtering, nested-target
-dedupe, label assignment, key state machine) plus the package scaffold; the
-DOM overlay wiring arrives in a later slice.
+Labels are rendered as an overlay by the client entry; while jump mode is
+active all keydown events are consumed by the state machine, so typing inside
+a focused input never leaks through.
+
+## v1 boundaries
+
+- Hints are snapshotted at the moment of activation: elements that appear or
+  move after activation do not get labels until you re-activate.
+- The Cmd+H / Cmd+U activation keys are fixed in v1; if a host bundle ever
+  claims these chords first, remapping via package config is a follow-up.
+- Web profile only: this plugin targets the DSH Web GUI and is not wired into
+  the desktop profile.
+
+## Install (web profile)
+
+Same as the skin packages, two ways:
+
+**A. As a profile dependency (recommended)**
+
+Add to `~/.dsh/profiles/web/package.json`:
+
+```json
+{
+  "dependencies": {
+    "dsh-jump": "link:/Users/lionad/Github/Lionad-Morotar/dsh-plugins/packages/dsh-jump"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["...", "dsh-jump"]
+    }
+  }
+}
+```
+
+Then `dsh plugin --profile web install` and restart DSH.
+
+**B. Manual patch**
+
+Append to the profile's `cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: dsh-jump
+      name: 'dsh-jump'
+```
+
+The top level of that file must always stay a YAML array (`[]` when empty).
 
 ## Layout
 
