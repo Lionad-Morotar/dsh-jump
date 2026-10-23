@@ -54,7 +54,7 @@ Append to the profile's `cordis.patch.yml`:
 
 ```yaml
 - insert:
-    - id: dsh-jump
+    - id: jump
       name: 'dsh-jump'
 ```
 
