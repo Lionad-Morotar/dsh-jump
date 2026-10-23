@@ -6,16 +6,19 @@
 import type { JumpConfig } from "./config.ts";
 import { createApp } from "./app.ts";
 
-export interface ClientContext {
-  config?: JumpConfig;
-}
-
-/** The object the loader factory returns; shape mirrors the host half. */
+/**
+ * The object the loader factory returns; shape mirrors the host half.
+ *
+ * cordis calls `apply(ctx, config)` — the context first, this plugin's config
+ * second. Reading config off the first argument throws ("cannot get property
+ * without inject") and takes the whole web boot down with it, so the context
+ * stays untouched here.
+ */
 export const clientPlugin = {
   name: "dsh-jump",
   inject: [] as string[],
-  apply(ctx: ClientContext = {}): () => void {
-    return createApp({ config: ctx?.config }).apply();
+  apply(_ctx: unknown, config?: JumpConfig): () => void {
+    return createApp({ config }).apply();
   },
 };
 
