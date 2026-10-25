@@ -9,7 +9,7 @@ import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { collectHints } from "../src/client/hints.ts";
-import { HOME_ROW_KEYS } from "../src/client/config.ts";
+import { CANDIDATE_SELECTOR, HOME_ROW_KEYS } from "../src/client/config.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -124,3 +124,49 @@ describe("label assignment", () => {
     expect(new Set(labels).size).toBe(labels.length);
   });
 });
+
+describe("text entry hosts in a real composer shape", () => {
+  it("labels the composer host, not the Lexical chip inside it", () => {
+    // 真实 composer：可编辑宿主里嵌 contenteditable=false 的 chip。
+    // 宿主与 chip 是同一条祖先链上的一对候选，最深优先会选 chip——除非
+    // 选择器把 contenteditable=false 排除掉。
+    const host = document.createElement("div");
+    host.setAttribute("contenteditable", "true");
+    host.setAttribute("role", "textbox");
+    host.setAttribute("data-composer-input", "true");
+    place(host, 100, 500, 600, 36);
+    const chip = document.createElement("span");
+    chip.setAttribute("contenteditable", "false");
+    place(chip, 110, 506, 60, 20);
+    host.append(chip);
+    document.body.append(host);
+
+    const hints = collectHints(
+      () => Array.from(document.querySelectorAll(CANDIDATE_SELECTOR)),
+      VIEWPORT,
+      { isVisible: visible },
+    );
+    expect(hints.map((h) => h.element)).toEqual([host]);
+  });
+
+  it("finds the composer when the whole document is queried, as the runtime does", () => {
+    // 回归钉子：composer 曾因选择器只认 HTML 控件而整轮不可达。
+    const composer = document.createElement("div");
+    composer.setAttribute("contenteditable", "true");
+    composer.setAttribute("role", "textbox");
+    place(composer, 100, 500, 600, 36);
+    document.body.append(composer);
+    const button = document.createElement("button");
+    place(button, 10, 10);
+    document.body.append(button);
+
+    const hints = collectHints(
+      () => Array.from(document.querySelectorAll(CANDIDATE_SELECTOR)),
+      VIEWPORT,
+      { isVisible: visible },
+    );
+    // 文档顺序即 label 顺序：composer 先插入，所以它拿到首键。
+    expect(hints.map((h) => h.element)).toEqual([composer, button]);
+  });
+});
+
