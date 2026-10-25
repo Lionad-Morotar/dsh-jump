@@ -12,50 +12,66 @@
  * 所以这里只读元素自身的静态特征。
  */
 
+import { TEXT_ENTRY_ROLES } from "./config.ts";
+
 /** 一个目标需要哪种动作才能"被跳到"。 */
 export type Activation = "click" | "focus";
 
-/** 带文本光标的 input 类型；其余类型（checkbox/range/file…）没有光标。 */
-const CARET_INPUT_TYPES = new Set(["text", "search", "url", "tel", "email", "password", "number"]);
+/**
+ * 带文本光标的 input 类型。
+ *
+ * 日期时间五类型（date/month/week/time/datetime-local）无 `selectionStart`
+ * 但确有分段编辑（方向键跳段、数字键入），语义上是文本输入面；而且合成 click
+ * 无法聚焦它们，归 click 会让 click 模式跳过去毫无反应。
+ */
+const CARET_INPUT_TYPES = new Set([
+  "text",
+  "search",
+  "url",
+  "tel",
+  "email",
+  "password",
+  "number",
+  "date",
+  "month",
+  "week",
+  "time",
+  "datetime-local",
+]);
 
 /** 天生就是文本输入面的标签。 */
 const TEXT_ENTRY_TAGS = new Set(["TEXTAREA"]);
 
-/** 声明自己是文本输入面的 ARIA 角色。 */
-const TEXT_ENTRY_ROLES = new Set(["textbox", "searchbox", "combobox"]);
-
-function contentEditableValue(element: Element): string | null {
-  const raw = element.getAttribute("contenteditable");
-  if (raw === null) return null;
-  // contenteditable 是枚举属性：空串与 "true" 都表示可编辑，只有 "false" 关闭。
-  // 大小写不敏感（HTML 属性值），所以先归一。
-  return raw.trim().toLowerCase();
-}
-
 function isEditable(element: Element): boolean {
-  const value = contentEditableValue(element);
-  return value !== null && value !== "false";
+  const raw = element.getAttribute("contenteditable");
+  if (raw === null) return false;
+  // contenteditable 是枚举属性：空串与 "true" 都表示可编辑，只有 "false" 关闭。
+  // 属性值大小写不敏感，所以先归一。
+  return raw.trim().toLowerCase() !== "false";
 }
 
 /**
  * 判定一个元素要哪种动作。
  *
- * 顺序即优先级：先认 contenteditable 与 role，再按标签分流——一个
- * <div contenteditable role=button> 之类的不存在，但 role 比标签更靠得住
- * （framework 常用 div 承担语义）。
+ * 顺序即优先级：先认 contenteditable（最强的可编辑信号），再按标签分流，最后才
+ * 看 role。标签优先于文本输入面 role，是为了处理 `<button role=combobox>` 这种
+ * ARIA 上合法、但交互上是按钮的形态——按钮没有光标，聚焦它什么都不发生，只有
+ * 真实点击才展开它的弹出层。
  */
 export function activationOf(element: Element): Activation {
   if (isEditable(element)) return "focus";
 
-  const role = element.getAttribute("role");
-  if (role !== null && TEXT_ENTRY_ROLES.has(role.toLowerCase())) return "focus";
-
   const tag = element.tagName;
-  if (TEXT_ENTRY_TAGS.has(tag)) return "focus";
   if (tag === "INPUT") {
     // 缺省 type 就是 text：getAttribute 为 null 时不能当作"没有类型"。
     const type = (element.getAttribute("type") ?? "text").trim().toLowerCase();
     return CARET_INPUT_TYPES.has(type) ? "focus" : "click";
+  }
+  if (TEXT_ENTRY_TAGS.has(tag)) return "focus";
+
+  const role = element.getAttribute("role");
+  if (role !== null && (TEXT_ENTRY_ROLES as readonly string[]).includes(role.trim().toLowerCase())) {
+    return "focus";
   }
 
   return "click";

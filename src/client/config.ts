@@ -24,21 +24,67 @@ export interface JumpConfig {
 }
 
 /**
+ * Widget roles whose whole purpose is "activate me".
+ *
+ * An explicit list rather than a `[role]:not([role=none])` broad match, so
+ * decorative and landmark roles (`img`, `status`, `alert`, `tooltip`,
+ * `navigation`, `tabpanel`…) never get a label.
+ *
+ * Deliberately absent: `row`, `columnheader` and `gridcell`. Those are
+ * structure, not targets — a row is a container and a column header is a label.
+ * A cell only becomes interactive inside an interactive grid, and a grid that
+ * makes its cells reachable also gives them a tabindex (usually a roving one),
+ * which the `[tabindex]` branch already catches. Including them would hand
+ * dead labels to every presentational table, because hint collection only
+ * reconciles a row that actually contains a deeper candidate.
+ */
+const ACTIVATABLE_ROLES = [
+  "button",
+  "link",
+  "tab",
+  "treeitem",
+  "option",
+  "menuitem",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "checkbox",
+  "radio",
+  "switch",
+  "slider",
+  "spinbutton",
+] as const;
+
+/**
+ * Roles that promise a text caret, for hosts that are neither a form control
+ * nor `contenteditable`.
+ *
+ * Single source: `target.ts` reads this to decide focus-vs-click, so a role
+ * can never be labelable while being classified the wrong way.
+ *
+ * `combobox` is deliberately absent. ARIA defines it as a composite
+ * "textbox + popup list", and the common rendering puts it on the button that
+ * opens the popup. Classifying that as focus would leave a label that neither
+ * mode can honour: focus does nothing to a button, and only a click opens it.
+ * A combobox that really is editable carries `contenteditable` and is caught
+ * there instead.
+ */
+export const TEXT_ENTRY_ROLES = ["textbox", "searchbox"] as const;
+
+/**
  * The labelable surface.
  *
  * Three families, each earning its place from a real gap rather than from a
  * completeness instinct:
  *
  * - Native controls and anything carrying a tabindex (the original set).
- * - Every ARIA widget role the Harness actually renders. The sidebar's project
- *   and session rows are `div[role=treeitem]` with no tabindex at all, and a
- *   disclosure is a `<summary>`: all clickable, none matching a native
- *   selector. Real-browser measurement over the DSH web GUI found these were
- *   the only visible `cursor: pointer` elements the original selector missed.
+ * - The ARIA widget roles above. The sidebar's project and session rows are
+ *   `div[role=treeitem]` with no tabindex at all, and a disclosure is a
+ *   `<summary>`: all clickable, none matching a native selector.
+ *   Real-browser measurement over the DSH web GUI found these were the only
+ *   visible `cursor: pointer` elements the original selector missed.
  * - Text entry hosts. The composer is a Lexical-managed
- *   `div[contenteditable=true][role=textbox]`: no tag, no role, and no
- *   tabindex attribute in the original set, so it was unreachable from the
- *   keyboard entirely.
+ *   `div[contenteditable=true][role=textbox]`: no tag and no tabindex
+ *   attribute, so it was unreachable from the keyboard entirely.
  *
  * `contenteditable=false` is excluded on purpose: Lexical marks chips and
  * command tokens inside the composer with it, and hint collection keeps only
@@ -58,29 +104,8 @@ export const CANDIDATE_SELECTOR = [
   "[tabindex]",
   // Editable hosts; the negative branch keeps Lexical chips out.
   "[contenteditable]:not([contenteditable=false])",
-  // ARIA widget roles. Kept as an explicit list rather than a
-  // `[role]:not([role=none])` broad match so decorative and landmark roles
-  // (img, status, alert, tooltip, navigation, tabpanel…) never get a label.
-  "[role=button]",
-  "[role=link]",
-  "[role=tab]",
-  "[role=treeitem]",
-  "[role=option]",
-  "[role=menuitem]",
-  "[role=menuitemcheckbox]",
-  "[role=menuitemradio]",
-  "[role=checkbox]",
-  "[role=radio]",
-  "[role=switch]",
-  "[role=slider]",
-  "[role=spinbutton]",
-  "[role=gridcell]",
-  "[role=columnheader]",
-  "[role=row]",
-  // Text entry roles, for hosts that are neither a form control nor editable.
-  "[role=textbox]",
-  "[role=searchbox]",
-  "[role=combobox]",
+  ...ACTIVATABLE_ROLES.map((role) => `[role=${role}]`),
+  ...TEXT_ENTRY_ROLES.map((role) => `[role=${role}]`),
 ].join(", ");
 
 export const DEFAULT_CONFIG: JumpConfig = {

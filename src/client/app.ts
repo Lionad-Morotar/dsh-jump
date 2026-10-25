@@ -102,6 +102,11 @@ function fireClickSequence(element: Element, cx: number, cy: number): void {
  * The caret is only moved when the target does not already own it: if the user
  * is typing in the field and asks jump to bring them back, the offset they left
  * is theirs.
+ *
+ * The selection is only touched once focus is confirmed to have landed. A host
+ * that claims a text-entry role but is not actually focusable (no tabindex, an
+ * aria mistake) would otherwise get its whole content highlighted while the
+ * real focus stayed where it was, leaving a stray blue band and no jump.
  */
 function focusTextEntry(element: Element, doc: Document): void {
   const el = element as HTMLElement;
@@ -109,6 +114,9 @@ function focusTextEntry(element: Element, doc: Document): void {
   // The user already typing here means the caret is where they left it.
   if (doc.activeElement === element) return;
   el.focus();
+  // focus() is a silent no-op when the element cannot take focus; only a target
+  // that really took it should get a caret.
+  if (doc.activeElement !== element) return;
   const selection = doc.getSelection?.() ?? null;
   if (selection === null) return;
   // Collapsing to the end of the host is what makes the next keystroke append

@@ -342,5 +342,35 @@ describe("text entry targets actually receive focus", () => {
     expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
     teardown();
   });
+
+  it("does not paint a selection over a text-entry target that cannot actually take focus", () => {
+    // 伪装成文本面却不可聚焦的宿主（ARIA 标错、缺 tabindex）：focus() 会静默
+    // 失败。此时若照旧设置文档选区，用户会看到目标内容被整段高亮、焦点却还在
+    // 原处，跳转没发生，只剩一段莫名的蓝条。
+    const fake = doc.createElement("div");
+    fake.setAttribute("role", "textbox");
+    fake.textContent = "not really editable";
+    place(fake, 20, 20);
+    doc.body.append(fake);
+    // jsdom 的 div 本来就不在 tab 序列里，focus() 是 no-op，正好是这个形态。
+    fake.focus = () => undefined;
+
+    const other = doc.createElement("button");
+    place(other, 200, 20);
+    doc.body.append(other);
+    other.focus();
+
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    // 第一个 label 指向 fake（DOM 顺序在前）。
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(other);
+    const selection = doc.getSelection();
+    const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    expect(range !== null && fake.contains(range.commonAncestorContainer)).toBe(false);
+    teardown();
+  });
 });
 
