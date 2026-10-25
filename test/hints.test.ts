@@ -110,12 +110,27 @@ describe("label assignment", () => {
     expect(labels[1]).toBe("ad");
   });
 
-  it("extends to three-key labels after the two-key space is exhausted", () => {
+  it("moves the whole round to three-key labels once the two-key space is exhausted", () => {
+    // 一轮内 label 必须等长。混长会让 matchKey 把两键 label 提前判成完成：
+    // 输入 "l"、"l" 时 "ll" 已在 labels 里，pending 立即清空，第 82 个候选
+    // 永远轮不到。所以越过 81 时整轮改三键，而不是接着往下发三键。
     const els = buttons(81 + 1);
     const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
     const labels = hints.map((h) => h.label);
-    expect(labels[81 - 1]).toBe("ll");
-    expect(labels[81]).toBe("asa");
+    const lengths = new Set(labels.map((label) => label.length));
+    expect(lengths).toEqual(new Set([3]));
+    expect(labels[0]).toBe("asa");
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it("keeps every round's labels the same length, so no label can shadow another", () => {
+    // 边界两侧各取一个：81 个候选整轮两键，82 个候选整轮三键。
+    for (const size of [9, 10, 81, 82]) {
+      const els = buttons(size);
+      const labels = collectHints(select(...els), VIEWPORT, { isVisible: visible }).map((h) => h.label);
+      expect(new Set(labels.map((label) => label.length)).size).toBe(1);
+      expect(new Set(labels).size).toBe(labels.length);
+    }
   });
 
   it("produces unique labels", () => {

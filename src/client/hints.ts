@@ -25,18 +25,27 @@ export interface CollectDeps {
 }
 
 /**
- * Ordered label stream: the nine home-row singles, then each level of ordered
- * combinations. Within one level a prefix's children enumerate every key except
- * the prefix's last character, then that character itself, so no label begins
- * with a doubled character (aa sorts to the tail of the "a" block) while the
- * level still covers the full key space.
+ * The ordered label stream of one fixed length.
+ *
+ * `keys` is how many strokes every label in the round takes: 1 yields the nine
+ * home-row singles, 2 yields the 81 two-key labels (an "as" block sorted after
+ * the singles), 3 the 729 three-key ones, and so on. The order within a level
+ * enumerates every key except the prefix's own last character first, then that
+ * character itself, so no label doubles its final stroke at the head of its
+ * block (`aa` sorts to the tail of the "a" block) while the level still covers
+ * the full key space.
+ *
+ * Length is fixed per round rather than grown level by level: a short label
+ * beside a longer one makes matchKey complete the short one early, and every
+ * candidate past that point becomes unreachable.
  */
-export function* generateLabels(includeSingles = true): Generator<string> {
-  // Equal-length labels per round: skipping the singles keeps a single-key
-  // label from shadowing the first character of longer labels in matchKey.
-  if (includeSingles) yield* HOME_ROW_KEYS;
+export function* generateLabels(keys = 1): Generator<string> {
+  if (keys <= 1) {
+    yield* HOME_ROW_KEYS;
+    return;
+  }
   let level: string[] = [...HOME_ROW_KEYS];
-  while (true) {
+  for (let depth = 1; depth < keys; depth += 1) {
     const next: string[] = [];
     for (const prefix of level) {
       const last = prefix[prefix.length - 1];
@@ -46,13 +55,32 @@ export function* generateLabels(includeSingles = true): Generator<string> {
       }
       next.push(prefix + last);
     }
-    yield* next;
     level = next;
   }
+  yield* level;
 }
 
 /** Label capacity of the single-key level; beyond it every label goes two-key. */
 const SINGLE_KEY_CAPACITY = HOME_ROW_KEYS.length;
+
+/**
+ * How many keys a round of `count` hints needs, applied to every hint.
+ *
+ * One length per round is a correctness requirement, not tidiness: matchKey
+ * treats a label that is present in the set as complete, so a two-key label
+ * living beside three-key ones would swallow the two strokes that should have
+ * started a three-key label, and the candidates carrying those labels would be
+ * unreachable. Level sizes are 9, 81, 729… (HOME_ROW_KEYS.length ** level).
+ */
+function keysPerLabel(count: number): number {
+  let level = 1;
+  let capacity = SINGLE_KEY_CAPACITY;
+  while (count > capacity) {
+    level += 1;
+    capacity *= SINGLE_KEY_CAPACITY;
+  }
+  return level;
+}
 
 /**
  * Filter candidates to the visible viewport, keep only the deepest element on
@@ -86,7 +114,7 @@ export function collectHints(
   const deepest = kept.filter(
     ({ element }) => !kept.some((other) => other.element !== element && element.contains(other.element)),
   );
-  const labels = generateLabels(deepest.length <= SINGLE_KEY_CAPACITY);
+  const labels = generateLabels(keysPerLabel(deepest.length));
   return deepest.map((entry) => {
     const label = labels.next();
     if (label.done) throw new Error("dsh-jump: label space exhausted");
