@@ -12,6 +12,7 @@ import { collectHints, type Hint } from "./hints.ts";
 import { createKeyState, matchKey, type KeyEventLike, type KeyState } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
+import { activationOf } from "./target.ts";
 
 export interface JumpWindow {
   document: Document;
@@ -86,6 +87,37 @@ function fireClickSequence(element: Element, cx: number, cy: number): void {
   element.dispatchEvent(pointer("pointerup", 0));
   element.dispatchEvent(mouse("mouseup", 0));
   element.dispatchEvent(mouse("click", 0));
+}
+
+/**
+ * Focus a text entry surface and put the caret where the user can keep typing.
+ *
+ * Plain `focus()` is not enough for a contenteditable host. A native text field
+ * does come out with its caret at the end (measured: `<input>.focus()` leaves
+ * selectionStart at the value length), but a contenteditable div leaves the
+ * caret wherever the selection happened to be, which for a fresh focus is the
+ * start of the content. Jumping to the composer and landing at the top of the
+ * draft is the opposite of "keep writing", so the collapse is done by hand.
+ *
+ * The caret is only moved when the target does not already own it: if the user
+ * is typing in the field and asks jump to bring them back, the offset they left
+ * is theirs.
+ */
+function focusTextEntry(element: Element, doc: Document): void {
+  const el = element as HTMLElement;
+  if (typeof el.focus !== "function") return;
+  // The user already typing here means the caret is where they left it.
+  if (doc.activeElement === element) return;
+  el.focus();
+  const selection = doc.getSelection?.() ?? null;
+  if (selection === null) return;
+  // Collapsing to the end of the host is what makes the next keystroke append
+  // instead of inserting at the top.
+  const range = doc.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
 }
 
 export function createApp(deps: AppDeps = {}): JumpApp {
@@ -165,11 +197,21 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         if (hit === undefined) return;
         const cx = hit.rect.x + hit.rect.w / 2;
         const cy = hit.rect.y + hit.rect.h / 2;
-        if (mode === "click") {
+        // Which action a target needs is a property of the target, not of the
+        // mode the user pressed: a text entry surface has no click semantics
+        // (synthetic pointer events are untrusted, so the browser performs no
+        // focusing default action for them — measured across button, input and
+        // contenteditable, all three left activeElement unchanged), while a
+        // button has no focus semantics (focusing it runs nothing). Mode then
+        // only decides the fallback for targets that do not care.
+        const activation = activationOf(hit.element);
+        if (activation === "focus") {
+          focusTextEntry(hit.element, win.document);
+        } else if (mode === "click") {
           fireClickSequence(hit.element, cx, cy);
         } else {
           const el = hit.element as HTMLElement;
-          // Non-focusable targets (an <a> without href) simply no-op.
+          // A widget with no focus method (a leaf div) simply no-ops.
           if (typeof el.focus === "function") el.focus();
         }
       };

@@ -232,3 +232,115 @@ describe("focus mode (Cmd+U)", () => {
     teardown();
   });
 });
+
+describe("text entry targets actually receive focus", () => {
+  /** 造一个真 composer 形状的可编辑宿主，并装好矩形。 */
+  function composer(): HTMLElement {
+    const host = doc.createElement("div");
+    host.setAttribute("contenteditable", "true");
+    host.setAttribute("role", "textbox");
+    host.setAttribute("data-composer-input", "true");
+    place(host, 100, 500, 600, 36);
+    doc.body.append(host);
+    return host;
+  }
+
+  it("Cmd+U on the composer focuses it and puts the caret at the end of the draft", () => {
+    // 跳到输入框的目的是接着写：光标落在行首等于把用户丢回开头。
+    const host = composer();
+    host.textContent = "draft";
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(host);
+    const selection = doc.getSelection();
+    expect(selection?.isCollapsed).toBe(true);
+    expect(host.contains(selection?.anchorNode ?? null)).toBe(true);
+    // 折叠位置在内容之后 = 可以继续打字。
+    expect(selection?.anchorOffset).toBe(host.childNodes.length);
+    teardown();
+  });
+
+  it("Cmd+H on the composer also focuses it, because synthetic clicks cannot focus anything", () => {
+    // 合成鼠标事件不是可信事件，浏览器不会为其执行"聚焦"默认动作；实测
+    // button/input/contenteditable 三种目标派发完整序列后 activeElement 均未变。
+    // 所以 click 模式对文本面必须改走 focus，否则跳过去等于没跳。
+    const host = composer();
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(host);
+    teardown();
+  });
+
+  it("Cmd+H on the composer does not dispatch a mouse sequence that would blur it again", () => {
+    const host = composer();
+    const seen: string[] = [];
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      host.addEventListener(type, () => seen.push(type));
+    }
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(seen).toEqual([]);
+    teardown();
+  });
+
+  it("Cmd+U on a textarea focuses it and keeps its native caret-at-end behaviour", () => {
+    const field = doc.createElement("textarea");
+    field.value = "hello";
+    place(field, 10, 10);
+    doc.body.append(field);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(field);
+    teardown();
+  });
+
+  it("a text entry target that already owns the caret is not yanked to the end", () => {
+    // 光标已经在里面（用户正打着字）时跳回去不该改变偏移，否则等于吞掉一次编辑意图。
+    const field = doc.createElement("textarea");
+    field.value = "hello world";
+    place(field, 10, 10);
+    doc.body.append(field);
+    field.focus();
+    field.setSelectionRange(3, 3);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(field);
+    expect(field.selectionStart).toBe(3);
+    teardown();
+  });
+
+  it("click mode on a button still fires the full pointer/mouse/click sequence", () => {
+    // 回归钉子：文本面改走 focus 之后，普通控件必须仍然走真实鼠标序列，
+    // 否则 React 的 onClick 不会触发。
+    const button = doc.createElement("button");
+    place(button, 10, 10);
+    doc.body.append(button);
+    const seen: string[] = [];
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      button.addEventListener(type, () => seen.push(type));
+    }
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
+    teardown();
+  });
+});
+
