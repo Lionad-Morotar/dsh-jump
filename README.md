@@ -58,6 +58,10 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 - 两个组合键都可以改：设置 → 通用 → 「跳跃导航快捷键」，点一下组合键再按新的即可
   立即生效，无需刷新。绑定存在浏览器的 `localStorage`（`dsh-jump:bindings:v1`），
   不写进包配置。
+- 这一行排在宿主自己的「键盘快捷键」之后。设置列表的顺序由行注册时声明的
+  `order` 决定，宿主已占用 0 / 10 / 11 / 12 / 15 / 16 / 17 / 20 / 30 / 100，
+  本插件取 18。改这个值时先确认没有撞上宿主，两个插件取同一个 `order` 时
+  谁在前取决于注册先后，不受控。
 - 标签前九个是 `a s d f g h j k l`；超过九个时整轮改用等长的双键标签（`as`、`ad`
   ……），避免短标签抢走长标签的首击；超过 81 个则整轮升到三键。
 - 命中的元素决定动的含义：文本输入面（textarea、带光标的 input、
@@ -133,9 +137,12 @@ a focused input never leaks through.
 - A chord must carry ⌘, ⌃ or ⌥. Shift alone is refused, as are keys the
   interface owns (Tab, Enter, Space, the arrow keys, Escape) and the chord the
   other mode already holds.
-- The settings row is registered only where the host exposes the General
-  settings slot and the module loader seeds React. Without either, navigation
-  still works; only the ability to remap is missing.
+- The settings row waits for the host's slot service through `ctx.inject`
+  rather than sampling it once. Services start one at a time, so a single
+  `ctx.get("slots")` during `apply` can legitimately return undefined; the row
+  would then never register, and `ctx.get` reports nothing. With neither the
+  slot service nor a React seed, navigation still works; only the ability to
+  remap is missing.
 - Web and desktop both load this plugin, but the label overlay targets the Web
   GUI's DOM. The chords and the settings row are not Web-specific.
 
