@@ -23,6 +23,19 @@ import { createBindingsStore, type BindingsStore } from "./store.ts";
 /** The one part of the Cordis context this plugin reads. */
 export interface RuntimeContext {
   get<T>(name: string): T | undefined;
+  /**
+   * Run a callback once the named services exist.
+   *
+   * Services come up one at a time; `get` samples and returns undefined for any
+   * that are not ready yet. Deferring through this hook is what makes the row
+   * appear at all on a host whose slot service starts after this plugin.
+   */
+  inject(names: string[], callback: (scope: ScopedContext) => void): () => void;
+}
+
+/** The subset of the context handed to a deferred callback. */
+export interface ScopedContext {
+  get<T>(name: string): T | undefined;
 }
 
 interface SlotService {
@@ -38,8 +51,13 @@ interface LocaleService {
 export const SETTINGS_SLOT = "settings.general.item";
 /** The row id; must not collide with the host's own rows. */
 export const SETTINGS_ID = "jump";
-/** Right after the host's own shortcut row, which sits at order 16. */
-export const SETTINGS_ORDER = 17;
+/**
+ * Between the host's shortcut row (16) and its link-opening row (17).
+ *
+ * The gap is not aesthetic: 17 is taken by ui-chat, so a row at the same order
+ * renders in an order decided by registration timing rather than intent.
+ */
+export const SETTINGS_ORDER = 18;
 
 export interface RuntimeDeps {
   ctx: RuntimeContext;
@@ -78,27 +96,38 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
 
   const disposers: (() => void)[] = [app.apply()];
 
-  const slots = ctx.get<SlotService>("slots");
-  if (React !== null && slots !== undefined) {
-    const locale = ctx.get<LocaleService>("locale");
-    const controller = createBindingsController({ store, platform });
-    // slots.inject owns the registration's lifecycle: it runs the callback once
-    // the slot exists and again if the host re-creates it, and disposes on
-    // unload. Wrapping it in ctx.effect as well would register twice.
+  // Registering the row has to wait for the slot service to exist. Sampling it
+  // once with `get` is the bug this shape exists to prevent: on a host where
+  // slots comes up after this plugin, the sample is undefined, the branch is
+  // skipped, and the plugin looks installed but has nowhere to be configured.
+  if (React !== null) {
     disposers.push(
-      slots.inject(SETTINGS_SLOT, () =>
-        slots.register({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER }, () =>
-          JumpSettingsRow({
-            React,
-            controller,
-            platform,
-            copy: copyFor(locale?.getSnapshot().active ?? "zh"),
-          }),
-        ),
-      ),
+      ctx.inject(["slots"], (scope) => {
+        const slots = scope.get<SlotService>("slots");
+        if (slots === undefined) return;
+        const locale = scope.get<LocaleService>("locale");
+        const controller = createBindingsController({ store, platform });
+        // slots.inject owns the registration's lifecycle: it runs the callback
+        // once the slot exists and again if the host re-creates it, and
+        // disposes on unload. Wrapping it in ctx.effect as well registers twice.
+        const disposeRow = slots.inject(SETTINGS_SLOT, () =>
+          slots.register({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER }, () =>
+            JumpSettingsRow({
+              React,
+              controller,
+              platform,
+              copy: copyFor(locale?.getSnapshot().active ?? "zh"),
+            }),
+          ),
+        );
+        const doc = deps.document ?? globalThis.document;
+        const disposeStyles = doc === undefined ? undefined : insertRowStyles(doc);
+        return () => {
+          disposeRow();
+          disposeStyles?.();
+        };
+      }),
     );
-    const doc = deps.document ?? globalThis.document;
-    if (doc !== undefined) disposers.push(insertRowStyles(doc));
   }
 
   return {

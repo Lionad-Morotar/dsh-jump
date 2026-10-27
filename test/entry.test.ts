@@ -26,6 +26,7 @@ Object.defineProperty(globalThis, "removeEventListener", {
 });
 
 const { default: clientPlugin, boot } = await import("../src/client/entry.ts");
+const { SETTINGS_ORDER } = await import("../src/client/runtime.ts");
 
 interface Registration {
   name: string;
@@ -36,24 +37,26 @@ interface Registration {
 function registry() {
   const registrations: Registration[] = [];
   const injections: string[] = [];
+  const services: Record<string, unknown> = {
+    slots: {
+      inject(key: string, callback: () => () => void): () => void {
+        injections.push(key);
+        return callback();
+      },
+      register(reg: Registration, _component: unknown): () => void {
+        registrations.push(reg);
+        return () => undefined;
+      },
+    },
+    locale: { getSnapshot: () => ({ active: "zh" }) },
+  };
+  const get = <T>(name: string): T | undefined => services[name] as T | undefined;
   const ctx = {
-    get<T>(name: string): T | undefined {
-      if (name === "slots") {
-        return {
-          inject(key: string, callback: () => () => void): () => void {
-            injections.push(key);
-            return callback();
-          },
-          register(reg: Registration, _component: unknown): () => void {
-            registrations.push(reg);
-            return () => undefined;
-          },
-        } as unknown as T;
-      }
-      if (name === "locale") {
-        return { getSnapshot: () => ({ active: "zh" }) } as unknown as T;
-      }
-      return undefined;
+    get,
+    // 宿主在 slots 就绪后才回调；这个替身里服务一开始就在，所以立刻执行。
+    inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+      void names;
+      return callback({ get }) as unknown as () => void;
     },
   };
   return { ctx, registrations, injections };
@@ -97,7 +100,7 @@ describe("clientPlugin", () => {
     expect(injections).toContain("settings.general.item");
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.id).toBe("jump");
-    expect(registrations[0]?.order).toBe(17);
+    expect(registrations[0]?.order).toBe(SETTINGS_ORDER);
     dispose();
     expect(doc.querySelectorAll("style[data-plugin-css]")).toHaveLength(0);
   });
@@ -108,7 +111,8 @@ describe("clientPlugin", () => {
     button.getBoundingClientRect = () =>
       ({ x: 0, y: 0, width: 10, height: 10, left: 0, top: 0, right: 10, bottom: 10, toJSON: () => ({}) }) as DOMRect;
     doc.body.append(button);
-    const dispose = clientPlugin.apply({ get: () => undefined });
+    const bare = { get: () => undefined, inject: () => () => undefined };
+    const dispose = clientPlugin.apply(bare);
     win.dispatchEvent(new win.KeyboardEvent("keydown", { key: "h", metaKey: true, bubbles: true, cancelable: true }));
     expect(doc.querySelector("[data-dsh-jump-overlay]")).not.toBeNull();
     dispose();
@@ -117,7 +121,8 @@ describe("clientPlugin", () => {
 
   it("removes its listener on dispose, leaving the page as it found it", () => {
     const win = dom.window;
-    const dispose = clientPlugin.apply({ get: () => undefined });
+    const bare = { get: () => undefined, inject: () => () => undefined };
+    const dispose = clientPlugin.apply(bare);
     const teardownSpy = vi.fn();
     win.addEventListener("keydown", teardownSpy);
     dispose();
@@ -180,7 +185,17 @@ describe("live remap", () => {
         return () => undefined;
       },
     };
-    const dispose = clientPlugin.apply({ get: (name: string) => (name === "slots" ? slots : undefined) }, undefined);
+    const get = (name: string) => (name === "slots" ? slots : undefined);
+    const dispose = clientPlugin.apply(
+      {
+        get,
+        inject: (names: string[], callback: (scope: { get(n: string): unknown }) => void) => {
+          void names;
+          return callback({ get }) as unknown as () => void;
+        },
+      },
+      undefined,
+    );
     expect(begin).toBeNull();
     expect(press).toBeNull();
 

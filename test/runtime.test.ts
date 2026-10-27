@@ -50,29 +50,34 @@ interface Captured {
 function host() {
   const captured: Captured[] = [];
   let localeReads = 0;
+  const services: Record<string, unknown> = {
+    slots: {
+      inject: (key: string, callback: () => () => void) => {
+        void key;
+        return callback();
+      },
+      register: (registration: { name: string; id: string; order: number }, _component: unknown) => {
+        captured.push({ slotKey: "unused", registration });
+        return () => undefined;
+      },
+    },
+    locale: {
+      getSnapshot: () => {
+        localeReads += 1;
+        return { active: "zh" };
+      },
+    },
+  };
+  const get = <T>(name: string): T | undefined => services[name] as T | undefined;
   return {
     captured,
     localeReads: () => localeReads,
     ctx: {
-      get<T>(name: string): T | undefined {
-        if (name === "slots") {
-          return {
-            inject: (key: string, callback: () => () => void) => callback(),
-            register: (registration: { name: string; id: string; order: number }, _component: unknown) => {
-              captured.push({ slotKey: "unused", registration });
-              return () => undefined;
-            },
-          } as unknown as T;
-        }
-        if (name === "locale") {
-          return {
-            getSnapshot: () => {
-              localeReads += 1;
-              return { active: "zh" };
-            },
-          } as unknown as T;
-        }
-        return undefined;
+      get,
+      // 服务都已就绪的宿主：回调立刻跑，作用域与根上下文同源。
+      inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        void names;
+        return callback({ get }) as unknown as () => void;
       },
     } as unknown as RuntimeContext,
   };
@@ -151,7 +156,9 @@ describe("createRuntime", () => {
     const button = doc.createElement("button");
     place(button);
     doc.body.append(button);
-    const runtime = createRuntime({ ctx: { get: () => undefined } as RuntimeContext, platform: "macos", React: REACT, ...HOST });
+    // 一个连 inject 都没有的宿主：导航照旧，只是没有可配置的面。
+    const bare = { get: () => undefined, inject: () => () => undefined } as unknown as RuntimeContext;
+    const runtime = createRuntime({ ctx: bare, platform: "macos", React: REACT, ...HOST });
     key(win, { key: "h", metaKey: true });
     expect(doc.querySelector("[data-dsh-jump-overlay]")).not.toBeNull();
     runtime.dispose();
@@ -169,6 +176,69 @@ describe("createRuntime", () => {
     expect(doc.querySelectorAll("style[data-plugin-css]")).toHaveLength(1);
     runtime.dispose();
     expect(doc.querySelectorAll("style[data-plugin-css]")).toHaveLength(0);
+  });
+
+  it("waits for the slots service instead of sampling it once", () => {
+    // 宿主的服务是逐个就绪的。apply 早于 slots 建立时，ctx.get 会静默返回
+    // undefined，行就再也不会注册。真实宿主里这就是"插件装了但设置里没有"。
+    const win = dom.window;
+    const button = doc.createElement("button");
+    place(button);
+    doc.body.append(button);
+
+    const captured: Captured[] = [];
+    // 用持有对象而不是裸 let：赋值发生在闭包里，TS 的控制流分析会把
+    // 调用点的 let 收窄成 never。
+    const pending: { release: (() => void) | null } = { release: null };
+    const slots = {
+      inject: (key: string, callback: () => () => void) => {
+        void key;
+        return callback();
+      },
+      register: (registration: { name: string; id: string; order: number }, _component: unknown) => {
+        captured.push({ slotKey: "unused", registration });
+        return () => undefined;
+      },
+    };
+    let injected = false;
+    // 服务表在回调前是空的：slots 尚不存在，locale 可以先有。
+    const services: Record<string, unknown> = { locale: { getSnapshot: () => ({ active: "zh" }) } };
+    const scopedGet = <T>(name: string): T | undefined => services[name] as T | undefined;
+    const ctx = {
+      get: () => undefined,
+      inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        injected = true;
+        expect(names).toContain("slots");
+        pending.release = () => {
+          services.slots = slots;
+          callback({ get: scopedGet });
+        };
+        return () => undefined;
+      },
+    } as unknown as RuntimeContext;
+
+    const runtime = createRuntime({ ctx, platform: "macos", React: REACT, ...HOST });
+    // 服务还没起来时，行不该被注册，但导航必须立刻可用。
+    expect(injected).toBe(true);
+    expect(captured).toHaveLength(0);
+    key(win, { key: "h", metaKey: true });
+    expect(doc.querySelector("[data-dsh-jump-overlay]")).not.toBeNull();
+
+    // 服务就绪后行才出现。
+    pending.release?.();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER });
+
+    runtime.dispose();
+  });
+
+  it("keeps the row id and order clear of the host's own rows", () => {
+    // 宿主的占用（实测）：15 developer-tools、16 shortcuts、17 link-opening、
+    // 20 composer-enter、30 performance-usage。撞上就是两行同位置。
+    for (const order of [15, 16, 17, 20, 30, 100]) expect(SETTINGS_ORDER).not.toBe(order);
+    for (const id of ["shortcuts", "link-opening", "composer-enter", "developer-tools"]) {
+      expect(SETTINGS_ID).not.toBe(id);
+    }
   });
 
   it("is safe to dispose twice", () => {
