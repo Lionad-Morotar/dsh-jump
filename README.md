@@ -1,23 +1,83 @@
 # dsh-jump
 
-Keyboard jump navigation for the DeepSeek Harness Web GUI.
+<img src="./assets/icon.svg" width="72" height="72" alt="dsh-jump icon" align="right" />
 
-- **Cmd+H** activates click mode: every interactive element in the viewport
-  gets a home-row label, and typing a label activates that element.
-- **Cmd+U** activates focus mode: same labels, same activation.
-- **Esc** (or any meta chord, or pressing the activation key again) leaves
-  jump mode.
+Keyboard jump navigation for the DeepSeek Harness Web GUI: press a chord, type a
+letter label, and the labelled element is clicked or focused.
 
-Both chords are remappable. Settings → General → "Jump navigation shortcuts"
-records a replacement chord per mode: click a chord, press the combination, and
-it takes effect immediately, without a reload. The same row restores the shipped
-chords. Off a Mac the defaults are Ctrl+H / Ctrl+U and are shown as such.
+[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
-Labels run `a s d f g h j k l` for up to nine hints; past nine, every hint in
-that round gets an equal-length two-key label (`as`, `ad`, …) so no shorter
-label can shadow the first stroke of a longer one. Past 81 the whole round
-moves to three keys, and so on.
+## Install
 
+### From an index source
+
+Once the package is on npm, the shortest path is the plugin manager: open
+Discover, add the market index URL, and install the entry. The entry's install
+command is `dsh plugin --profile web add dsh-jump`.
+
+### From this repository
+
+Until the package is published, point the profile at the checkout:
+
+```json
+{
+  "dependencies": {
+    "dsh-jump": "link:../dsh-plugins/packages/dsh-jump"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["...", "dsh-jump"]
+    }
+  }
+}
+```
+
+Then `dsh plugin --profile web install` and restart DSH. The path in `link:`
+resolves relative to `~/.dsh/profiles/web`, so adjust it to wherever the
+checkout lives on your machine.
+
+### Manual patch
+
+Append to the profile's `cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: jump
+      name: 'dsh-jump'
+```
+
+The top level of that file must always stay a YAML array (`[]` when empty).
+
+## 中文
+
+给 DeepSeek Harness Web GUI 的键盘跳跃导航：按下一个组合键，视口里的可交互元素
+会被打上字母标签，再敲标签即可点击或聚焦到它。
+
+- `Cmd+H` 进入点击模式，`Cmd+U` 进入聚焦模式；非 Mac 上默认是 `Ctrl+H` /
+  `Ctrl+U`。`Esc`（或任意 meta 组合键、或再按一次激活键）退出。
+- 两个组合键都可以改：设置 → 通用 → 「跳跃导航快捷键」，点一下组合键再按新的即可
+  立即生效，无需刷新。绑定存在浏览器的 `localStorage`（`dsh-jump:bindings:v1`），
+  不写进包配置。
+- 标签前九个是 `a s d f g h j k l`；超过九个时整轮改用等长的双键标签（`as`、`ad`
+  ……），避免短标签抢走长标签的首击；超过 81 个则整轮升到三键。
+- 命中的元素决定动的含义：文本输入面（textarea、带光标的 input、
+  `contenteditable`）聚焦并把光标落到草稿末尾，其余元素在点击模式下走完整的
+  合成指针/鼠标/点击序列，聚焦模式下只调 `focus()`。
+
+## Compatibility
+
+`engines.dsh` is `>=0.2.0-rc.2 <0.3.0-0`. An own `engines.dsh` range decides
+alone: the host ignores `peerDependencies` once it is present, and prereleases
+participate in the range, so 0.2 release candidates are admitted while 0.3 is
+not.
+
+## Display metadata
+
+The plugin manager reads `locale/en.json` and `locale/zh.json` for the title and
+one-line description without evaluating the plugin, and resolves the icon
+through `exports["./icon"]` as an SVG served as a `data:` URL.
+`assets/icon-180.png` is the same artwork rendered at 180px for GitHub-hosted
+catalog entries, which reject SVG.
 ## What gets labelled
 
 Three families, each added because a real element was unreachable:
@@ -78,41 +138,6 @@ a focused input never leaks through.
   still works; only the ability to remap is missing.
 - Web and desktop both load this plugin, but the label overlay targets the Web
   GUI's DOM. The chords and the settings row are not Web-specific.
-
-## Install (web profile)
-
-Same as the skin packages, two ways:
-
-**A. As a profile dependency (recommended)**
-
-Add to `~/.dsh/profiles/web/package.json`:
-
-```json
-{
-  "dependencies": {
-    "dsh-jump": "link:/Users/lionad/Github/Lionad-Morotar/dsh-plugins/packages/dsh-jump"
-  },
-  "dsh": {
-    "profile": {
-      "bundles": ["...", "dsh-jump"]
-    }
-  }
-}
-```
-
-Then `dsh plugin --profile web install` and restart DSH.
-
-**B. Manual patch**
-
-Append to the profile's `cordis.patch.yml`:
-
-```yaml
-- insert:
-    - id: jump
-      name: 'dsh-jump'
-```
-
-The top level of that file must always stay a YAML array (`[]` when empty).
 
 ## Layout
 

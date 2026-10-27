@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-labelledby="jump-title">
+  <title id="jump-title">dsh-jump</title>
+  <defs>
+    <linearGradient id="jump-bg" x1="8" y1="6" x2="40" y2="44" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5C7BFF" />
+      <stop offset="1" stop-color="#2B39DB" />
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="13" fill="url(#jump-bg)" />
+  <rect x="10" y="25" width="21" height="13" rx="4" fill="#FFFFFF" fill-opacity="0.45" />
+  <g fill="#FFFFFF">
+    <circle cx="5.5" cy="6" r="1.5" />
+    <circle cx="10" cy="9" r="1.5" />
+    <circle cx="13.7" cy="12.4" r="1.6" />
+    <circle cx="17.1" cy="16.9" r="1.5" />
+  </g>
+  <g fill="#FFFFFF" fill-opacity="0.88">
+    <circle cx="21" cy="16.5" r="1" />
+    <circle cx="25.5" cy="13" r="1" />
+  </g>
+  <rect x="9" y="21.5" width="21" height="13" rx="4" fill="#FFFFFF" />
+  <circle cx="36.5" cy="13" r="5" fill="#FFFFFF" />
+</svg>

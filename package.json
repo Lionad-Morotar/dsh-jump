@@ -1,22 +1,48 @@
 {
   "name": "dsh-jump",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "DeepSeek Harness jump plugin: Cmd+H labels clickable elements for click, Cmd+U for focus, Esc to leave",
   "license": "MIT",
+  "author": "Lionad <1806234223@qq.com>",
+  "homepage": "https://github.com/Lionad-Morotar/dsh-plugins/tree/main/packages/dsh-jump#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lionad-Morotar/dsh-plugins",
+    "directory": "packages/dsh-jump"
+  },
+  "bugs": {
+    "url": "https://github.com/Lionad-Morotar/dsh-plugins/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "keyboard",
+    "navigation",
+    "accessibility",
+    "vimium"
+  ],
+  "icon": "./assets/icon.svg",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./icon": "./assets/icon.svg",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "assets",
+    "locale",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
   "dsh": {
     "client": {
       "platform": "web",
