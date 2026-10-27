@@ -90,8 +90,11 @@ Three families, each added because a real element was unreachable:
   `summary` — plus anything carrying a `tabindex`.
 - ARIA widget roles the Harness actually renders: `button`, `link`, `tab`,
   `treeitem` (the sidebar's project and session rows), `option`, the
-  `menuitem*` family, `checkbox`, `radio`, `switch`, `slider`, `spinbutton`,
-  `gridcell`, `row`, `columnheader`.
+  `menuitem*` family, `checkbox`, `radio`, `switch`, `slider`, `spinbutton`.
+  Structural roles (`row`, `columnheader`, `gridcell`) are deliberately
+  absent: a row is a container and a header is a label, so labelling them
+  hands dead labels to every presentational table; an interactive grid gives
+  its cells a `tabindex`, which the branch above already catches.
 - Editable hosts (`[contenteditable]:not([contenteditable=false])`) and the
   text-entry roles `textbox` / `searchbox` / `combobox`. This is what makes
   the composer reachable: it is a Lexical-managed
