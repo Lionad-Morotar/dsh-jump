@@ -53,7 +53,8 @@
     "locale",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "screenshots.json"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
