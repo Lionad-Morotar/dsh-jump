@@ -32,13 +32,16 @@ const manifest = require(join(packageRoot, "package.json"));
  * once shipped four phantom columns of garbage this way). esbuild emits a
  * lone default export as `module.exports.default`, hence the unwrap.
  */
-function wrap(id, code) {
+function wrap(id, code, { boot = false } = {}) {
+  // `boot` runs inside the factory, after the bundle's exports exist, and is the
+  // only place the loader's `require` is reachable.
+  const handover = boot ? "\nmodule.exports.boot(require);" : "";
   return `window.__ModuleLoader__.load({
   id: ${JSON.stringify(id)},
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
-${code}
+${code}${handover}
     return module.exports.default ?? module.exports;
   }
 });
@@ -51,7 +54,7 @@ ${code}
  * imported by Node from an ESM package, while the client half is evaluated by
  * the browser as a classic script inside the factory.
  */
-async function bundle(entry, format) {
+async function bundle(entry, format, external = []) {
   const host = format === "esm";
   const result = await build({
     entryPoints: [entry],
@@ -62,6 +65,7 @@ async function bundle(entry, format) {
     minify: true,
     write: false,
     legalComments: "none",
+    external,
     logLevel: "silent",
   });
   const output = result.outputFiles?.[0];
@@ -75,8 +79,10 @@ async function main() {
 
   await writeFile(join(libRoot, "index.js"), await bundle(join(packageRoot, "src", "index.ts"), "esm"), "utf8");
 
-  const client = await bundle(join(packageRoot, "src", "client", "entry.ts"), "cjs");
-  await writeFile(join(libRoot, "client.js"), wrap(manifest.name, client), "utf8");
+  // React is a platform module the loader seeds, not a dependency of this
+  // package: bundling it would ship a second React and break every hook.
+  const client = await bundle(join(packageRoot, "src", "client", "entry.ts"), "cjs", ["react", "react/jsx-runtime"]);
+  await writeFile(join(libRoot, "client.js"), wrap(manifest.name, client, { boot: true }), "utf8");
 
   const written = ["index.js", "client.js"];
   const sizes = await Promise.all(
