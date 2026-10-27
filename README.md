@@ -5,19 +5,30 @@
 Keyboard jump navigation for the DeepSeek Harness Web GUI: press a chord, type a
 letter label, and the labelled element is clicked or focused.
 
+![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
+
 [中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
 ## Install
 
+### From npm
+
+```
+dsh plugin --profile web add dsh-jump
+```
+
+The package on npm is `dsh-jump`. Restart the profile afterwards; the bundle
+patch registers its Loader row, so no manual `cordis.patch.yml` edit is needed.
+
 ### From an index source
 
-Once the package is on npm, the shortest path is the plugin manager: open
-Discover, add the market index URL, and install the entry. The entry's install
-command is `dsh plugin --profile web add dsh-jump`.
+The plugin manager can also install it through a market index: add the index URL
+`https://raw.githubusercontent.com/Lionad-Morotar/dsh-plugins/main/market/index.json`
+in Discover, then install the `dsh-jump` entry.
 
 ### From this repository
 
-Until the package is published, point the profile at the checkout:
+To track the checkout instead of the published version:
 
 ```json
 {
