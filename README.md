@@ -8,6 +8,11 @@ Keyboard jump navigation for the DeepSeek Harness Web GUI.
 - **Esc** (or any meta chord, or pressing the activation key again) leaves
   jump mode.
 
+Both chords are remappable. Settings → General → "Jump navigation shortcuts"
+records a replacement chord per mode: click a chord, press the combination, and
+it takes effect immediately, without a reload. The same row restores the shipped
+chords. Off a Mac the defaults are Ctrl+H / Ctrl+U and are shown as such.
+
 Labels run `a s d f g h j k l` for up to nine hints; past nine, every hint in
 that round gets an equal-length two-key label (`as`, `ad`, …) so no shorter
 label can shadow the first stroke of a longer one. Past 81 the whole round
@@ -59,10 +64,20 @@ a focused input never leaks through.
 
 - Hints are snapshotted at the moment of activation: elements that appear or
   move after activation do not get labels until you re-activate.
-- The Cmd+H / Cmd+U activation keys are fixed in v1; if a host bundle ever
-  claims these chords first, remapping via package config is a follow-up.
-- Web profile only: this plugin targets the DSH Web GUI and is not wired into
-  the desktop profile.
+- The activation chords are stored per browser profile in `localStorage`
+  (`dsh-jump:bindings:v1`), not in package config. The host's own shortcut
+  registry cannot hold them: a bare home-row label stroke is rejected as
+  modifier-less, and the shipped `Cmd+H` / `Cmd+U` defaults collide with
+  reserved primary chords. The listener is therefore plugin-owned, and the
+  settings row writes to the same plugin-owned document.
+- A chord must carry ⌘, ⌃ or ⌥. Shift alone is refused, as are keys the
+  interface owns (Tab, Enter, Space, the arrow keys, Escape) and the chord the
+  other mode already holds.
+- The settings row is registered only where the host exposes the General
+  settings slot and the module loader seeds React. Without either, navigation
+  still works; only the ability to remap is missing.
+- Web and desktop both load this plugin, but the label overlay targets the Web
+  GUI's DOM. The chords and the settings row are not Web-specific.
 
 ## Install (web profile)
 
@@ -102,8 +117,18 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 ## Layout
 
 - `src/index.ts` host half (empty `apply`; the Loader requires it to resolve)
+- `src/client/entry.ts` loader adapter: takes the factory's `require`, resolves
+  React, then hands the real context to `runtime.ts`
+- `src/client/runtime.ts` composition: one bindings store shared by the listener
+  and the settings row
 - `src/client/hints.ts` hint collection and label stream
 - `src/client/target.ts` which action a matched target needs (click vs focus)
 - `src/client/keys.ts` key state machine
-- `src/client/config.ts` default keys and selectors
+- `src/client/bindings.ts` chord model, platform defaults, validation, formatting
+- `src/client/store.ts` the persisted pair, total on read, normalized on write
+- `src/client/recorder.ts` one keydown into a candidate chord
+- `src/client/settings-controller.ts` the recording mode's rules, renderer-free
+- `src/client/settings-row.ts` the React row, built with `createElement`
+- `src/client/copy.ts` the row's Chinese and English copy
+- `src/client/config.ts` selectors and the label key map
 - `lib/` committed build products (`pnpm --filter dsh-jump build`)
