@@ -1,7 +1,6 @@
 {
   "name": "dsh-jump",
   "version": "0.1.0",
-  "type": "module",
   "description": "DeepSeek Harness jump plugin: Cmd+H labels clickable elements for click, Cmd+U for focus, Esc to leave",
   "license": "MIT",
   "author": "Lionad <1806234223@qq.com>",
@@ -24,6 +23,22 @@
     "vimium"
   ],
   "icon": "./assets/icon.svg",
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": []
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -40,22 +55,15 @@
     "README.md",
     "LICENSE"
   ],
-  "engines": {
-    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
-  },
-  "dsh": {
-    "client": {
-      "platform": "web",
-      "inject": []
-    },
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "release": "pnpm test && pnpm run build && pnpm publish --config.registry=https://registry.npmjs.org --no-git-checks"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.3.0-0"
   },
   "devDependencies": {
     "@types/jsdom": "^30.0.0",
@@ -63,10 +71,7 @@
     "jsdom": "^30.1.3",
     "vitest": "^3.2.0"
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.3.0-0"
-  },
+  "type": "module",
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
       "optional": true
