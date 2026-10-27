@@ -3,7 +3,8 @@
  * so tests drive it with plain objects and the browser adapter feeds a
  * KeyboardEvent's fields straight in.
  */
-import { ACTIVATION_CLICK, ACTIVATION_FOCUS, HOME_ROW_KEYS } from "./config.ts";
+import { matchesBinding, type JumpBindings } from "./bindings.ts";
+import { HOME_ROW_KEYS } from "./config.ts";
 
 export type KeyMode = "idle" | "click" | "focus";
 
@@ -40,33 +41,31 @@ function reset(state: KeyState): void {
 
 /**
  * Fold one key event into the state and report what it means. `labels` is the
- * live label set of the current activation round; a keystroke that neither
- * completes nor extends a label resets the pending prefix so a mistyped
- * sequence cannot poison the next one. Every accepted label character is
- * reported (even the first half of a two-key label): the caller echoes what
- * was typed, and `state.pending` says whether the label has fully landed.
+ * live label set of the current activation round and `bindings` the chords the
+ * user currently has bound; a keystroke that neither completes nor extends a
+ * label resets the pending prefix so a mistyped sequence cannot poison the next
+ * one. Every accepted label character is reported (even the first half of a
+ * two-key label): the caller echoes what was typed, and `state.pending` says
+ * whether the label has fully landed.
  */
 export function matchKey(
   state: KeyState,
   e: KeyEventLike,
-  labels: readonly string[] = HOME_ROW_KEYS,
+  labels: readonly string[],
+  bindings: JumpBindings,
 ): KeyAction {
-  const bare = !e.shiftKey && !e.ctrlKey && !e.altKey;
-
   if (state.mode === "idle") {
-    // Activation demands meta and nothing else: shift/alt/ctrl variants
-    // belong to the host and must not steal the chord.
-    if (e.metaKey && bare && !e.isComposing) {
-      if (e.key === ACTIVATION_CLICK) {
-        state.mode = "click";
-        state.pending = "";
-        return { type: "activate-click" };
-      }
-      if (e.key === ACTIVATION_FOCUS) {
-        state.mode = "focus";
-        state.pending = "";
-        return { type: "activate-focus" };
-      }
+    // Only the bound chord opens a round, and only with exactly its modifiers:
+    // any other stroke belongs to the host and must not be swallowed.
+    if (matchesBinding(e, bindings.click)) {
+      state.mode = "click";
+      state.pending = "";
+      return { type: "activate-click" };
+    }
+    if (matchesBinding(e, bindings.focus)) {
+      state.mode = "focus";
+      state.pending = "";
+      return { type: "activate-focus" };
     }
     return { type: "ignore" };
   }
@@ -75,13 +74,14 @@ export function matchKey(
     reset(state);
     return { type: "exit" };
   }
-  // Any meta chord (including the activation key pressed again) leaves jump
-  // mode instead of typing a label.
-  if (e.metaKey) {
+  // Any chord leaves jump mode instead of typing a label: the activation keys
+  // pressed again, and every neighbour the user might reach for by mistake.
+  // Shift is exempt because shift+label is a typo to swallow, not a chord.
+  if (e.metaKey || e.ctrlKey || e.altKey) {
     reset(state);
     return { type: "exit" };
   }
-  if (!bare || e.isComposing) return { type: "ignore" };
+  if (e.shiftKey || e.isComposing) return { type: "ignore" };
   // A stroke that cannot extend any label (wrong row, dead end) clears the
   // prefix so the mistyped sequence cannot poison the next one.
   if (!(HOME_ROW_KEYS as readonly string[]).includes(e.key)) {

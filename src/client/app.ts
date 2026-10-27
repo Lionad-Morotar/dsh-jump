@@ -8,8 +8,9 @@
  * unconsumed Cmd+H/Cmd+U or label stroke would leak into the embedded VS Code
  * keybindings.
  */
+import { createDefaultBindings, detectPlatform, type JumpBindings, type JumpPlatform } from "./bindings.ts";
 import { collectHints, type Hint } from "./hints.ts";
-import { createKeyState, matchKey, type KeyEventLike, type KeyState } from "./keys.ts";
+import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
 import { activationOf } from "./target.ts";
@@ -31,10 +32,25 @@ export interface JumpWindow {
   ): void;
 }
 
+/**
+ * The activation chords, as a live source rather than a fixed value.
+ *
+ * The reader can remap them from the settings page at any time while the
+ * listener stays installed for the page's lifetime, so the chords are read at
+ * match time instead of being captured at mount.
+ */
+export interface BindingSource {
+  get(): JumpBindings;
+}
+
 export interface AppDeps {
   /** Host window; defaults to the browser global, injected under jsdom. */
   window?: JumpWindow;
   config?: JumpConfig;
+  /** Activation chords; defaults to the platform keymap, fixed for the page. */
+  bindings?: BindingSource;
+  /** Modifier family, injected by tests; browsers read the navigator. */
+  platform?: JumpPlatform;
   /** Visibility oracle injected by tests; browsers get the default below. */
   isVisible?: (element: Element) => boolean;
 }
@@ -128,10 +144,19 @@ function focusTextEntry(element: Element, doc: Document): void {
   selection.addRange(range);
 }
 
+/** The navigator's platform string, or "" where the host has none. */
+function navigatorPlatform(): string {
+  return globalThis.navigator?.platform ?? "";
+}
+
 export function createApp(deps: AppDeps = {}): JumpApp {
   const win = deps.window ?? (globalThis as unknown as JumpWindow);
   const config: JumpConfig = { ...DEFAULT_CONFIG, ...deps.config };
   const isVisible = deps.isVisible ?? defaultIsVisible;
+  const platform = deps.platform ?? detectPlatform(navigatorPlatform());
+  // A caller without a store gets one fixed pair for this app's lifetime.
+  const fixed = createDefaultBindings(platform);
+  const bindings: BindingSource = deps.bindings ?? { get: () => fixed };
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
@@ -165,7 +190,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           isComposing: event.isComposing,
         };
         const wasActive = state.mode !== "idle";
-        const action = matchKey(state, like, hints.map((hint) => hint.label));
+        const action = matchKey(state, like, hints.map((hint) => hint.label), bindings.get());
         // While a mode is active every keydown belongs to jump, even the
         // ones matchKey ignores (Enter, arrows, off-row keys): a leaked
         // Enter would submit a focused composer and arrow scrolling would

@@ -374,3 +374,70 @@ describe("text entry targets actually receive focus", () => {
   });
 });
 
+describe("configurable activation chords", () => {
+  const custom = {
+    click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
+    focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+  };
+
+  function source(bindings: typeof custom) {
+    let current = bindings;
+    const listeners = new Set<(next: typeof custom) => void>();
+    return {
+      get: () => current,
+      subscribe: (listener: (next: typeof custom) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      push(next: typeof custom) {
+        current = next;
+        for (const listener of listeners) listener(current);
+      },
+    };
+  }
+
+  it("activates on the configured chord and ignores the shipped one", () => {
+    buttons(2);
+    const bindings = source(custom);
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    expect(overlayRoot()).toBeNull();
+
+    win.dispatchEvent(keydown({ key: "k", metaKey: true, altKey: true }));
+    expect(overlayRoot()).not.toBeNull();
+    teardown();
+  });
+
+  it("routes the focus chord through its own modifiers", () => {
+    const field = doc.createElement("textarea");
+    place(field, 10, 10);
+    doc.body.append(field);
+    const bindings = source(custom);
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    win.dispatchEvent(keydown({ key: "j", ctrlKey: true, shiftKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(field);
+    teardown();
+  });
+
+  it("takes a remap made while mounted on the next activation", () => {
+    buttons(2);
+    const bindings = source(custom);
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    bindings.push({
+      click: { key: "p", meta: true, alt: false, ctrl: false, shift: false },
+      focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+    });
+
+    win.dispatchEvent(keydown({ key: "k", metaKey: true, altKey: true }));
+    expect(overlayRoot()).toBeNull();
+    win.dispatchEvent(keydown({ key: "p", metaKey: true }));
+    expect(overlayRoot()).not.toBeNull();
+    teardown();
+  });
+});
+
