@@ -76,3 +76,21 @@ export function activationOf(element: Element): Activation {
 
   return "click";
 }
+
+/**
+ * 焦点是否落在一个会吞掉裸按键的输入面里。
+ *
+ * 与 activationOf 共用同一套判据。两处若各写一套，"什么算输入面"就会有两个
+ * 版本，而裸按键该不该让路正好取决于这个判断。
+ *
+ * 两层：元素自身按 activationOf 判，另外顺祖先链找 contenteditable ——
+ * 可编辑区域的焦点常常落在它的子节点上，而子节点自身没有 contenteditable 属性。
+ */
+export function isTextEntry(element: Element | null): boolean {
+  if (element === null) return false;
+  if (activationOf(element) === "focus") return true;
+  for (let node: Element | null = element; node !== null; node = node.parentElement) {
+    if (isEditable(node)) return true;
+  }
+  return false;
+}

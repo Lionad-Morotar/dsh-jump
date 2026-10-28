@@ -82,6 +82,14 @@ export function matchKey(
     return { type: "exit" };
   }
   if (e.shiftKey || e.isComposing) return { type: "ignore" };
+  // Pressing the activation chord again leaves. The modifier branch above
+  // catches every chorded form; a bare named key carries no modifier, so it
+  // has to be compared against the chords explicitly, or Insert/F2 would be
+  // the one activation that cannot be cancelled from the keyboard.
+  if (matchesBinding(e, bindings.click) || matchesBinding(e, bindings.focus)) {
+    reset(state);
+    return { type: "exit" };
+  }
   // A stroke that cannot extend any label (wrong row, dead end) clears the
   // prefix so the mistyped sequence cannot poison the next one.
   if (!(HOME_ROW_KEYS as readonly string[]).includes(e.key)) {

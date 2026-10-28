@@ -18,6 +18,36 @@ const LABELS = [...HOME_ROW_KEYS];
 const MAC = createDefaultBindings("macos");
 const OTHER = createDefaultBindings("other");
 
+describe("bare named chord as the activation", () => {
+  const BARE = {
+    click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
+    focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+  };
+
+  it("activates on the bare key", () => {
+    expect(matchKey(createKeyState(), key("Insert"), [], BARE)).toEqual({ type: "activate-click" });
+  });
+
+  it("leaves when the same bare key is pressed again", () => {
+    // 裸键没有修饰键，"任意修饰键即退出"那条分支罩不住它；不显式比对，
+    // 它就会成为唯一一个不能用键盘取消的激活键。
+    const state = createKeyState();
+    matchKey(state, key("Insert"), [], BARE);
+    expect(matchKey(state, key("Insert"), LABELS, BARE)).toEqual({ type: "exit" });
+    expect(state.mode).toBe("idle");
+  });
+
+  it("still leaves on Escape and on any modifier stroke", () => {
+    const a = createKeyState();
+    matchKey(a, key("Insert"), [], BARE);
+    expect(matchKey(a, key("Escape"), LABELS, BARE)).toEqual({ type: "exit" });
+
+    const b = createKeyState();
+    matchKey(b, key("Insert"), [], BARE);
+    expect(matchKey(b, key("q", { metaKey: true }), LABELS, BARE)).toEqual({ type: "exit" });
+  });
+});
+
 describe("activation", () => {
   it("meta+h in idle activates click mode", () => {
     expect(matchKey(createKeyState(), key("h", { metaKey: true }), LABELS, MAC)).toEqual({ type: "activate-click" });

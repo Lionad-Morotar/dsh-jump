@@ -8,12 +8,19 @@
  * unconsumed Cmd+H/Cmd+U or label stroke would leak into the embedded VS Code
  * keybindings.
  */
-import { createDefaultBindings, detectPlatform, type JumpBindings, type JumpPlatform } from "./bindings.ts";
+import {
+  createDefaultBindings,
+  detectPlatform,
+  firesInTextEntry,
+  matchesBinding,
+  type JumpBindings,
+  type JumpPlatform,
+} from "./bindings.ts";
 import { collectHints, type Hint } from "./hints.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
-import { activationOf } from "./target.ts";
+import { activationOf, isTextEntry } from "./target.ts";
 
 export interface JumpWindow {
   document: Document;
@@ -180,6 +187,18 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       let hints: Hint[] = [];
 
       const onKeyDown = (event: KeyboardEvent): void => {
+        // A bare named key (Insert, F2, Home) is only free while no text
+        // surface has focus: inside one, the editor's own meaning of that key
+        // outranks navigation. Checked before matchKey so the chord never opens
+        // a round, and skipped from the swallow below so the stroke reaches the
+        // field. A chord with a modifier can never be typed by accident, so it
+        // stays live everywhere.
+        const reachable = bindings.get();
+        const bareMatch =
+          (matchesBinding(event, reachable.click) && !firesInTextEntry(reachable.click)) ||
+          (matchesBinding(event, reachable.focus) && !firesInTextEntry(reachable.focus));
+        if (state.mode === "idle" && bareMatch && isTextEntry(win.document.activeElement)) return;
+
         const before = state.pending;
         const like: KeyEventLike = {
           key: event.key,
@@ -190,7 +209,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           isComposing: event.isComposing,
         };
         const wasActive = state.mode !== "idle";
-        const action = matchKey(state, like, hints.map((hint) => hint.label), bindings.get());
+        const action = matchKey(state, like, hints.map((hint) => hint.label), reachable);
         // While a mode is active every keydown belongs to jump, even the
         // ones matchKey ignores (Enter, arrows, off-row keys): a leaked
         // Enter would submit a focused composer and arrow scrolling would

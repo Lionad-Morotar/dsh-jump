@@ -143,6 +143,28 @@ describe("bindingIssue", () => {
     expect(bindingIssue(binding({ alt: true }), [binding()])).toBeNull();
   });
 
+  it("accepts a bare named key that prints nothing", () => {
+    // Insert / F1 / Home 这类键没有可打印字符，裸按不会在文本里留下痕迹，
+    // 所以"必须带修饰键"这条规则对它们不成立。
+    for (const key of ["Insert", "F1", "F12", "Home", "End", "PageUp", "PageDown"]) {
+      expect(bindingIssue(binding({ key, meta: false, alt: false, ctrl: false, shift: false }), []), key).toBeNull();
+    }
+  });
+
+  it("still requires a modifier on a bare printable key", () => {
+    // 单个字符裸按会打字，抢走它就是抢走输入法之外的所有输入。
+    for (const key of ["h", "1", "/", "F"]) {
+      expect(bindingIssue(binding({ key, meta: false, alt: false, ctrl: false, shift: false }), []), key).toBe("no-modifier");
+    }
+  });
+
+  it("reports modifierless named keys that the interface owns", () => {
+    // 免修饰键不等于免保留：这些键即使不带修饰键也仍然属于界面。
+    for (const key of ["Escape", "Tab", "Enter", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]) {
+      expect(bindingIssue(binding({ key, meta: false, alt: false, ctrl: false, shift: false }), []), key).toBe("reserved-key");
+    }
+  });
+
   it("accepts ordinary chords with any non-shift modifier", () => {
     expect(bindingIssue(binding(), [])).toBeNull();
     expect(bindingIssue(binding({ meta: false, ctrl: true }), [])).toBeNull();

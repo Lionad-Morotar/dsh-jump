@@ -75,6 +75,39 @@ const RESERVED_KEYS: readonly string[] = [
   "",
 ];
 
+/**
+ * Whether a chord is allowed to fire while a text surface has focus.
+ *
+ * A chord carrying a modifier is not something a text surface can produce by
+ * typing, so it stays available everywhere. A bare named key is the ambiguous
+ * case: an editor uses Insert for overtype, a grid uses Home for the row start.
+ * The plugin's job is navigation, not overriding the field the reader is in, so
+ * a bare chord stands down while one has focus.
+ */
+export function firesInTextEntry(binding: JumpBinding): boolean {
+  return binding.meta || binding.alt || binding.ctrl || binding.shift;
+}
+
+/**
+ * Keys that a bare press can own without taking input away from anyone.
+ *
+ * "Must carry a modifier" exists because a bare printable key types a character,
+ * so consuming it would eat text the reader meant to enter. That reasoning does
+ * not extend to keys with no character: Insert, the function row, Home/End,
+ * PageUp/PageDown and the media keys report a named `key` and print nothing.
+ * Binding one bare is therefore safe in general, and the runtime still steps
+ * aside while a text surface has focus (see `activationAllowed`), so an editor
+ * that reads Insert itself keeps it.
+ *
+ * The test is "is this the name of a printing key", not a whitelist: every
+ * `KeyboardEvent.key` of length 1 is printable (letters, digits, punctuation,
+ * space), and everything longer is a named key. Named keys the interface owns
+ * are filtered by RESERVED_KEYS first, so Escape and the arrows still lose.
+ */
+export function isNamedKey(key: string): boolean {
+  return key.length > 1 && !RESERVED_KEYS.includes(key);
+}
+
 const MAC_SYMBOLS: Readonly<Record<string, string>> = { ctrl: "⌃", alt: "⌥", shift: "⇧", meta: "⌘" };
 const OTHER_NAMES: Readonly<Record<string, string>> = { ctrl: "Ctrl", alt: "Alt", shift: "Shift", meta: "Meta" };
 
@@ -192,8 +225,10 @@ export function bindingsEqual(left: JumpBinding, right: JumpBinding): boolean {
 export function bindingIssue(candidate: JumpBinding, taken: readonly JumpBinding[]): BindingIssue | null {
   if (RESERVED_KEYS.includes(candidate.key)) return "reserved-key";
   // Shift alone is not a modifier: shift+a is still a plain letter to every
-  // text surface the plugin runs inside.
-  if (!candidate.meta && !candidate.alt && !candidate.ctrl) return "no-modifier";
+  // text surface the plugin runs inside. A named key is the exception, because
+  // it prints nothing and the runtime yields it back to focused text surfaces.
+  const bare = !candidate.meta && !candidate.alt && !candidate.ctrl;
+  if (bare && !isNamedKey(candidate.key)) return "no-modifier";
   if (taken.some((other) => bindingsEqual(other, candidate))) return "duplicate";
   return null;
 }

@@ -46,6 +46,75 @@ function activate(): void {
 
 beforeEach(() => {
   doc.body.replaceChildren();
+  (doc.activeElement as HTMLElement | null)?.blur?.();
+});
+
+describe("bare named keys yield to focused text surfaces", () => {
+  /** 一条只有 Insert、不带任何修饰键的绑定。 */
+  const BARE: { click: { key: string; meta: boolean; alt: boolean; ctrl: boolean; shift: boolean }; focus: typeof BARE.click } = {
+    click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
+    focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+  };
+
+  it("activates on a bare named key when focus is not in a text surface", () => {
+    buttons(2);
+    const bindings = { get: () => BARE };
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    doc.body.dispatchEvent(keydown({ key: "Insert" }));
+    expect(overlayRoot()).not.toBeNull();
+    teardown();
+  });
+
+  it("steps aside while a textarea has focus, so the editor keeps Insert", () => {
+    buttons(2);
+    const field = doc.createElement("textarea");
+    place(field, 10, 10);
+    doc.body.append(field);
+    field.focus();
+    const bindings = { get: () => BARE };
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    const e = keydown({ key: "Insert" });
+    field.dispatchEvent(e);
+    expect(overlayRoot()).toBeNull();
+    // 让路的判据是"没吃掉"：other 键的监听器仍然能看到这一击。
+    expect(e.defaultPrevented).toBe(false);
+    teardown();
+  });
+
+  it("steps aside for contenteditable too, which has no tag to check", () => {
+    buttons(2);
+    const editable = doc.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    place(editable, 10, 10);
+    doc.body.append(editable);
+    editable.focus();
+    const bindings = { get: () => BARE };
+    const teardown = createApp({ window: win, isVisible: () => true, bindings }).apply();
+
+    const e = keydown({ key: "Insert" });
+    editable.dispatchEvent(e);
+    expect(overlayRoot()).toBeNull();
+    expect(e.defaultPrevented).toBe(false);
+    teardown();
+  });
+
+  it("keeps a chorded binding working inside a text surface", () => {
+    // 带修饰键的组合键不与输入冲突，所以在输入面里也不让路。
+    const field = doc.createElement("textarea");
+    place(field, 10, 10);
+    doc.body.append(field);
+    field.focus();
+    buttons(2);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    const e = keydown({ key: "h", metaKey: true });
+    field.dispatchEvent(e);
+    expect(overlayRoot()).not.toBeNull();
+    expect(e.defaultPrevented).toBe(true);
+    teardown();
+  });
 });
 
 describe("createApp wiring", () => {
