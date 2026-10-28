@@ -32,6 +32,7 @@ interface Registration {
   name: string;
   id: string;
   order?: number;
+  label?: string | (() => string);
 }
 
 function registry() {
@@ -83,7 +84,7 @@ describe("clientPlugin", () => {
     dispose();
   });
 
-  it("registers the settings row in the General settings list", () => {
+  it("registers a settings section with a nav label", () => {
     boot(((id: string) => {
       if (id === "react") {
         return {
@@ -97,10 +98,11 @@ describe("clientPlugin", () => {
     }) as (id: string) => unknown);
     const { ctx, registrations, injections } = registry();
     const dispose = clientPlugin.apply(ctx);
-    expect(injections).toContain("settings.general.item");
+    expect(injections).toContain("settings.section");
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.id).toBe("jump");
     expect(registrations[0]?.order).toBe(SETTINGS_ORDER);
+    expect(typeof registrations[0]?.label).toBe("function");
     dispose();
     expect(doc.querySelectorAll("style[data-plugin-css]")).toHaveLength(0);
   });

@@ -6,7 +6,7 @@
  * Escape abandons it), and every one of those rules is testable without a
  * renderer. The React component below the fold only projects this state.
  */
-import type { JumpAction, JumpBindings, JumpPlatform } from "./bindings.ts";
+import { bindingsEqual, createDefaultBindings, type JumpAction, type JumpBindings, type JumpPlatform } from "./bindings.ts";
 import { recordChord } from "./recorder.ts";
 import type { BindingsStore } from "./store.ts";
 
@@ -37,6 +37,16 @@ export interface BindingRowController {
   }): PressOutcome;
   /** Restore the shipped chords and drop any recording. */
   reset(): void;
+  /**
+   * Restore one action's shipped chord, leaving the other alone.
+   *
+   * Added with the settings page: two chords used to sit side by side under one
+   * "restore defaults" button, which is fine while they are a single unit of
+   * configuration. A page that presents them as two independent rows invites the
+   * reader to reset one, and resetting both to do it loses work they did not
+   * mean to touch.
+   */
+  resetAction(action: JumpAction): void;
   subscribe(listener: (state: BindingRowState) => void): () => void;
 }
 
@@ -93,6 +103,19 @@ export function createBindingsController(options: BindingRowOptions): BindingRow
 
     reset(): void {
       store.reset();
+      emit({ bindings: store.get(), recording: null, issue: null });
+    },
+
+    resetAction(action) {
+      const shipped = createDefaultBindings(platform);
+      // The other action may already hold the shipped chord, in which case
+      // restoring would create the duplicate the recorder refuses. Sweeping the
+      // collision onto the other action's own default keeps both usable and is
+      // what "restore defaults" means for a pair that has to stay distinct.
+      const other = action === "click" ? "focus" : "click";
+      const next: JumpBindings = { ...state.bindings, [action]: shipped[action] };
+      if (bindingsEqual(next[action], next[other])) next[other] = shipped[other];
+      store.set(next);
       emit({ bindings: store.get(), recording: null, issue: null });
     },
 

@@ -17,7 +17,7 @@ import type { JumpConfig } from "./config.ts";
 import { detectPlatform, type JumpPlatform } from "./bindings.ts";
 import type { RuntimeContext } from "./runtime.ts";
 import { createRuntime } from "./runtime.ts";
-import type { RowReact } from "./settings-row.ts";
+import type { RowReact } from "./react.ts";
 
 type ModuleRequire = (specifier: string) => unknown;
 

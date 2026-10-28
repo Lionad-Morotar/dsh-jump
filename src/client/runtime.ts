@@ -17,7 +17,8 @@ import type { JumpConfig } from "./config.ts";
 import type { JumpPlatform } from "./bindings.ts";
 import { copyFor } from "./copy.ts";
 import { createBindingsController } from "./settings-controller.ts";
-import { insertRowStyles, JumpSettingsRow, type RowReact } from "./settings-row.ts";
+import { JumpSettingsPage, insertPageStyles } from "./settings-page.ts";
+import type { RowReact } from "./react.ts";
 import { createBindingsStore, type BindingsStore } from "./store.ts";
 
 /** The one part of the Cordis context this plugin reads. */
@@ -40,24 +41,36 @@ export interface ScopedContext {
 
 interface SlotService {
   inject(key: string, callback: () => () => void): () => void;
-  register(registration: { name: string; id: string; order: number }, component: unknown): () => void;
+  register(
+    registration: { name: string; id: string; order: number; label?: string | (() => string) },
+    component: unknown,
+  ): () => void;
 }
 
 interface LocaleService {
   getSnapshot(): { active: string };
 }
 
-/** The host slot the row occupies: the General settings list. */
-export const SETTINGS_SLOT = "settings.general.item";
-/** The row id; must not collide with the host's own rows. */
+/**
+ * The host slot this plugin occupies: one page in the settings panel.
+ *
+ * It started as a row inside the General list, which is the slot the host offers
+ * for a single preference. Two shortcuts are not a single preference, and a list
+ * row can only show them side by side under one restore control. A section gets
+ * its own nav entry, a heading per mode and a restore control per mode.
+ */
+export const SETTINGS_SLOT = "settings.section";
+/** The section id; a fresh id adds a nav entry rather than replacing a shipped one. */
 export const SETTINGS_ID = "jump";
 /**
- * Between the host's shortcut row (16) and its link-opening row (17).
+ * Position among the settings nav entries.
  *
- * The gap is not aesthetic: 17 is taken by ui-chat, so a row at the same order
- * renders in an order decided by registration timing rather than intent.
+ * Occupied at the time of writing: account -10, general 0, models 10,
+ * plugins 15, agent-presets 20, then third parties from 30 (cost-meter) up to
+ * 115/116 (skin managers). 25 puts this page directly after the host's own
+ * built-ins without landing on any of them.
  */
-export const SETTINGS_ORDER = 18;
+export const SETTINGS_ORDER = 25;
 
 export interface RuntimeDeps {
   ctx: RuntimeContext;
@@ -96,7 +109,7 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
 
   const disposers: (() => void)[] = [app.apply()];
 
-  // Registering the row has to wait for the slot service to exist. Sampling it
+  // Registering the page has to wait for the slot service to exist. Sampling it
   // once with `get` is the bug this shape exists to prevent: on a host where
   // slots comes up after this plugin, the sample is undefined, the branch is
   // skipped, and the plugin looks installed but has nowhere to be configured.
@@ -107,23 +120,26 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
         if (slots === undefined) return;
         const locale = scope.get<LocaleService>("locale");
         const controller = createBindingsController({ store, platform });
+        // The nav label is a thunk so the host re-reads it on every projection:
+        // the panel then follows a locale change without re-registering.
+        const label = (): string => copyFor(locale?.getSnapshot().active ?? "zh").navLabel;
+        const page = (): unknown =>
+          JumpSettingsPage({
+            React,
+            controller,
+            platform,
+            copy: copyFor(locale?.getSnapshot().active ?? "zh"),
+          });
         // slots.inject owns the registration's lifecycle: it runs the callback
         // once the slot exists and again if the host re-creates it, and
         // disposes on unload. Wrapping it in ctx.effect as well registers twice.
-        const disposeRow = slots.inject(SETTINGS_SLOT, () =>
-          slots.register({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER }, () =>
-            JumpSettingsRow({
-              React,
-              controller,
-              platform,
-              copy: copyFor(locale?.getSnapshot().active ?? "zh"),
-            }),
-          ),
+        const disposePage = slots.inject(SETTINGS_SLOT, () =>
+          slots.register({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER, label }, page),
         );
         const doc = deps.document ?? globalThis.document;
-        const disposeStyles = doc === undefined ? undefined : insertRowStyles(doc);
+        const disposeStyles = doc === undefined ? undefined : insertPageStyles(doc);
         return () => {
-          disposeRow();
+          disposePage();
           disposeStyles?.();
         };
       }),

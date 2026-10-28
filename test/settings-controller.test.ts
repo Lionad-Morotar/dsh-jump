@@ -130,6 +130,47 @@ describe("createBindingsController", () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
+  describe("resetAction", () => {
+    it("restores only the named action", () => {
+      const { controller, store } = setup();
+      controller.begin("click");
+      controller.press(press({ key: "k", metaKey: true, altKey: true }));
+      controller.begin("focus");
+      controller.press(press({ key: "j", ctrlKey: true, shiftKey: true }));
+      expect(store.get().focus.key).toBe("j");
+
+      controller.resetAction("click");
+      expect(store.get().click).toEqual(MAC.click);
+      // 重置一个不该动另一个：页面把两者呈现为独立的行，读者点哪行的
+      // 恢复就只该还原哪行。
+      expect(store.get().focus.key).toBe("j");
+    });
+
+    it("sweeps a resulting collision onto the other action's default", () => {
+      // 录制器不允许现存的重复，但"改过再还原"能造出来：先把 click 挪走，
+      // 再把 focus 改成 click 的出厂键，最后把 click 还原，两者就撞上了。
+      // 直接写文档（模拟另一个标签页或旧版本留下的状态）同样能到这一步。
+      const { controller, store } = setup();
+      controller.begin("click");
+      controller.press(press({ key: "k", metaKey: true, altKey: true }));
+      controller.begin("focus");
+      controller.press(press({ key: "h", metaKey: true }));
+      expect(store.get().focus.key).toBe("h");
+
+      controller.resetAction("click");
+      expect(store.get().click).toEqual(MAC.click);
+      // 撞上就必须一起扫开，否则还原会产出一个运行时永远轮不到的重复键。
+      expect(store.get().focus).toEqual(MAC.focus);
+    });
+
+    it("drops an open recording", () => {
+      const { controller } = setup();
+      controller.begin("click");
+      controller.resetAction("focus");
+      expect(controller.getState().recording).toBeNull();
+    });
+  });
+
   it("exposes the action the reader is recording and the chord it will replace", () => {
     const { controller } = setup();
     expect(controller.getState().recording).toBeNull();

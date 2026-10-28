@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { createDefaultBindings } from "../src/client/bindings.ts";
 import type { JumpWindow } from "../src/client/app.ts";
 import { createRuntime, SETTINGS_ID, SETTINGS_ORDER, SETTINGS_SLOT, type RuntimeContext } from "../src/client/runtime.ts";
-import type { RowReact } from "../src/client/settings-row.ts";
+import type { RowReact } from "../src/client/react.ts";
 import { createBindingsStore, type BindingsStorage } from "../src/client/store.ts";
 
 const MAC = createDefaultBindings("macos");
@@ -44,7 +44,8 @@ const REACT: RowReact = {
 
 interface Captured {
   slotKey: string;
-  registration: { name: string; id: string; order: number };
+  registration: { name: string; id: string; order: number; label?: string | (() => string) };
+  component: unknown;
 }
 
 function host() {
@@ -56,8 +57,11 @@ function host() {
         void key;
         return callback();
       },
-      register: (registration: { name: string; id: string; order: number }, _component: unknown) => {
-        captured.push({ slotKey: "unused", registration });
+      register: (
+        registration: { name: string; id: string; order: number; label?: string | (() => string) },
+        component: unknown,
+      ) => {
+        captured.push({ slotKey: "unused", registration, component });
         return () => undefined;
       },
     },
@@ -142,12 +146,15 @@ describe("createRuntime", () => {
     runtime.dispose();
   });
 
-  it("registers the row right after the host's own shortcut row", () => {
+  it("registers a settings section with a nav label", () => {
     const h = host();
     const runtime = createRuntime({ ctx: h.ctx, platform: "macos", React: REACT, ...HOST });
     expect(h.captured).toHaveLength(1);
-    expect(h.captured[0]?.registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER });
-    expect(SETTINGS_ORDER).toBeGreaterThan(16);
+    const registration = h.captured[0]?.registration;
+    expect(registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER, label: expect.any(Function) });
+    // label 是 thunk：宿主每次投影都重读，语言切换因此不需要重新注册。
+    expect(typeof registration?.label).toBe("function");
+    expect((registration?.label as () => string)()).toBe("跳跃导航");
     runtime.dispose();
   });
 
@@ -195,8 +202,11 @@ describe("createRuntime", () => {
         void key;
         return callback();
       },
-      register: (registration: { name: string; id: string; order: number }, _component: unknown) => {
-        captured.push({ slotKey: "unused", registration });
+      register: (
+        registration: { name: string; id: string; order: number; label?: string | (() => string) },
+        component: unknown,
+      ) => {
+        captured.push({ slotKey: "unused", registration, component });
         return () => undefined;
       },
     };
@@ -224,18 +234,25 @@ describe("createRuntime", () => {
     key(win, { key: "h", metaKey: true });
     expect(doc.querySelector("[data-dsh-jump-overlay]")).not.toBeNull();
 
-    // 服务就绪后行才出现。
+    // 服务就绪后页面才出现。
     pending.release?.();
     expect(captured).toHaveLength(1);
-    expect(captured[0]?.registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER });
+    expect(captured[0]?.registration).toEqual({
+      name: SETTINGS_SLOT,
+      id: SETTINGS_ID,
+      order: SETTINGS_ORDER,
+      label: expect.any(Function),
+    });
 
     runtime.dispose();
   });
 
-  it("keeps the row id and order clear of the host's own rows", () => {
-    // 宿主的占用（实测）：15 developer-tools、16 shortcuts、17 link-opening、
-    // 20 composer-enter、30 performance-usage。撞上就是两行同位置。
-    for (const order of [15, 16, 17, 20, 30, 100]) expect(SETTINGS_ORDER).not.toBe(order);
+  it("keeps the section id and order clear of the host's own entries", () => {
+    // 设置导航的实测占用：account -10、general 0、models 10、plugins 15、
+    // agent-presets 20，第三方从 30（cost-meter）一直到 115/116（皮肤管理器）。
+    // 撞上同一个 order 时谁在前取决于注册先后，不受控。
+    for (const order of [-10, 0, 10, 15, 20, 30, 31, 45, 100, 115, 116]) expect(SETTINGS_ORDER).not.toBe(order);
+    for (const id of ["account", "general", "models", "plugins", "agent-presets"]) expect(SETTINGS_ID).not.toBe(id);
     for (const id of ["shortcuts", "link-opening", "composer-enter", "developer-tools"]) {
       expect(SETTINGS_ID).not.toBe(id);
     }
