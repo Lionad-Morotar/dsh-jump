@@ -20,20 +20,14 @@ dsh plugin --profile web add dsh-jump
 The package on npm is `dsh-jump`. Restart the profile afterwards; the bundle
 patch registers its Loader row, so no manual `cordis.patch.yml` edit is needed.
 
-### From an index source
+### From a checkout
 
-The plugin manager can also install it through a market index: add the index URL
-`https://raw.githubusercontent.com/Lionad-Morotar/dsh-plugins/main/market/index.json`
-in Discover, then install the `dsh-jump` entry.
-
-### From this repository
-
-To track the checkout instead of the published version:
+To track this repository instead of the published version:
 
 ```json
 {
   "dependencies": {
-    "dsh-jump": "link:../dsh-plugins/packages/dsh-jump"
+    "dsh-jump": "link:../dsh-jump"
   },
   "dsh": {
     "profile": {
@@ -45,7 +39,8 @@ To track the checkout instead of the published version:
 
 Then `dsh plugin --profile web install` and restart DSH. The path in `link:`
 resolves relative to `~/.dsh/profiles/web`, so adjust it to wherever the
-checkout lives on your machine.
+checkout lives on your machine. Pointing at a git URL works too:
+`dsh plugin --profile web add github:Lionad-Morotar/dsh-jump`.
 
 ### Manual patch
 
@@ -183,4 +178,34 @@ a focused input never leaks through.
 - `src/client/react.ts` the narrowed React slice and the recording listener
 - `src/client/copy.ts` the page's Chinese and English copy
 - `src/client/config.ts` selectors and the label key map
-- `lib/` committed build products (`pnpm --filter dsh-jump build`)
+- `lib/` committed build products (`pnpm run build`)
+
+## Development
+
+```sh
+pnpm install
+pnpm test        # vitest, 12 files
+pnpm typecheck   # tsc --noEmit
+pnpm run build   # esbuild src -> lib, committed
+```
+
+`lib/` is committed on purpose: an installed profile loads `lib/` straight from
+the package and never runs a build step, so the built files have to be in the
+tarball and in the repository.
+
+The build produces a two-entry package: `lib/index.js` is the host half (an
+empty `apply` the Loader still requires to resolve) and `lib/client.js` is the
+browser half inlined with its React imports resolved at load time.
+
+## Releasing
+
+```sh
+npm version <patch|minor|major>   # or edit package.json
+pnpm run release                  # test, build, then publish to registry.npmjs.org
+git push --follow-tags
+```
+
+`release` runs the tests and the build before publishing, so a failing suite
+stops the release. Publishing goes to `registry.npmjs.org` explicitly because a
+global `registry` setting elsewhere (a mirror, for instance) would otherwise
+send the tarball to the wrong place while reads still succeed.

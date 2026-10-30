@@ -1,0 +1,11 @@
+node_modules/
+.pnpm-store/
+*.log
+.DS_Store
+coverage/
+temp/
+zRefs/
+
+# Build output is committed: the Harness profile loads lib/ straight from the
+# installed package and never runs a build step.
+!lib/
