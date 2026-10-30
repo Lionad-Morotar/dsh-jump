@@ -5,6 +5,10 @@
 Keyboard jump navigation for the DeepSeek Harness Web GUI: press a chord, type a
 letter label, and the labelled element is clicked or focused.
 
+[![npm](https://img.shields.io/npm/v/dsh-jump.svg?style=flat-square)](https://www.npmjs.com/package/dsh-jump)
+[![license](https://img.shields.io/npm/l/dsh-jump.svg?style=flat-square)](./LICENSE)
+[![topic](https://img.shields.io/badge/topic-dsh--plugin-0e7490.svg?style=flat-square)](https://github.com/topics/dsh-plugin)
+
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
 [中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
