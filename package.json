@@ -1,6 +1,6 @@
 {
   "name": "dsh-jump",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness jump plugin: Cmd+H labels clickable elements for click, Cmd+U for focus, Esc to leave",
   "license": "MIT",
   "author": "Lionad <1806234223@qq.com>",
