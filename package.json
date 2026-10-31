@@ -38,6 +38,46 @@
       "patch": "./cordis.patch.yml"
     }
   },
+  "dshWorkshop": {
+    "schema": "omdsh-workshop-package/v1",
+    "type": "plugin",
+    "integration": {
+      "protocol": "harness-profile",
+      "artifact": "cordis.patch.yml"
+    },
+    "install": {
+      "mode": "transactional",
+      "adapter": "profile-bundle",
+      "failurePolicy": "generation-rollback",
+      "touchesCurrentBeforeActivation": false
+    },
+    "lifecycle": {
+      "activation": "restart-profile",
+      "dispose": "supported"
+    },
+    "permissions": [
+      "web:index-inject",
+      "dom:overlay",
+      "browser:local-storage"
+    ],
+    "compatibility": {
+      "dshVersions": [
+        "0.2.1-rc.3"
+      ]
+    },
+    "capability": {
+      "id": "jump-labels",
+      "kind": "ui",
+      "invocation": "In the DSH web GUI, press the jump chord (Cmd+H for click, Cmd+U for focus) on any page, then type the letter label shown over a target.",
+      "expected": "Every visible interactive target gets a letter label; typing a label clicks that target (Cmd+H) or focuses it (Cmd+U); Escape leaves label mode."
+    },
+    "evidence": {
+      "install": null,
+      "failureIsolation": null,
+      "hotReload": null,
+      "remove": null
+    }
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
