@@ -71,6 +71,27 @@ describe("input source round", () => {
     expect(ime.current()).toBe("com.sogou.inputmethod.sogou.pinyin");
   });
 
+  it("keeps the remembered source when putting it back fails, so the next end retries", () => {
+    const ime = runner("com.sogou.inputmethod.sogou.pinyin");
+    let allowRestore = false;
+    const realSelect = ime.select.bind(ime);
+    ime.select = (id) => {
+      if (id !== "com.apple.keylayout.ABC" && !allowRestore) {
+        ime.log.push(`select:${id}`);
+        return false;
+      }
+      return realSelect(id);
+    };
+    const round = createInputSourceRound(ime);
+
+    round.begin();
+    round.end();
+    allowRestore = true;
+    round.end();
+
+    expect(ime.current()).toBe("com.sogou.inputmethod.sogou.pinyin");
+  });
+
   it("does not open a round when the switch to ABC fails, so the next successful round can still restore", () => {
     const ime = runner("com.sogou.inputmethod.sogou.pinyin");
     let allow = false;

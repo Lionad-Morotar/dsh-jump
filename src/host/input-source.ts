@@ -72,9 +72,9 @@ export function createInputSourceRound(runner: InputSourceRunner): InputSourceRo
     },
     end() {
       if (saved === null) return;
-      const back = saved;
+      // 还不回去就留着：清掉之后再也没有人记得原来的输入源。
+      if (!runner.select(saved)) return;
       saved = null;
-      runner.select(back);
     },
   };
 }
