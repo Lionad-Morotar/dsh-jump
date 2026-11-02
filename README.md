@@ -2,8 +2,9 @@
 
 <img src="./assets/icon.svg" width="72" height="72" alt="dsh-jump icon" align="right" />
 
-Keyboard jump navigation for the DeepSeek Harness Web GUI: press a chord, type a
-letter label, and the labelled element is clicked or focused.
+Keyboard jump navigation for the DeepSeek Harness Web GUI: press the click or
+focus chord, type a letter label, and the labelled element is clicked or
+focused.
 
 [![npm](https://img.shields.io/npm/v/dsh-jump.svg?style=flat-square)](https://www.npmjs.com/package/dsh-jump)
 [![license](https://img.shields.io/npm/l/dsh-jump.svg?style=flat-square)](./LICENSE)
@@ -60,7 +61,7 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 
 ## 中文
 
-给 DeepSeek Harness Web GUI 的键盘跳跃导航：按下一个组合键，视口里的可交互元素
+给 DeepSeek Harness Web GUI 的键盘跳跃导航：按下点击或聚焦的组合键，视口里的可交互元素
 会被打上字母标签，再敲标签即可点击或聚焦到它。
 
 - `Cmd+H` 进入点击模式，`Cmd+U` 进入聚焦模式；非 Mac 上默认是 `Ctrl+H` /
