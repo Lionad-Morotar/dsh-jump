@@ -54,12 +54,12 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   }
 
   /**
-   * The badge text of one hint. A prefix the label still starts with splits the
-   * label into the letters already typed and the ones left behind; a bare or
-   * ruled-out label stays one run, so the badge keeps reading as whole.
+   * The badge text of one hint. The typed prefix splits the label into the
+   * letters already typed and the ones left behind; an empty prefix, which is
+   * also what a ruled-out label gets, stays one run so the badge keeps reading
+   * as whole.
    */
-  function segments(hint: Hint, pending: string): HTMLElement[] {
-    const typed = pending !== "" && hint.label.startsWith(pending) ? pending : "";
+  function segments(hint: Hint, typed: string): HTMLElement[] {
     if (typed === "") return [segment("whole", hint.label)];
     // Weight, not colour, marks the hand-off: dimming already means "ruled out"
     // and must stay reserved for badges the prefix cannot reach.
@@ -70,9 +70,13 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   }
 
   function badge(hint: Hint, pending: string): HTMLElement {
+    // One answer drives both the split and the light: a label the prefix still
+    // reaches keeps its typed run and stays lit, otherwise it is one whole run
+    // and goes dim.
+    const matched = hint.label.startsWith(pending);
     const el = doc.createElement("div");
     el.dataset.jumpLabel = hint.label;
-    el.append(...segments(hint, pending));
+    el.append(...segments(hint, matched ? pending : ""));
     const { width, height } = viewport();
     // A hint at the viewport edge still needs its badge on screen, so the
     // badge box (not the hint) is clamped into the viewport.
@@ -82,7 +86,7 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       "position:fixed;left:" + String(Math.round(x)) + "px;top:" + String(Math.round(y)) + "px;" +
       "padding:1px 3px;background:#ffd60a;color:#000;border-radius:3px;" +
       "font:11px/1.3 ui-monospace,Menlo,monospace;pointer-events:none;" +
-      "opacity:" + (hint.label.startsWith(pending) ? "1" : "0.3");
+      "opacity:" + (matched ? "1" : "0.3");
     return el;
   }
 
