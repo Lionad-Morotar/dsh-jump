@@ -7,5 +7,6 @@ export default defineConfig({
     // tests build the only one in the room.
     environment: "node",
     include: ["test/**/*.test.ts"],
+    setupFiles: ["test/setup-platform.ts"],
   },
 });
