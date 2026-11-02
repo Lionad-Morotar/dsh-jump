@@ -71,6 +71,23 @@ describe("input source round", () => {
     expect(ime.current()).toBe("com.sogou.inputmethod.sogou.pinyin");
   });
 
+  it("does not open a round when the switch to ABC fails, so the next successful round can still restore", () => {
+    const ime = runner("com.sogou.inputmethod.sogou.pinyin");
+    let allow = false;
+    ime.select = (id) => {
+      ime.log.push(`select:${id}`);
+      return allow;
+    };
+    const round = createInputSourceRound(ime);
+
+    round.begin();
+    allow = true;
+    round.begin();
+    round.end();
+
+    expect(ime.log.at(-1)).toBe("select:com.sogou.inputmethod.sogou.pinyin");
+  });
+
   it("leaves the current source alone when it cannot be read", () => {
     const ime = runner(null);
     const round = createInputSourceRound(ime);

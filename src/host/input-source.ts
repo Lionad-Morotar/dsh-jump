@@ -65,8 +65,10 @@ export function createInputSourceRound(runner: InputSourceRunner): InputSourceRo
       if (saved !== null) return;
       const current = runner.current();
       if (current === null) return;
+      // 切不到英文就不算进入这一轮：清掉记住的源会让下一次 end 无源可还，
+      // 用户就停在半路的输入法上。记住的值留着，下一次 end 还能还。
+      if (!runner.select(ABC_SOURCE)) return;
       saved = current;
-      runner.select(ABC_SOURCE);
     },
     end() {
       if (saved === null) return;
