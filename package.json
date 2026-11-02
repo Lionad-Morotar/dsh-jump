@@ -58,7 +58,8 @@
     "permissions": [
       "web:index-inject",
       "dom:overlay",
-      "browser:local-storage"
+      "browser:local-storage",
+      "host:input-source"
     ],
     "compatibility": {
       "dshVersions": [
@@ -109,6 +110,7 @@
     "@types/jsdom": "^30.0.0",
     "esbuild": "^0.28.2",
     "jsdom": "^30.1.3",
+    "typescript": "^5.9.3",
     "vitest": "^3.2.0"
   },
   "type": "module",

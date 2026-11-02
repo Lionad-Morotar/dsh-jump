@@ -14,6 +14,7 @@
  */
 import { createApp, type JumpApp, type JumpWindow } from "./app.ts";
 import type { JumpConfig } from "./config.ts";
+import { notifyInputSource, type ImeFetch } from "./ime.ts";
 import type { JumpPlatform } from "./bindings.ts";
 import { copyFor } from "./copy.ts";
 import { createBindingsController } from "./settings-controller.ts";
@@ -84,6 +85,8 @@ export interface RuntimeDeps {
   window?: JumpWindow;
   /** Injected under jsdom, where there is no page document. */
   document?: Document;
+  /** Injected by tests; the page uses its own fetch when absent. */
+  imeFetch?: ImeFetch;
 }
 
 export interface JumpRuntime {
@@ -105,7 +108,14 @@ export interface JumpRuntime {
 export function createRuntime(deps: RuntimeDeps): JumpRuntime {
   const { ctx, platform, React, config } = deps;
   const store = deps.store ?? createBindingsStore({ platform });
-  const app = createApp({ config, bindings: store, platform, window: deps.window });
+  const imeFetch = deps.imeFetch;
+  const app = createApp({
+    config,
+    bindings: store,
+    platform,
+    window: deps.window,
+    onRound: (phase) => notifyInputSource(phase, imeFetch),
+  });
 
   const disposers: (() => void)[] = [app.apply()];
 

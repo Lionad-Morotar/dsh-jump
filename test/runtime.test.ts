@@ -171,6 +171,33 @@ describe("createRuntime", () => {
     runtime.dispose();
   });
 
+  it("asks the host input-source route to begin and end with the round", () => {
+    const win = dom.window;
+    const button = doc.createElement("button");
+    place(button);
+    doc.body.append(button);
+    const calls: { url: string; body: string }[] = [];
+    const runtime = createRuntime({
+      ctx: host().ctx,
+      platform: "macos",
+      React: null,
+      ...HOST,
+      imeFetch: (url, init) => {
+        calls.push({ url, body: init.body });
+        return Promise.resolve();
+      },
+    });
+
+    key(win, { key: "h", metaKey: true });
+    key(win, { key: "Escape" });
+
+    expect(calls).toEqual([
+      { url: "/api/dsh-jump/ime", body: '{"op":"begin"}' },
+      { url: "/api/dsh-jump/ime", body: '{"op":"end"}' },
+    ]);
+    runtime.dispose();
+  });
+
   it("skips the row when the loader seeded no usable React", () => {
     const h = host();
     const runtime = createRuntime({ ctx: h.ctx, platform: "macos", React: null, ...HOST });

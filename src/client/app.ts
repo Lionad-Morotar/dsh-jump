@@ -22,21 +22,16 @@ import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 
+/** 测试桩是 jsdom 的 window，监听签名不能比它更窄。 */
+type JumpListen = (type: string, listener: (event: Event) => void, options?: { capture?: boolean }) => void;
+
 export interface JumpWindow {
   document: Document;
   innerWidth: number;
   innerHeight: number;
   dispatchEvent(event: Event): boolean;
-  addEventListener(
-    type: "keydown",
-    listener: (event: KeyboardEvent) => void,
-    options?: { capture?: boolean },
-  ): void;
-  removeEventListener(
-    type: "keydown",
-    listener: (event: KeyboardEvent) => void,
-    options?: { capture?: boolean },
-  ): void;
+  addEventListener: JumpListen;
+  removeEventListener: JumpListen;
 }
 
 /**
@@ -60,6 +55,14 @@ export interface AppDeps {
   platform?: JumpPlatform;
   /** Visibility oracle injected by tests; browsers get the default below. */
   isVisible?: (element: Element) => boolean;
+  /**
+   * Told when a label round opens and when it closes.
+   *
+   * The page cannot change the system input source itself. The runtime turns
+   * these two moments into a request the host process can act on. Absent in
+   * tests that do not care, and a no-op must not change navigation.
+   */
+  onRound?: (phase: "begin" | "end") => void;
 }
 
 export interface JumpApp {
@@ -164,12 +167,29 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   // A caller without a store gets one fixed pair for this app's lifetime.
   const fixed = createDefaultBindings(platform);
   const bindings: BindingSource = deps.bindings ?? { get: () => fixed };
+  const onRound = deps.onRound ?? (() => undefined);
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
   });
 
+  /**
+   * Drop whatever currently holds focus before a round starts.
+   *
+   * A focused composer keeps an IME composition open, so the next letter would
+   * belong to the input method instead of a label. Blurring first makes the
+   * chord work from a text field the same way it works from a button. The
+   * document element and a missing blur are both left alone.
+   */
+  function releaseFocus(): void {
+    const active = win.document.activeElement as HTMLElement | null;
+    if (active === null || active === win.document.body || active === win.document.documentElement) return;
+    if (typeof active.blur !== "function") return;
+    active.blur();
+  }
+
   function collectRound(): Hint[] {
+    releaseFocus();
     // Snapshot semantics: hints are computed once per activation, so DOM
     // churn afterwards never moves labels under a half-typed prefix (v1).
     const hints = collectHints(
@@ -185,8 +205,21 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     apply(): () => void {
       const state = createKeyState();
       let hints: Hint[] = [];
+      let roundOpen = false;
 
-      const onKeyDown = (event: KeyboardEvent): void => {
+      const openRound = (): void => {
+        if (roundOpen) return;
+        roundOpen = true;
+        onRound("begin");
+      };
+      const closeRound = (): void => {
+        if (!roundOpen) return;
+        roundOpen = false;
+        onRound("end");
+      };
+
+      const onKeyDown = (raw: Event): void => {
+        const event = raw as KeyboardEvent;
         // A bare named key (Insert, F2, Home) is only free while no text
         // surface has focus: inside one, the editor's own meaning of that key
         // outranks navigation. Checked before matchKey so the chord never opens
@@ -224,12 +257,14 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
 
         if (action.type === "activate-click" || action.type === "activate-focus") {
+          openRound();
           hints = collectRound();
           return;
         }
         if (action.type === "exit") {
           hints = [];
           overlay.destroy();
+          closeRound();
           return;
         }
         if (state.pending !== before) {
@@ -244,6 +279,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const hit = hints.find((hint) => hint.label === typed);
         hints = [];
         overlay.destroy();
+        closeRound();
         const mode = state.mode;
         state.mode = "idle";
         if (hit === undefined) return;
@@ -268,11 +304,28 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
       };
 
+      // 切到别的应用时这一轮不再有人敲标签，但输入法是全系统的，英文会跟过去。
+      // 隐藏即结束，比等一分钟的兜底更早把输入源还回去。
+      const onVisibility = (): void => {
+        if (win.document.visibilityState !== "hidden") return;
+        hints = [];
+        overlay.destroy();
+        state.mode = "idle";
+        state.pending = "";
+        closeRound();
+      };
+      // 刷新或关掉页面时插件的卸载函数不会跑。pagehide 是这一轮还能发出 end 的最后时机。
+      const onPageHide = (): void => closeRound();
       win.addEventListener("keydown", onKeyDown, { capture: true });
+      win.document.addEventListener("visibilitychange", onVisibility);
+      win.addEventListener("pagehide", onPageHide);
       return () => {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
+        win.document.removeEventListener("visibilitychange", onVisibility);
+        win.removeEventListener("pagehide", onPageHide);
         overlay.destroy();
         hints = [];
+        closeRound();
       };
     },
   };
