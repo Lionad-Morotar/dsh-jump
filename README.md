@@ -78,7 +78,7 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 - 激活时先放掉当前焦点，再采集标签。焦点留在输入框里时，下一击会被输入法吃掉；
   放掉之后，从输入框和从按钮激活是同一条路。
 - macOS 上，激活还会记住当前输入源并切到美式键盘（`com.apple.keylayout.ABC`）。
-  `Esc`、打完一个标签、或插件卸载时还回去。切换由宿主进程调用本机的 `im-select`
+  `Esc`、打完一个标签、切到别的应用、或插件卸载时还回去。切换由宿主进程调用本机的 `im-select`
   完成，页面本身切不了输入法。二进制不在、或宿主没有 web 服务时，这一步跳过，
   标签模式照常打开。
 - 命中的元素决定动的含义：文本输入面（textarea、带光标的 input、

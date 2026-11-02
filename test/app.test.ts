@@ -492,6 +492,24 @@ describe("activation clears the page so the next letter is a label", () => {
     teardown();
   });
 
+  it("gives the input source back when the window is hidden mid-round", () => {
+    buttons(1);
+    const calls: string[] = [];
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      onRound: (phase) => calls.push(phase),
+    }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    Object.defineProperty(doc, "visibilityState", { configurable: true, get: () => "hidden" });
+    doc.dispatchEvent(new dom.window.Event("visibilitychange"));
+
+    expect(calls).toEqual(["begin", "end"]);
+    expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+
   it("gives the input source back when the page is going away mid-round", () => {
     buttons(1);
     const calls: string[] = [];

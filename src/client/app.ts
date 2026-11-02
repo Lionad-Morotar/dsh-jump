@@ -304,12 +304,24 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
       };
 
+      // 切到别的应用时这一轮不再有人敲标签，但输入法是全系统的，英文会跟过去。
+      // 隐藏即结束，比等一分钟的兜底更早把输入源还回去。
+      const onVisibility = (): void => {
+        if (win.document.visibilityState !== "hidden") return;
+        hints = [];
+        overlay.destroy();
+        state.mode = "idle";
+        state.pending = "";
+        closeRound();
+      };
       // 刷新或关掉页面时插件的卸载函数不会跑。pagehide 是这一轮还能发出 end 的最后时机。
       const onPageHide = (): void => closeRound();
       win.addEventListener("keydown", onKeyDown, { capture: true });
+      win.document.addEventListener("visibilitychange", onVisibility);
       win.addEventListener("pagehide", onPageHide);
       return () => {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
+        win.document.removeEventListener("visibilitychange", onVisibility);
         win.removeEventListener("pagehide", onPageHide);
         overlay.destroy();
         hints = [];
