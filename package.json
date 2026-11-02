@@ -58,7 +58,8 @@
     "permissions": [
       "web:index-inject",
       "dom:overlay",
-      "browser:local-storage"
+      "browser:local-storage",
+      "host:input-source"
     ],
     "compatibility": {
       "dshVersions": [

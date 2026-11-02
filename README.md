@@ -75,6 +75,12 @@ The top level of that file must always stay a YAML array (`[]` when empty).
   两个插件取同一个 `order` 时谁在前取决于注册先后，不受控。
 - 标签前九个是 `a s d f g h j k l`；超过九个时整轮改用等长的双键标签（`as`、`ad`
   ……），避免短标签抢走长标签的首击；超过 81 个则整轮升到三键。
+- 激活时先放掉当前焦点，再采集标签。焦点留在输入框里时，下一击会被输入法吃掉；
+  放掉之后，从输入框和从按钮激活是同一条路。
+- macOS 上，激活还会记住当前输入源并切到美式键盘（`com.apple.keylayout.ABC`）。
+  `Esc`、打完一个标签、或插件卸载时还回去。切换由宿主进程调用本机的 `im-select`
+  完成，页面本身切不了输入法。二进制不在、或宿主没有 web 服务时，这一步跳过，
+  标签模式照常打开。
 - 命中的元素决定动的含义：文本输入面（textarea、带光标的 input、
   `contenteditable`）聚焦并把光标落到草稿末尾，其余元素在点击模式下走完整的
   合成指针/鼠标/点击序列，聚焦模式下只调 `focus()`。
@@ -138,6 +144,16 @@ Labels are rendered as an overlay by the client entry; while jump mode is
 active all keydown events are consumed by the state machine, so typing inside
 a focused input never leaks through.
 
+Activation blurs the focused element before it collects labels, so a letter
+typed next is a label even when the chord was pressed inside a text field. On
+macOS the host process also remembers the current input source and switches to
+`com.apple.keylayout.ABC` for the round, then switches back on Escape, on a
+completed label, or when the plugin unloads. The page cannot do this itself;
+it asks the host over `POST /api/dsh-jump/ime`, and the host runs `im-select`.
+A missing binary or a host without a web server skips the switch. Labels still
+appear. `im-select` is a machine dependency, not a package dependency: install
+it yourself (`brew install im-select`) if you want the switch.
+
 ## v1 boundaries
 
 - Hints are snapshotted at the moment of activation: elements that appear or
@@ -166,7 +182,9 @@ a focused input never leaks through.
 
 ## Layout
 
-- `src/index.ts` host half (empty `apply`; the Loader requires it to resolve)
+- `src/index.ts` host half: serves `POST /api/dsh-jump/ime` and runs `im-select`
+- `src/host/input-source.ts` one round: remember, switch to ABC, restore
+- `src/host/ime-route.ts` the route, re-attached if the web server appears late
 - `src/client/entry.ts` loader adapter: takes the factory's `require`, resolves
   React, then hands the real context to `runtime.ts`
 - `src/client/runtime.ts` composition: one bindings store shared by the listener
@@ -182,6 +200,7 @@ a focused input never leaks through.
 - `src/client/react.ts` the narrowed React slice and the recording listener
 - `src/client/copy.ts` the page's Chinese and English copy
 - `src/client/config.ts` selectors and the label key map
+- `src/client/ime.ts` the page's begin/end notice to the host route
 - `lib/` committed build products (`pnpm run build`)
 
 ## Development
@@ -197,9 +216,9 @@ pnpm run build   # esbuild src -> lib, committed
 the package and never runs a build step, so the built files have to be in the
 tarball and in the repository.
 
-The build produces a two-entry package: `lib/index.js` is the host half (an
-empty `apply` the Loader still requires to resolve) and `lib/client.js` is the
-browser half inlined with its React imports resolved at load time.
+The build produces a two-entry package: `lib/index.js` is the host half (the
+input-source route) and `lib/client.js` is the browser half inlined with its
+React imports resolved at load time.
 
 ## Releasing
 
