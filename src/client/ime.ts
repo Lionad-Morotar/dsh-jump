@@ -9,8 +9,16 @@ export const IME_PATH = "/api/dsh-jump/ime";
 
 export type ImePhase = "begin" | "end";
 
+export interface ImeFetchInit {
+  method: "POST";
+  headers: { "content-type": string };
+  body: string;
+  /** 页面正在卸载时浏览器仍把这个请求发出去。 */
+  keepalive: true;
+}
+
 export interface ImeFetch {
-  (url: string, init: { method: "POST"; headers: { "content-type": string }; body: string }): Promise<unknown>;
+  (url: string, init: ImeFetchInit): Promise<unknown>;
 }
 
 export function notifyInputSource(phase: ImePhase, fetchImpl: ImeFetch = globalThis.fetch.bind(globalThis)): void {
@@ -18,5 +26,6 @@ export function notifyInputSource(phase: ImePhase, fetchImpl: ImeFetch = globalT
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ op: phase }),
+    keepalive: true,
   }).catch(() => undefined);
 }

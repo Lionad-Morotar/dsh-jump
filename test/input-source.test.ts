@@ -12,7 +12,7 @@ import {
   type InputSourceRunner,
 } from "../src/host/input-source.ts";
 
-function runner(initial: string | null): InputSourceRunner & { log: string[] } {
+function runner(initial: string | null): InputSourceRunner & { log: string[]; select(id: string): boolean } {
   let current = initial;
   const log: string[] = [];
   return {
@@ -90,6 +90,24 @@ describe("input source round", () => {
     round.end();
 
     expect(ime.current()).toBe("com.sogou.inputmethod.sogou.pinyin");
+  });
+
+  it("restores on its own when a round outlives its limit, then a new round reads the source again", () => {
+    const ime = runner("com.sogou.inputmethod.sogou.pinyin");
+    let now = 0;
+    const round = createInputSourceRound(ime, { now: () => now, limitMs: 1000 });
+
+    round.begin();
+    now = 1000;
+    round.sweep();
+
+    expect(ime.current()).toBe("com.sogou.inputmethod.sogou.pinyin");
+
+    ime.select("com.apple.keylayout.US");
+    round.begin();
+    round.end();
+
+    expect(ime.current()).toBe("com.apple.keylayout.US");
   });
 
   it("does not open a round when the switch to ABC fails, so the next successful round can still restore", () => {

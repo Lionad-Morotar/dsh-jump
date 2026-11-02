@@ -55,10 +55,34 @@ export interface InputSourceRound {
   begin(): void;
   /** 把 begin 时记下的输入源还回去。没有进行中的一轮则什么都不做。 */
   end(): void;
+  /** 一轮超过时限还没结束，就自己还原。页面刷新时 end 可能根本到不了。 */
+  sweep(): void;
 }
 
-export function createInputSourceRound(runner: InputSourceRunner): InputSourceRound {
+export interface InputSourceRoundOptions {
+  /** 一轮最长占用。到点 sweep 还原，避免页面走了之后输入法停在英文。 */
+  limitMs?: number;
+  now?: () => number;
+}
+
+/** 人敲完一组标签用不了这么久。更长就是页面已经走了，end 没送来。 */
+export const ROUND_LIMIT_MS = 60_000;
+
+export function createInputSourceRound(
+  runner: InputSourceRunner,
+  options: InputSourceRoundOptions = {},
+): InputSourceRound {
+  const limitMs = options.limitMs ?? ROUND_LIMIT_MS;
+  const now = options.now ?? Date.now;
   let saved: string | null = null;
+  let openedAt = 0;
+
+  function restore(): void {
+    if (saved === null) return;
+    // 还不回去就留着：清掉之后再也没有人记得原来的输入源。
+    if (!runner.select(saved)) return;
+    saved = null;
+  }
 
   return {
     begin() {
@@ -69,12 +93,15 @@ export function createInputSourceRound(runner: InputSourceRunner): InputSourceRo
       // 用户就停在半路的输入法上。记住的值留着，下一次 end 还能还。
       if (!runner.select(ABC_SOURCE)) return;
       saved = current;
+      openedAt = now();
     },
     end() {
+      restore();
+    },
+    sweep() {
       if (saved === null) return;
-      // 还不回去就留着：清掉之后再也没有人记得原来的输入源。
-      if (!runner.select(saved)) return;
-      saved = null;
+      if (now() - openedAt < limitMs) return;
+      restore();
     },
   };
 }

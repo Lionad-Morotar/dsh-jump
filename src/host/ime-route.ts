@@ -107,6 +107,9 @@ export function attachImeRoute(ctx: ImeHostContext, round: InputSourceRound): ()
   };
 
   register();
+  // 页面刷新时 end 到不了。到点自己还原，不把输入法留在英文上。
+  const timer = setInterval(() => round.sweep(), 1000);
+  if (typeof timer.unref === "function") timer.unref();
   const stopWatching = ctx.on("internal/service", (name) => {
     if (name !== "webServer") return;
     disposeRoute?.();
@@ -119,6 +122,7 @@ export function attachImeRoute(ctx: ImeHostContext, round: InputSourceRound): ()
   });
 
   return () => {
+    clearInterval(timer);
     stopWatching();
     disposeRoute?.();
     disposeRoute = undefined;

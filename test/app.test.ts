@@ -194,13 +194,13 @@ describe("createApp wiring", () => {
     buttons(2);
     const addSpy = vi.spyOn(win, "addEventListener");
     const teardown = createApp({ window: win, isVisible: () => true }).apply();
-    const added = addSpy.mock.calls.filter((c) => c[0] === "keydown").length;
+    const added = addSpy.mock.calls.filter((c) => c[0] === ("keydown" as string)).length;
     expect(added).toBe(1);
     addSpy.mockRestore();
 
     const removeSpy = vi.spyOn(win, "removeEventListener");
     teardown();
-    const removed = removeSpy.mock.calls.filter((c) => c[0] === "keydown").length;
+    const removed = removeSpy.mock.calls.filter((c) => c[0] === ("keydown" as string)).length;
     expect(removed).toBe(1);
     removeSpy.mockRestore();
 
@@ -487,6 +487,22 @@ describe("activation clears the page so the next letter is a label", () => {
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(calls).toEqual(["begin", "end"]);
+    teardown();
+  });
+
+  it("gives the input source back when the page is going away mid-round", () => {
+    buttons(1);
+    const calls: string[] = [];
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      onRound: (phase) => calls.push(phase),
+    }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    win.dispatchEvent(new dom.window.Event("pagehide"));
 
     expect(calls).toEqual(["begin", "end"]);
     teardown();

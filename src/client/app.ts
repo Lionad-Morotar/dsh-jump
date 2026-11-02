@@ -22,21 +22,16 @@ import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 
+/** 测试桩是 jsdom 的 window，监听签名不能比它更窄。 */
+type JumpListen = (type: string, listener: (event: Event) => void, options?: { capture?: boolean }) => void;
+
 export interface JumpWindow {
   document: Document;
   innerWidth: number;
   innerHeight: number;
   dispatchEvent(event: Event): boolean;
-  addEventListener(
-    type: "keydown",
-    listener: (event: KeyboardEvent) => void,
-    options?: { capture?: boolean },
-  ): void;
-  removeEventListener(
-    type: "keydown",
-    listener: (event: KeyboardEvent) => void,
-    options?: { capture?: boolean },
-  ): void;
+  addEventListener: JumpListen;
+  removeEventListener: JumpListen;
 }
 
 /**
@@ -223,7 +218,8 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         onRound("end");
       };
 
-      const onKeyDown = (event: KeyboardEvent): void => {
+      const onKeyDown = (raw: Event): void => {
+        const event = raw as KeyboardEvent;
         // A bare named key (Insert, F2, Home) is only free while no text
         // surface has focus: inside one, the editor's own meaning of that key
         // outranks navigation. Checked before matchKey so the chord never opens
@@ -308,9 +304,13 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
       };
 
+      // 刷新或关掉页面时插件的卸载函数不会跑。pagehide 是这一轮还能发出 end 的最后时机。
+      const onPageHide = (): void => closeRound();
       win.addEventListener("keydown", onKeyDown, { capture: true });
+      win.addEventListener("pagehide", onPageHide);
       return () => {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
+        win.removeEventListener("pagehide", onPageHide);
         overlay.destroy();
         hints = [];
         closeRound();
