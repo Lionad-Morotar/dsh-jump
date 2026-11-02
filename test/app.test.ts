@@ -6,7 +6,7 @@
  * KeyboardEvent 真实例派发，断言落在 DOM 副作用与 defaultPrevented 上。
  */
 import { JSDOM } from "jsdom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpWindow } from "../src/client/app.ts";
 
@@ -216,6 +216,83 @@ describe("createApp wiring", () => {
     expect(overlayRoot()).toBeNull();
     expect(e.defaultPrevented).toBe(false);
     teardown();
+  });
+});
+
+describe("badge segments in a multi-key round", () => {
+  // 断言先失败时也要摘掉监听器，否则漏掉的 app 会接管后续用例的按键。
+  let stop: (() => void) | undefined;
+  afterEach(() => {
+    stop?.();
+    stop = undefined;
+  });
+
+  function mount(): void {
+    stop = createApp({ window: win, isVisible: () => true }).apply();
+  }
+
+  /** 当前轮里某个 label 的徽章。 */
+  function badge(label: string): HTMLElement {
+    const root = overlayRoot();
+    const found = [...(root?.children ?? [])].find(
+      (child) => (child as HTMLElement).dataset.jumpLabel === label,
+    );
+    expect(found).toBeDefined();
+    return found as HTMLElement;
+  }
+
+  /** 徽章分出的文字段，按 [段名, 文本] 列出。 */
+  function parts(label: string): [string | undefined, string | null][] {
+    return [...badge(label).children].map((part) => [
+      (part as HTMLElement).dataset.jumpPart,
+      part.textContent,
+    ]);
+  }
+
+  it("paints a badge as one whole-label segment while no prefix is typed", () => {
+    buttons(12);
+    mount();
+    activate();
+
+    expect(parts("ad")).toEqual([["whole", "ad"]]);
+  });
+
+  it("splits a still-matching badge into the typed letters and the rest", () => {
+    buttons(12);
+    mount();
+    activate();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(parts("ad")).toEqual([
+      ["typed", "a"],
+      ["rest", "d"],
+    ]);
+    const [typed, rest] = [...badge("ad").children] as HTMLElement[];
+    expect(typed?.style.fontWeight).not.toBe("");
+    expect(typed?.style.fontWeight).not.toBe(rest?.style.fontWeight);
+    // 连前缀都对不上的徽章仍是一整段完整标签，只是变暗。
+    expect(parts("sd")).toEqual([["whole", "sd"]]);
+    expect(badge("sd").style.opacity).toBe("0.3");
+  });
+
+  it("returns every badge to one whole segment after a dead-end key", () => {
+    buttons(12);
+    mount();
+    activate();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(parts("ad")).toEqual([
+      ["typed", "a"],
+      ["rest", "d"],
+    ]);
+
+    // "x" 不在主行，接不上任何 label，前缀被清空。
+    win.dispatchEvent(keydown({ key: "x" }));
+
+    expect(parts("ad")).toEqual([["whole", "ad"]]);
+    expect(parts("sd")).toEqual([["whole", "sd"]]);
+    expect(badge("sd").style.opacity).toBe("1");
   });
 });
 
