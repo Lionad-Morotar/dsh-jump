@@ -60,6 +60,14 @@ export interface AppDeps {
   platform?: JumpPlatform;
   /** Visibility oracle injected by tests; browsers get the default below. */
   isVisible?: (element: Element) => boolean;
+  /**
+   * Told when a label round opens and when it closes.
+   *
+   * The page cannot change the system input source itself. The runtime turns
+   * these two moments into a request the host process can act on. Absent in
+   * tests that do not care, and a no-op must not change navigation.
+   */
+  onRound?: (phase: "begin" | "end") => void;
 }
 
 export interface JumpApp {
@@ -164,12 +172,29 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   // A caller without a store gets one fixed pair for this app's lifetime.
   const fixed = createDefaultBindings(platform);
   const bindings: BindingSource = deps.bindings ?? { get: () => fixed };
+  const onRound = deps.onRound ?? (() => undefined);
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
   });
 
+  /**
+   * Drop whatever currently holds focus before a round starts.
+   *
+   * A focused composer keeps an IME composition open, so the next letter would
+   * belong to the input method instead of a label. Blurring first makes the
+   * chord work from a text field the same way it works from a button. The
+   * document element and a missing blur are both left alone.
+   */
+  function releaseFocus(): void {
+    const active = win.document.activeElement as HTMLElement | null;
+    if (active === null || active === win.document.body || active === win.document.documentElement) return;
+    if (typeof active.blur !== "function") return;
+    active.blur();
+  }
+
   function collectRound(): Hint[] {
+    releaseFocus();
     // Snapshot semantics: hints are computed once per activation, so DOM
     // churn afterwards never moves labels under a half-typed prefix (v1).
     const hints = collectHints(
@@ -185,6 +210,18 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     apply(): () => void {
       const state = createKeyState();
       let hints: Hint[] = [];
+      let roundOpen = false;
+
+      const openRound = (): void => {
+        if (roundOpen) return;
+        roundOpen = true;
+        onRound("begin");
+      };
+      const closeRound = (): void => {
+        if (!roundOpen) return;
+        roundOpen = false;
+        onRound("end");
+      };
 
       const onKeyDown = (event: KeyboardEvent): void => {
         // A bare named key (Insert, F2, Home) is only free while no text
@@ -224,12 +261,14 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
 
         if (action.type === "activate-click" || action.type === "activate-focus") {
+          openRound();
           hints = collectRound();
           return;
         }
         if (action.type === "exit") {
           hints = [];
           overlay.destroy();
+          closeRound();
           return;
         }
         if (state.pending !== before) {
@@ -244,6 +283,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const hit = hints.find((hint) => hint.label === typed);
         hints = [];
         overlay.destroy();
+        closeRound();
         const mode = state.mode;
         state.mode = "idle";
         if (hit === undefined) return;
@@ -273,6 +313,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
         overlay.destroy();
         hints = [];
+        closeRound();
       };
     },
   };

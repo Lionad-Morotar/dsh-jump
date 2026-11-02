@@ -432,14 +432,79 @@ describe("text entry targets actually receive focus", () => {
     const teardown = createApp({ window: win, isVisible: () => true }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
-    // 第一个 label 指向 fake（DOM 顺序在前）。
+    // 激活本身会先放掉焦点，所以按钮不再是「原处」。要钉住的是：跳转失败后焦点
+    // 没有落到这个伪装目标上，选区也没有被涂到它的内容上。
     win.dispatchEvent(keydown({ key: "a" }));
 
-    expect(doc.activeElement).toBe(other);
+    expect(doc.activeElement).not.toBe(fake);
     const selection = doc.getSelection();
     const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
     expect(range !== null && fake.contains(range.commonAncestorContainer)).toBe(false);
     teardown();
+  });
+});
+
+describe("activation clears the page so the next letter is a label", () => {
+  it("blurs whatever held focus before collecting labels", () => {
+    buttons(2);
+    const field = doc.createElement("textarea");
+    place(field, 10, 10);
+    doc.body.append(field);
+    field.focus();
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+
+    expect(doc.activeElement).not.toBe(field);
+    expect(overlayRoot()).not.toBeNull();
+    teardown();
+  });
+
+  it("asks the host to take the latin input source on activation and to give it back on escape", () => {
+    buttons(1);
+    const calls: string[] = [];
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      onRound: (phase) => calls.push(phase),
+    }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "Escape" }));
+
+    expect(calls).toEqual(["begin", "end"]);
+    teardown();
+  });
+
+  it("gives the input source back once a label completes, not only on escape", () => {
+    buttons(1);
+    const calls: string[] = [];
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      onRound: (phase) => calls.push(phase),
+    }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(calls).toEqual(["begin", "end"]);
+    teardown();
+  });
+
+  it("gives the input source back if the plugin unloads while a round is open", () => {
+    buttons(1);
+    const calls: string[] = [];
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      onRound: (phase) => calls.push(phase),
+    }).apply();
+
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    teardown();
+
+    expect(calls).toEqual(["begin", "end"]);
   });
 });
 
