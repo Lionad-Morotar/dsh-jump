@@ -143,6 +143,13 @@ function focusTextEntry(element: Element, doc: Document): void {
   // focus() is a silent no-op when the element cannot take focus; only a target
   // that really took it should get a caret.
   if (doc.activeElement !== element) return;
+  // A native field carries its own caret and already places it at the end of
+  // the value on `focus()`. It also refuses `Range` work: `selectNodeContents`
+  // addresses the element rather than its text, so the range lands outside the
+  // field and the next keystroke goes nowhere even though the field does hold
+  // focus. Leaving the field alone is therefore the whole fix, and it equally
+  // keeps a caret the user left mid-word where they left it.
+  if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") return;
   const selection = doc.getSelection?.() ?? null;
   if (selection === null) return;
   // Collapsing to the end of the host is what makes the next keystroke append

@@ -519,6 +519,34 @@ describe("text entry targets actually receive focus", () => {
     expect(range !== null && fake.contains(range.commonAncestorContainer)).toBe(false);
     teardown();
   });
+
+  it("focuses a native search field without reaching for a Range", () => {
+    // 原生 input 不认 Range：`selectNodeContents(input)` 指向元素本身而不是它的
+    // 文本，加进选区之后光标落在框外，字段虽然拿到了焦点，下一个字母还是进不去。
+    // 真实浏览器立刻能看出来，jsdom 没有选区引擎则会假装通过，所以这里钉住的是
+    // 「没有构造 Range」，而不是最终选区落在哪。
+    const field = doc.createElement("input");
+    field.type = "search";
+    field.value = "query";
+    place(field, 10, 10, 160, 22);
+    doc.body.append(field);
+
+    const touched: string[] = [];
+    const originalCreateRange = doc.createRange.bind(doc);
+    doc.createRange = () => {
+      touched.push("createRange");
+      return originalCreateRange();
+    };
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(doc.activeElement).toBe(field);
+    expect(touched).toEqual([]);
+    teardown();
+    doc.createRange = originalCreateRange;
+  });
 });
 
 describe("activation clears the page so the next letter is a label", () => {
