@@ -146,10 +146,11 @@ inserts a description of the element into the current session's composer as a
 structured chip.
 
 - **Off until recorded.** Reference mode ships unbound, so no chord is taken
-  from the host on install. The settings page shows a third row with "Off"; the
-  chord button starts recording, and a "turn off reference mode" control unbinds
-  it again. Restoring that row means unbinding, not falling back to a shipped
-  chord, because it has none.
+  from the host on install. It is the third row of the Jump navigation settings
+  section (`settings.section`, id `jump`, order 25), under click and focus. That
+  row shows "Off" instead of a chord; its chord button starts recording, and a
+  "turn off reference mode" control unbinds it again. Restoring that row means
+  unbinding, not falling back to a shipped chord, because it has none.
 - **Nothing on the page changes.** The reference branch is checked before the
   target's own activation, so neither the synthetic click sequence nor the
   focus path runs. The element keeps whatever selection and focus it had.
