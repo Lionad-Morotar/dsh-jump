@@ -165,9 +165,12 @@ structured chip.
   session is on screen. An invisible entry in `conversation.input.overlay`
   publishes `{ sessionId, inputActions }`; with no session, or on a host
   without that slot, the insert answers `no-session` and nothing is clicked.
-- **Degrades, never throws.** A host without `insertReference` falls back to
-  `inputActions.insertText(clipboardText)`; if neither channel accepts the
-  write the pick is silently dropped rather than escalating into a click.
+- **Degrades, never throws.** A host without `insertReference`, or one whose
+  trigger source never registered, falls back to
+  `inputActions.insertText(clipboardText)`: the plain text is still sendable,
+  whereas a chip with no codec would be refused at send time and keep the
+  draft. If neither channel accepts the write the pick is silently dropped
+  rather than escalating into a click.
   `inputTriggers`, `sessions` and `conversation` are all soft-probed, so a host
   missing any of them keeps the navigation and loses only the chip's send-time
   identity.

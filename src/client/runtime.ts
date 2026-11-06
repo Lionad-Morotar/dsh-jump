@@ -157,6 +157,10 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
   // What the bridge last published. A plain object rather than a store: the
   // only reader is the insert closure, and it reads at click time.
   const bridge: { state: JumpReferenceBridgeState } = { state: { sessionId: null, inputActions: null } };
+  // Whether the chip's trigger source is registered. A mutable flag rather than
+  // a captured boolean: the inject path registers asynchronously, and the insert
+  // closure outlives any single registration.
+  const source: { registered: boolean } = { registered: false };
 
   /**
    * Write one picked element into the session's composer.
@@ -186,6 +190,9 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
         captureSpan: () => inputActions.captureInsertion?.(),
         insertReference: (insert, span) => facade?.insertReference?.(insert, span) ?? false,
         insertText: (text, span) => inputActions.insertText?.(text, span) ?? false,
+        // Without the source a chip would be refused at send time and keep the
+        // draft, so the plain-text write is the honest outcome here.
+        canInsertReference: source.registered,
       },
       uiReferencePayload(describeElement(element)),
     );
@@ -214,7 +221,11 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
         const triggers = scope.get<InputTriggersFace>("inputTriggers");
         if (triggers === undefined) return;
         const dispose = triggers.registerSource(createJumpReferenceSource());
-        return () => dispose();
+        source.registered = true;
+        return () => {
+          dispose();
+          source.registered = false;
+        };
       }),
     );
   }

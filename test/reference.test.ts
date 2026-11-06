@@ -141,6 +141,7 @@ describe("insertUiReference", () => {
       readonly spans?: readonly (TokenSpanLike | undefined)[];
       readonly reference?: readonly boolean[];
       readonly text?: readonly boolean[];
+      readonly canInsertReference?: boolean;
     } = {},
   ): UiReferenceInsertionDeps & { readonly inserts: UiReferenceInsert[]; readonly texts: string[] } {
     const inserts: UiReferenceInsert[] = [];
@@ -163,6 +164,7 @@ describe("insertUiReference", () => {
         texts.push(value);
         return text[Math.min(textCall++, text.length - 1)] ?? false;
       },
+      canInsertReference: script.canInsertReference ?? true,
     };
   }
 
@@ -178,6 +180,15 @@ describe("insertUiReference", () => {
     const d = deps({ spans: [span(1), span(2)], reference: [false, true] });
     expect(insertUiReference(d, payload)).toBe("reference");
     expect(d.inserts).toHaveLength(2);
+  });
+
+  it("never builds a chip when the source is not registered", () => {
+    // Reference mode stays usable without the source; it just writes the plain
+    // text form, which the host can still send.
+    const d = deps({ canInsertReference: false });
+    expect(insertUiReference(d, payload)).toBe("text");
+    expect(d.inserts).toHaveLength(0);
+    expect(d.texts).toEqual([payload.clipboardText]);
   });
 
   it("degrades to plain text when the chip path refuses twice", () => {

@@ -101,6 +101,56 @@ function key(win: typeof dom.window, init: Record<string, unknown>): void {
   win.dispatchEvent(new win.KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
 }
 
+describe("reference source availability", () => {
+  /** A host whose trigger service can be withheld, to model a late registration. */
+  function hostWithTriggers(withTriggers: boolean) {
+    const services: Record<string, unknown> = {
+      slots: {
+        inject: (_key: string, callback: () => () => void) => callback(),
+        register: () => () => undefined,
+      },
+      locale: { getSnapshot: () => ({ active: "zh" }) },
+    };
+    if (withTriggers) {
+      services.inputTriggers = { registerSource: () => () => undefined };
+    }
+    const get = <T>(name: string): T | undefined => services[name] as T | undefined;
+    return {
+      get,
+      inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        // A host missing the service never runs the callback, which is exactly
+        // the case the flag has to survive.
+        if (names.includes("inputTriggers") && services.inputTriggers === undefined) {
+          return () => undefined;
+        }
+        return callback({ get }) as unknown as () => void;
+      },
+    } as unknown as RuntimeContext;
+  }
+
+  it("registers the source when the host offers the service", () => {
+    const runtime = createRuntime({
+      ctx: hostWithTriggers(true),
+      platform: "macos",
+      React: REACT,
+      ...HOST,
+    });
+    // Nothing to assert on the flag directly; the runtime must simply survive
+    // the registration and tear down cleanly.
+    expect(() => runtime.dispose()).not.toThrow();
+  });
+
+  it("stays alive on a host without the trigger service", () => {
+    const runtime = createRuntime({
+      ctx: hostWithTriggers(false),
+      platform: "macos",
+      React: REACT,
+      ...HOST,
+    });
+    expect(() => runtime.dispose()).not.toThrow();
+  });
+});
+
 describe("createRuntime", () => {
   it("exposes the store both halves read", () => {
     const store = createBindingsStore({ storage: memory(), platform: "macos" });

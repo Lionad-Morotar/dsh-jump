@@ -117,6 +117,11 @@ export interface UiReferenceInsertionDeps {
   readonly captureSpan: () => TokenSpanLike | undefined;
   readonly insertReference: (insert: UiReferenceInsert, span: TokenSpanLike) => boolean;
   readonly insertText: (text: string, span: TokenSpanLike) => boolean;
+  /**
+   * Whether a chip would survive to send time. Read per write: a source can be
+   * disposed after the pick that offered this write began.
+   */
+  readonly canInsertReference: boolean;
 }
 
 /**
@@ -304,11 +309,15 @@ export function insertUiReference(
     clipboardText: payload.clipboardText,
     appearance: "session",
   };
-  const first = deps.captureSpan();
-  if (first !== undefined) {
-    if (deps.insertReference(insert, first)) return "reference";
-    const second = deps.captureSpan();
-    if (second !== undefined && deps.insertReference(insert, second)) return "reference";
+  // No registered source means no codec at send time, so the chip path is
+  // skipped entirely rather than attempted and refused later.
+  if (deps.canInsertReference) {
+    const first = deps.captureSpan();
+    if (first !== undefined) {
+      if (deps.insertReference(insert, first)) return "reference";
+      const second = deps.captureSpan();
+      if (second !== undefined && deps.insertReference(insert, second)) return "reference";
+    }
   }
   // No span at all means the composer has no caret to write at; the text path
   // asks once more because the editor may have settled in between.
