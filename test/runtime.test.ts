@@ -149,8 +149,9 @@ describe("createRuntime", () => {
   it("registers a settings section with a nav label", () => {
     const h = host();
     const runtime = createRuntime({ ctx: h.ctx, platform: "macos", React: REACT, ...HOST });
-    expect(h.captured).toHaveLength(1);
-    const registration = h.captured[0]?.registration;
+    // Two entries: the settings page and the invisible session bridge.
+    expect(h.captured).toHaveLength(2);
+    const registration = h.captured.find((c) => c.registration.id === SETTINGS_ID)?.registration;
     expect(registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER, label: expect.any(Function) });
     // label 是 thunk：宿主每次投影都重读，语言切换因此不需要重新注册。
     expect(typeof registration?.label).toBe("function");
@@ -217,8 +218,10 @@ describe("createRuntime", () => {
     const ctx = {
       get: () => undefined,
       inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        // Two injections now: the trigger source (which needs no React) and the
+        // settings slot. Only the slot one is deferred here.
+        if (!names.includes("slots")) return () => undefined;
         injected = true;
-        expect(names).toContain("slots");
         pending.release = () => {
           services.slots = slots;
           callback({ get: scopedGet });
@@ -236,8 +239,8 @@ describe("createRuntime", () => {
 
     // 服务就绪后页面才出现。
     pending.release?.();
-    expect(captured).toHaveLength(1);
-    expect(captured[0]?.registration).toEqual({
+    expect(captured).toHaveLength(2);
+    expect(captured.find((c) => c.registration.id === SETTINGS_ID)?.registration).toEqual({
       name: SETTINGS_SLOT,
       id: SETTINGS_ID,
       order: SETTINGS_ORDER,

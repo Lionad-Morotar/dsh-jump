@@ -63,7 +63,11 @@ describe("createBindingsController", () => {
     controller.begin("click");
     expect(controller.press(press({ key: "k", metaKey: true, altKey: true }))).toBe("saved");
     expect(controller.getState()).toEqual({
-      bindings: { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: MAC.focus },
+      bindings: {
+        click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
+        focus: MAC.focus,
+        reference: null,
+      },
       recording: null,
       issue: null,
     });

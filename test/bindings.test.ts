@@ -33,10 +33,13 @@ function event(over: Mods = {}) {
 
 describe("defaults", () => {
   it("ships one binding per action and nothing shares a chord", () => {
-    expect(Object.keys(MAC).sort()).toEqual(["click", "focus"]);
+    expect(Object.keys(MAC).sort()).toEqual(["click", "focus", "reference"]);
+    // Reference mode ships unbound: no chord is taken from the host until the
+    // reader records one.
+    expect(MAC.reference).toBeNull();
     expect(bindingsEqual(MAC.click, MAC.focus)).toBe(false);
-    expect(bindingIssue(MAC.click, [MAC.focus])).toBeNull();
-    expect(bindingIssue(MAC.focus, [MAC.click])).toBeNull();
+    expect(bindingIssue(MAC.click, [MAC.focus, MAC.reference])).toBeNull();
+    expect(bindingIssue(MAC.focus, [MAC.click, MAC.reference])).toBeNull();
   });
 
   it("uses the platform's own primary modifier rather than hard-coding meta", () => {

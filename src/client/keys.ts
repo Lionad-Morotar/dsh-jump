@@ -6,7 +6,7 @@
 import { matchesBinding, type JumpBindings } from "./bindings.ts";
 import { HOME_ROW_KEYS } from "./config.ts";
 
-export type KeyMode = "idle" | "click" | "focus";
+export type KeyMode = "idle" | "click" | "focus" | "reference";
 
 export interface KeyState {
   mode: KeyMode;
@@ -26,6 +26,7 @@ export interface KeyEventLike {
 export type KeyAction =
   | { type: "activate-click" }
   | { type: "activate-focus" }
+  | { type: "activate-reference" }
   | { type: "label"; key: string }
   | { type: "exit" }
   | { type: "ignore" };
@@ -67,6 +68,13 @@ export function matchKey(
       state.pending = "";
       return { type: "activate-focus" };
     }
+    // An unbound reference mode has no chord to match, which is how "off" is
+    // expressed: there is no stroke that opens it.
+    if (bindings.reference !== null && matchesBinding(e, bindings.reference)) {
+      state.mode = "reference";
+      state.pending = "";
+      return { type: "activate-reference" };
+    }
     return { type: "ignore" };
   }
 
@@ -86,7 +94,11 @@ export function matchKey(
   // catches every chorded form; a bare named key carries no modifier, so it
   // has to be compared against the chords explicitly, or Insert/F2 would be
   // the one activation that cannot be cancelled from the keyboard.
-  if (matchesBinding(e, bindings.click) || matchesBinding(e, bindings.focus)) {
+  if (
+    matchesBinding(e, bindings.click) ||
+    matchesBinding(e, bindings.focus) ||
+    (bindings.reference !== null && matchesBinding(e, bindings.reference))
+  ) {
     reset(state);
     return { type: "exit" };
   }

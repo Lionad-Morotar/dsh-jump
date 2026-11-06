@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpWindow } from "../src/client/app.ts";
+import type { JumpBindings } from "../src/client/bindings.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const win = dom.window as unknown as JumpWindow;
@@ -51,9 +52,10 @@ beforeEach(() => {
 
 describe("bare named keys yield to focused text surfaces", () => {
   /** 一条只有 Insert、不带任何修饰键的绑定。 */
-  const BARE: { click: { key: string; meta: boolean; alt: boolean; ctrl: boolean; shift: boolean }; focus: typeof BARE.click } = {
+  const BARE: JumpBindings = {
     click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
     focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+    reference: null,
   };
 
   it("activates on a bare named key when focus is not in a text surface", () => {
@@ -444,9 +446,10 @@ describe("text entry targets actually receive focus", () => {
 });
 
 describe("configurable activation chords", () => {
-  const custom = {
+  const custom: JumpBindings = {
     click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
     focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+    reference: null,
   };
 
   function source(bindings: typeof custom) {
@@ -500,6 +503,7 @@ describe("configurable activation chords", () => {
     bindings.push({
       click: { key: "p", meta: true, alt: false, ctrl: false, shift: false },
       focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+      reference: null,
     });
 
     win.dispatchEvent(keydown({ key: "k", metaKey: true, altKey: true }));

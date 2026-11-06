@@ -22,6 +22,16 @@ export interface Copy {
   focusTitle: string;
   /** One line under the focus-mode heading. */
   focusDescription: string;
+  /** Heading over the reference-mode row. */
+  referenceTitle: string;
+  /** One line under the reference-mode heading. */
+  referenceDescription: string;
+  /** Shown in place of a chord while reference mode has none. */
+  referenceDisabled: string;
+  /** The control that unbinds reference mode again. */
+  referenceDisable: string;
+  /** Why reference mode cannot be used right now, when it cannot. */
+  referenceNeedsSession: string;
   /** Shown in place of a chord while the reader is pressing keys. */
   recording: string;
   /** The instruction under the rows while recording. */
@@ -32,6 +42,8 @@ export interface Copy {
   clickName: string;
   /** Accessible name for the focus-mode chord button. */
   focusName: string;
+  /** Accessible name for the reference-mode chord button. */
+  referenceName: string;
   /** The note about how a bare named key behaves while typing. */
   bareNote: string;
   /** Why a chord was refused, keyed by the code the recorder reports. */
@@ -46,11 +58,17 @@ export const ZH: Copy = {
   clickDescription: "选中后触发一次完整的点击。",
   focusTitle: "聚焦模式",
   focusDescription: "选中后只把焦点移过去。",
+  referenceTitle: "引用模式",
+  referenceDescription: "选中后把该元素作为引用插入输入框，不点击也不移动焦点。",
+  referenceDisabled: "未启用",
+  referenceDisable: "关闭引用模式",
+  referenceNeedsSession: "需要先打开一个会话，引用要插进它的输入框。",
   recording: "按下快捷键",
   recordingHint: "Esc 取消",
   reset: "恢复默认",
   clickName: "点击模式的快捷键",
   focusName: "聚焦模式的快捷键",
+  referenceName: "引用模式的快捷键",
   bareNote: "Insert、F1 这类不产生字符的键可以不配修饰键；在输入框里它们仍归输入框。",
   issues: {
     "no-modifier": "单个字符的键需要⌘或⌃或⌥，不产生字符的键（Insert、F1 等）可以直接用",
@@ -67,11 +85,17 @@ export const EN: Copy = {
   clickDescription: "The selected target receives a full click.",
   focusTitle: "Focus mode",
   focusDescription: "The selected target only receives focus.",
+  referenceTitle: "Reference mode",
+  referenceDescription: "The selected element is inserted into the composer as a reference; nothing is clicked and focus does not move.",
+  referenceDisabled: "Off",
+  referenceDisable: "Turn off reference mode",
+  referenceNeedsSession: "Open a session first: the reference is inserted into its composer.",
   recording: "Press a shortcut",
   recordingHint: "Esc to cancel",
   reset: "Restore default",
   clickName: "Click-mode shortcut",
   focusName: "Focus-mode shortcut",
+  referenceName: "Reference-mode shortcut",
   bareNote: "Keys that print nothing, such as Insert or F1, can be bound bare; while a text field has focus they still belong to it.",
   issues: {
     "no-modifier": "A single-character key needs ⌘, ⌃ or ⌥; a key that prints nothing (Insert, F1) can be used bare",

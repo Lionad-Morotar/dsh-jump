@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { createDefaultBindings } from "../src/client/bindings.ts";
+import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 import { HOME_ROW_KEYS } from "../src/client/config.ts";
 import { createKeyState, matchKey } from "../src/client/keys.ts";
 
@@ -19,9 +19,10 @@ const MAC = createDefaultBindings("macos");
 const OTHER = createDefaultBindings("other");
 
 describe("bare named chord as the activation", () => {
-  const BARE = {
+  const BARE: JumpBindings = {
     click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
     focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+    reference: null,
   };
 
   it("activates on the bare key", () => {
@@ -78,7 +79,7 @@ describe("activation", () => {
   });
 
   it("follows the configured chord rather than the shipped letter", () => {
-    const custom = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false } };
+    const custom = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false }, reference: null };
     expect(matchKey(createKeyState(), key("k", { metaKey: true, altKey: true }), LABELS, custom)).toEqual({ type: "activate-click" });
     expect(matchKey(createKeyState(), key("j", { ctrlKey: true }), LABELS, custom)).toEqual({ type: "activate-focus" });
     // 旧默认值不再生效
@@ -174,7 +175,7 @@ describe("exit", () => {
   });
 
   it("exits on a non-primary modifier too, so a remapped chord cannot be half-typed", () => {
-    const custom = { click: { key: "k", meta: false, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false } };
+    const custom = { click: { key: "k", meta: false, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false }, reference: null };
     const state = createKeyState();
     matchKey(state, key("k", { altKey: true }), LABELS, custom);
     expect(state.mode).toBe("click");

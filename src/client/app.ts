@@ -60,7 +60,14 @@ export interface AppDeps {
   platform?: JumpPlatform;
   /** Visibility oracle injected by tests; browsers get the default below. */
   isVisible?: (element: Element) => boolean;
-}
+  /**
+   * What reference mode does with the picked element.
+   *
+   * Injected rather than imported so the DOM layer stays free of the composer:
+   * this callback writes into the session's draft, which is a different surface
+   * with its own failure modes.
+   */
+  onReference?: (element: Element) => void; }
 
 export interface JumpApp {
   /** Mount the window listener. Returns the symmetric teardown. */
@@ -196,7 +203,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const reachable = bindings.get();
         const bareMatch =
           (matchesBinding(event, reachable.click) && !firesInTextEntry(reachable.click)) ||
-          (matchesBinding(event, reachable.focus) && !firesInTextEntry(reachable.focus));
+          (matchesBinding(event, reachable.focus) && !firesInTextEntry(reachable.focus)) ||
+          (reachable.reference !== null &&
+            matchesBinding(event, reachable.reference) &&
+            !firesInTextEntry(reachable.reference));
         if (state.mode === "idle" && bareMatch && isTextEntry(win.document.activeElement)) return;
 
         const before = state.pending;
@@ -223,7 +233,11 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           return;
         }
 
-        if (action.type === "activate-click" || action.type === "activate-focus") {
+        if (
+          action.type === "activate-click" ||
+          action.type === "activate-focus" ||
+          action.type === "activate-reference"
+        ) {
           hints = collectRound();
           return;
         }
@@ -256,6 +270,13 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // contenteditable, all three left activeElement unchanged), while a
         // button has no focus semantics (focusing it runs nothing). Mode then
         // only decides the fallback for targets that do not care.
+        // Reference mode is checked before the target's own activation: it is
+        // the one mode whose whole point is to leave the page alone, so neither
+        // the click sequence nor the focus path may run for it.
+        if (mode === "reference") {
+          deps.onReference?.(hit.element);
+          return;
+        }
         const activation = activationOf(hit.element);
         if (activation === "focus") {
           focusTextEntry(hit.element, win.document);

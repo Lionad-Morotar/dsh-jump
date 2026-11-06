@@ -113,6 +113,7 @@ export const PAGE_CSS = `
   outline: 1px solid var(--dsw-alias-label-primary);
   outline-offset: -1px;
 }
+[data-dsh-jump-page] [data-dsh-jump-disable],
 [data-dsh-jump-page] [data-dsh-jump-reset] {
   height: 36px;
   padding: 0 12px;
@@ -125,10 +126,12 @@ export const PAGE_CSS = `
   line-height: 18px;
   cursor: pointer;
 }
+[data-dsh-jump-page] [data-dsh-jump-disable]:hover:not(:disabled),
 [data-dsh-jump-page] [data-dsh-jump-reset]:hover:not(:disabled) {
   background: var(--dsw-alias-interactive-bg-hover);
   color: var(--dsw-alias-label-primary);
 }
+[data-dsh-jump-page] [data-dsh-jump-disable]:disabled,
 [data-dsh-jump-page] [data-dsh-jump-reset]:disabled {
   cursor: default;
   opacity: 0.45;
@@ -183,8 +186,15 @@ function modeRow(props: ModeRowProps): unknown {
     () => controller.getState(),
   );
   const recording = state.recording === action;
-  const printed = formatBinding(state.bindings[action], platform);
-  const shipped = formatBinding(createDefaultBindings(platform)[action], platform);
+  const binding = state.bindings[action];
+  // An unbound action has no chord to print: the button shows the "off" word
+  // instead, and announces no shortcut rather than an empty one.
+  const printed = binding === null ? null : formatBinding(binding, platform);
+  const shipped = createDefaultBindings(platform)[action];
+  const shippedPrinted = shipped === null ? null : formatBinding(shipped, platform);
+  // Only reference mode can be unbound, so only it gets the control that
+  // unbinds; a "turn off click mode" button would be a plugin that does nothing.
+  const canDisable = action === "reference";
   return React.createElement(
     "div",
     { "data-dsh-jump-mode": action },
@@ -207,19 +217,33 @@ function modeRow(props: ModeRowProps): unknown {
           // chord, so the accessible name and the announced shortcut stay out
           // of that swap.
           "aria-label": name,
-          "aria-keyshortcuts": printed,
+          ...(printed === null ? {} : { "aria-keyshortcuts": printed }),
           onClick: () => {
             controller.begin(action);
           },
         },
-        recording ? copy.recording : printed,
+        recording ? copy.recording : (printed ?? copy.referenceDisabled),
       ),
+      canDisable
+        ? React.createElement(
+            "button",
+            {
+              type: "button",
+              "data-dsh-jump-disable": action,
+              disabled: binding === null,
+              onClick: () => {
+                controller.disableAction(action);
+              },
+            },
+            copy.referenceDisable,
+          )
+        : null,
       React.createElement(
         "button",
         {
           type: "button",
           "data-dsh-jump-reset": action,
-          disabled: printed === shipped,
+          disabled: printed === shippedPrinted,
           onClick: () => {
             controller.resetAction(action);
           },
@@ -275,6 +299,16 @@ export function JumpSettingsPage(props: SettingsPageProps): unknown {
       title: copy.focusTitle,
       description: copy.focusDescription,
       name: copy.focusName,
+    }),
+    modeRow({
+      React,
+      action: "reference",
+      controller,
+      platform,
+      copy,
+      title: copy.referenceTitle,
+      description: copy.referenceDescription,
+      name: copy.referenceName,
     }),
     // A refusal belongs to the recording row; the page repeats it once under the
     // rows so it is announced even while the reader's focus is on the button.

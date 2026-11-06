@@ -98,18 +98,22 @@ function textOf(n: Node): string {
 describe("JumpSettingsPage", () => {
   it("renders one row per mode, each with its own chord", () => {
     const { tree } = setup();
-    expect(chords(tree).map(textOf)).toEqual(["⌘H", "⌘U"]);
+    // The third row shows the "off" word instead of a chord, because reference
+    // mode ships unbound.
+    expect(chords(tree).map(textOf)).toEqual(["⌘H", "⌘U", ZH.referenceDisabled]);
     // 两个模式各有自己的说明，页面不再把两者挤在一句描述里。
     expect(textOf(tree)).toContain(ZH.clickTitle);
     expect(textOf(tree)).toContain(ZH.focusTitle);
     expect(textOf(tree)).toContain(ZH.clickDescription);
     expect(textOf(tree)).toContain(ZH.focusDescription);
+    expect(textOf(tree)).toContain(ZH.referenceTitle);
+    expect(textOf(tree)).toContain(ZH.referenceDescription);
   });
 
   it("gives each mode its own restore control", () => {
     const { tree } = setup();
-    expect(resets(tree)).toHaveLength(2);
-    expect(resets(tree).map((b) => b.props["data-dsh-jump-reset"])).toEqual(["click", "focus"]);
+    expect(resets(tree)).toHaveLength(3);
+    expect(resets(tree).map((b) => b.props["data-dsh-jump-reset"])).toEqual(["click", "focus", "reference"]);
   });
 
   it("disables a row's restore control while it already holds the shipped chord", () => {

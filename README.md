@@ -138,6 +138,39 @@ Labels are rendered as an overlay by the client entry; while jump mode is
 active all keydown events are consumed by the state machine, so typing inside
 a focused input never leaks through.
 
+## Reference mode
+
+A third activation mode, off by default. It uses the same label round as the
+other two, but picking a label does not click and does not move focus: it
+inserts a description of the element into the current session's composer as a
+structured chip.
+
+- **Off until recorded.** Reference mode ships unbound, so no chord is taken
+  from the host on install. The settings page shows a third row with "Off"; the
+  chord button starts recording, and a "turn off reference mode" control unbinds
+  it again. Restoring that row means unbinding, not falling back to a shipped
+  chord, because it has none.
+- **Nothing on the page changes.** The reference branch is checked before the
+  target's own activation, so neither the synthetic click sequence nor the
+  focus path runs. The element keeps whatever selection and focus it had.
+- **The chip.** `clipboardText` is `[ui element button#gx-reference]` or
+  `[ui element button[data-testid=gx-reference]]`; the label is
+  `button「引用」`. The model text is one line of facts:
+  `[ui element] <button> data-testid="gx-reference" role=button aria-label="引用" class="gx-btn" text="引用"`.
+  Identity priority is `data-testid` > `id` > up to three authored classes; a
+  class counts as authored when it carries a `-` or `_` and is not a utility
+  word or a generated hash (`css-…`, `sc-…`, `_…`).
+- **It needs a session.** The plugin is root-level, so it cannot ask which
+  session is on screen. An invisible entry in `conversation.input.overlay`
+  publishes `{ sessionId, inputActions }`; with no session, or on a host
+  without that slot, the insert answers `no-session` and nothing is clicked.
+- **Degrades, never throws.** A host without `insertReference` falls back to
+  `inputActions.insertText(clipboardText)`; if neither channel accepts the
+  write the pick is silently dropped rather than escalating into a click.
+  `inputTriggers`, `sessions` and `conversation` are all soft-probed, so a host
+  missing any of them keeps the navigation and loses only the chip's send-time
+  identity.
+
 ## v1 boundaries
 
 - Hints are snapshotted at the moment of activation: elements that appear or
