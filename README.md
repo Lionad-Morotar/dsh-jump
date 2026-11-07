@@ -199,8 +199,12 @@ structured chip.
   description rather than a live reference, so the element is looked up again
   on every click, in the same order the description was written in:
   `data-testid` > `id` > tag plus its authored classes > `role` / `aria-label`
-  > visible text. Each step runs over the whole candidate list before the next
-  one starts, so a stale `id` elsewhere on the page cannot beat a live test id.
+  > visible text. The identity steps search the whole document: a live
+  `data-testid` wins even when the element's tag changed since the chip was
+  written, and an `id` is matched without consulting the tag. Only the weaker
+  steps stay inside the original tag's candidate list. Each step is exhausted
+  before the next one starts, so a stale `id` elsewhere on the page cannot beat
+  a live test id.
   A hit is scrolled to the centre of the viewport and focused with
   `preventScroll`, which keeps the focus from undoing the centring. The
   composer is never a candidate: it is `contenteditable` and its text can hold
