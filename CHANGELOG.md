@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - 引用模式：设置页第三行，独立和弦、默认关闭。按和弦进入同一轮标签，选中目标不点击、不聚焦，把元素的可定位描述作为结构化 chip 插进当前会话输入框
 - 元素描述按 `data-testid` > `id` > 有含义的 class 取身份；宿主缺 `insertReference`、source 未注册时降级纯文本，无会话时返回 `no-session`，任何情况下都不退化成一次点击
+- 点击引用 chip 回到对应元素：按 `data-testid` > `id` > tag 加有含义的 class > `role` / `aria-label` > 可见文本重新找回元素，滚到视口中心并以 `preventScroll` 聚焦。每一档都先扫完整候选列表再降一档，页面上别处的旧 `id` 抢不过还活着的 test id；编辑区（`contenteditable`）永远不是候选，否则会滚到刚点的这颗 chip 自己。找不到返回 `false`，宿主保持自己的手势
 
 ### Changed
 
