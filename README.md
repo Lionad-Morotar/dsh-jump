@@ -64,11 +64,14 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 给 DeepSeek Harness Web GUI 的键盘跳跃导航：按下点击或聚焦的组合键，视口里的可交互元素
 会被打上字母标签，再敲标签即可点击或聚焦到它。
 
-- `Cmd+H` 进入点击模式，`Cmd+U` 进入聚焦模式；非 Mac 上默认是 `Ctrl+H` /
-  `Ctrl+U`。`Esc`（或任意 meta 组合键、或再按一次激活键）退出。
-- 两个组合键都可以改：设置 → 「跳跃导航」，点一下快捷键再按新的即可立即生效，
-  无需刷新。两个模式各有自己的恢复按钮。绑定存在浏览器的 `localStorage`
-  （`dsh-jump:bindings:v1`），不写进包配置。
+- `Cmd+H` 进入点击模式；非 Mac 上是 `Ctrl+H`。`Esc`（或任意 meta 组合键、或再按
+  一次激活键）退出。
+- 聚焦模式与引用模式默认未启用，没有和弦就没有按键能打开它们。要开启就进
+  设置 → 「跳跃导航」，点该行的快捷键再按一个组合键；行内另有「关闭」把它解绑
+  回未启用，「恢复默认」对这两行同样是解绑（它们没有出厂和弦可回）。点击模式
+  始终保留一个和弦。
+- 组合键都可以改：点一下快捷键再按新的即可立即生效，无需刷新。绑定存在浏览器的
+  `localStorage`（`dsh-jump:bindings:v1`），不写进包配置。
 - `Insert`、`F1`、`Home` 这类不产生字符的键可以不配修饰键。它们在输入框里
   仍然归输入框：焦点在可编辑区域时裸键不触发，带修饰键的组合键照旧生效。
 - 这一页在设置导航里排第 25 位。位置由注册时声明的 `order` 决定；宿主占用
@@ -124,8 +127,9 @@ Three families, each added because a real element was unreachable:
 
 ## Click versus focus is decided by the target
 
-Both activation keys jump to the same set, and the matched element decides
-what "jumping" means:
+Both activation modes jump to the same set, and the matched element decides
+what "jumping" means. Click mode ships bound; focus mode ships unbound, so a
+reader who wants it records a chord on its settings row first:
 
 - Text entry surfaces (textarea, caret-bearing inputs, contenteditable hosts)
   are focused, and the caret is collapsed to the end of the draft so the next
@@ -155,6 +159,43 @@ A missing binary or a host without a web server skips the switch. Labels still
 appear. `im-select` is a machine dependency, not a package dependency: install
 it yourself (`brew install im-select`) if you want the switch.
 
+## Reference mode
+
+A third activation mode, off by default. It uses the same label round as the
+other two, but picking a label does not click and does not move focus: it
+inserts a description of the element into the current session's composer as a
+structured chip.
+
+- **Off until recorded.** Reference mode ships unbound, so no chord is taken
+  from the host on install. It is the third row of the Jump navigation settings
+  section (`settings.section`, id `jump`, order 25), under click and focus. That
+  row shows "Off" instead of a chord; its chord button starts recording, and a
+  "turn off reference mode" control unbinds it again. Restoring that row means
+  unbinding, not falling back to a shipped chord, because it has none.
+- **Nothing on the page changes.** The reference branch is checked before the
+  target's own activation, so neither the synthetic click sequence nor the
+  focus path runs. The element keeps whatever selection and focus it had.
+- **The chip.** `clipboardText` is `[ui element button#gx-reference]` or
+  `[ui element button[data-testid=gx-reference]]`; the label is
+  `button「引用」`. The model text is one line of facts:
+  `[ui element] <button> data-testid="gx-reference" role=button aria-label="引用" class="gx-btn" text="引用"`.
+  Identity priority is `data-testid` > `id` > up to three authored classes; a
+  class counts as authored when it carries a `-` or `_` and is not a utility
+  word or a generated hash (`css-…`, `sc-…`, `_…`).
+- **It needs a session.** The plugin is root-level, so it cannot ask which
+  session is on screen. An invisible entry in `conversation.input.overlay`
+  publishes `{ sessionId, inputActions }`; with no session, or on a host
+  without that slot, the insert answers `no-session` and nothing is clicked.
+- **Degrades, never throws.** A host without `insertReference`, or one whose
+  trigger source never registered, falls back to
+  `inputActions.insertText(clipboardText)`: the plain text is still sendable,
+  whereas a chip with no codec would be refused at send time and keep the
+  draft. If neither channel accepts the write the pick is silently dropped
+  rather than escalating into a click.
+  `inputTriggers`, `sessions` and `conversation` are all soft-probed, so a host
+  missing any of them keeps the navigation and loses only the chip's send-time
+  identity.
+
 ## v1 boundaries
 
 - Hints are snapshotted at the moment of activation: elements that appear or
@@ -162,9 +203,9 @@ it yourself (`brew install im-select`) if you want the switch.
 - The activation chords are stored per browser profile in `localStorage`
   (`dsh-jump:bindings:v1`), not in package config. The host's own shortcut
   registry cannot hold them: a bare home-row label stroke is rejected as
-  modifier-less, and the shipped `Cmd+H` / `Cmd+U` defaults collide with
-  reserved primary chords. The listener is therefore plugin-owned, and the
-  settings page writes to the same plugin-owned document.
+  modifier-less, and the shipped `Cmd+H` default collides with reserved primary
+  chords. The listener is therefore plugin-owned, and the settings page writes
+  to the same plugin-owned document.
 - A chord that prints a character must carry ⌘, ⌃ or ⌥: a bare letter would
   type into whatever field has focus, and Shift alone is refused for the same
   reason. A key that prints nothing (Insert, F1, Home, PageUp) may be bound

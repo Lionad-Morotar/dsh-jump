@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpWindow } from "../src/client/app.ts";
+import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const win = dom.window as unknown as JumpWindow;
@@ -51,9 +52,10 @@ beforeEach(() => {
 
 describe("bare named keys yield to focused text surfaces", () => {
   /** 一条只有 Insert、不带任何修饰键的绑定。 */
-  const BARE: { click: { key: string; meta: boolean; alt: boolean; ctrl: boolean; shift: boolean }; focus: typeof BARE.click } = {
+  const BARE: JumpBindings = {
     click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
     focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+    reference: null,
   };
 
   it("activates on a bare named key when focus is not in a text surface", () => {
@@ -345,12 +347,29 @@ describe("active-mode key swallowing", () => {
   });
 });
 
+/**
+ * The shipped bindings plus a focus chord the reader recorded.
+ *
+ * Focus mode ships unbound, so a test that drives it has to configure it first;
+ * that is the same step a reader takes in the settings page.
+ */
+const WITH_FOCUS: JumpBindings = {
+  ...createDefaultBindings("macos"),
+  focus: { key: "u", meta: true, alt: false, ctrl: false, shift: false },
+};
+
 describe("focus mode (Cmd+U)", () => {
   it("Cmd+U then full label focuses the target and tears down overlay", () => {
     const input = doc.createElement("input");
     place(input, 5, 5);
     doc.body.append(input);
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     expect(overlayRoot()).not.toBeNull();
@@ -365,7 +384,13 @@ describe("focus mode (Cmd+U)", () => {
     const input = doc.createElement("input");
     place(input, 5, 5);
     doc.body.append(input);
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
@@ -395,7 +420,13 @@ describe("text entry targets actually receive focus", () => {
     // 跳到输入框的目的是接着写：光标落在行首等于把用户丢回开头。
     const host = composer();
     host.textContent = "draft";
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
@@ -443,7 +474,13 @@ describe("text entry targets actually receive focus", () => {
     field.value = "hello";
     place(field, 10, 10);
     doc.body.append(field);
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
@@ -460,7 +497,13 @@ describe("text entry targets actually receive focus", () => {
     doc.body.append(field);
     field.focus();
     field.setSelectionRange(3, 3);
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
@@ -506,7 +549,13 @@ describe("text entry targets actually receive focus", () => {
     doc.body.append(other);
     other.focus();
 
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     // 激活本身会先放掉焦点，所以按钮不再是「原处」。要钉住的是：跳转失败后焦点
@@ -537,7 +586,13 @@ describe("text entry targets actually receive focus", () => {
       touched.push("createRange");
       return originalCreateRange();
     };
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const teardown = createApp({
+      window: win,
+      isVisible: () => true,
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
+    }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
@@ -588,6 +643,9 @@ describe("activation clears the page so the next letter is a label", () => {
       window: win,
       isVisible: () => true,
       onRound: (phase) => calls.push(phase),
+      // Focus mode ships unbound, so this mount carries the chord a reader
+      // would have recorded in the settings page.
+      bindings: { get: () => WITH_FOCUS },
     }).apply();
 
     win.dispatchEvent(keydown({ key: "u", metaKey: true }));
@@ -648,9 +706,10 @@ describe("activation clears the page so the next letter is a label", () => {
 });
 
 describe("configurable activation chords", () => {
-  const custom = {
+  const custom: JumpBindings = {
     click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
     focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+    reference: null,
   };
 
   function source(bindings: typeof custom) {
@@ -704,6 +763,7 @@ describe("configurable activation chords", () => {
     bindings.push({
       click: { key: "p", meta: true, alt: false, ctrl: false, shift: false },
       focus: { key: "j", meta: false, alt: false, ctrl: true, shift: true },
+      reference: null,
     });
 
     win.dispatchEvent(keydown({ key: "k", metaKey: true, altKey: true }));

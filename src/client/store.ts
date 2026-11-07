@@ -50,8 +50,19 @@ export interface BindingsStoreOptions {
   platform: JumpPlatform;
 }
 
+/**
+ * Whether two sets are the same configuration.
+ *
+ * `bindingsEqual` is null-safe, so an unbound reference compares as equal to
+ * another unbound one and a document that only ever had two chords keeps
+ * reporting "no change" instead of writing itself back on every read.
+ */
 function samePair(left: JumpBindings, right: JumpBindings): boolean {
-  return bindingsEqual(left.click, right.click) && bindingsEqual(left.focus, right.focus);
+  return (
+    bindingsEqual(left.click, right.click) &&
+    bindingsEqual(left.focus, right.focus) &&
+    bindingsEqual(left.reference, right.reference)
+  );
 }
 
 /**

@@ -101,6 +101,56 @@ function key(win: typeof dom.window, init: Record<string, unknown>): void {
   win.dispatchEvent(new win.KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
 }
 
+describe("reference source availability", () => {
+  /** A host whose trigger service can be withheld, to model a late registration. */
+  function hostWithTriggers(withTriggers: boolean) {
+    const services: Record<string, unknown> = {
+      slots: {
+        inject: (_key: string, callback: () => () => void) => callback(),
+        register: () => () => undefined,
+      },
+      locale: { getSnapshot: () => ({ active: "zh" }) },
+    };
+    if (withTriggers) {
+      services.inputTriggers = { registerSource: () => () => undefined };
+    }
+    const get = <T>(name: string): T | undefined => services[name] as T | undefined;
+    return {
+      get,
+      inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        // A host missing the service never runs the callback, which is exactly
+        // the case the flag has to survive.
+        if (names.includes("inputTriggers") && services.inputTriggers === undefined) {
+          return () => undefined;
+        }
+        return callback({ get }) as unknown as () => void;
+      },
+    } as unknown as RuntimeContext;
+  }
+
+  it("registers the source when the host offers the service", () => {
+    const runtime = createRuntime({
+      ctx: hostWithTriggers(true),
+      platform: "macos",
+      React: REACT,
+      ...HOST,
+    });
+    // Nothing to assert on the flag directly; the runtime must simply survive
+    // the registration and tear down cleanly.
+    expect(() => runtime.dispose()).not.toThrow();
+  });
+
+  it("stays alive on a host without the trigger service", () => {
+    const runtime = createRuntime({
+      ctx: hostWithTriggers(false),
+      platform: "macos",
+      React: REACT,
+      ...HOST,
+    });
+    expect(() => runtime.dispose()).not.toThrow();
+  });
+});
+
 describe("createRuntime", () => {
   it("exposes the store both halves read", () => {
     const store = createBindingsStore({ storage: memory(), platform: "macos" });
@@ -149,8 +199,9 @@ describe("createRuntime", () => {
   it("registers a settings section with a nav label", () => {
     const h = host();
     const runtime = createRuntime({ ctx: h.ctx, platform: "macos", React: REACT, ...HOST });
-    expect(h.captured).toHaveLength(1);
-    const registration = h.captured[0]?.registration;
+    // Two entries: the settings page and the invisible session bridge.
+    expect(h.captured).toHaveLength(2);
+    const registration = h.captured.find((c) => c.registration.id === SETTINGS_ID)?.registration;
     expect(registration).toEqual({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER, label: expect.any(Function) });
     // label 是 thunk：宿主每次投影都重读，语言切换因此不需要重新注册。
     expect(typeof registration?.label).toBe("function");
@@ -244,8 +295,10 @@ describe("createRuntime", () => {
     const ctx = {
       get: () => undefined,
       inject: (names: string[], callback: (scope: { get<T>(n: string): T | undefined }) => void) => {
+        // Two injections now: the trigger source (which needs no React) and the
+        // settings slot. Only the slot one is deferred here.
+        if (!names.includes("slots")) return () => undefined;
         injected = true;
-        expect(names).toContain("slots");
         pending.release = () => {
           services.slots = slots;
           callback({ get: scopedGet });
@@ -263,8 +316,8 @@ describe("createRuntime", () => {
 
     // 服务就绪后页面才出现。
     pending.release?.();
-    expect(captured).toHaveLength(1);
-    expect(captured[0]?.registration).toEqual({
+    expect(captured).toHaveLength(2);
+    expect(captured.find((c) => c.registration.id === SETTINGS_ID)?.registration).toEqual({
       name: SETTINGS_SLOT,
       id: SETTINGS_ID,
       order: SETTINGS_ORDER,

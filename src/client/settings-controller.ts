@@ -6,7 +6,14 @@
  * Escape abandons it), and every one of those rules is testable without a
  * renderer. The React component below the fold only projects this state.
  */
-import { bindingsEqual, createDefaultBindings, type JumpAction, type JumpBindings, type JumpPlatform } from "./bindings.ts";
+import {
+  bindingsEqual,
+  createDefaultBindings,
+  type JumpAction,
+  type JumpBinding,
+  type JumpBindings,
+  type JumpPlatform,
+} from "./bindings.ts";
 import { recordChord } from "./recorder.ts";
 import type { BindingsStore } from "./store.ts";
 
@@ -47,6 +54,14 @@ export interface BindingRowController {
    * mean to touch.
    */
   resetAction(action: JumpAction): void;
+  /**
+   * Unbind one action, leaving the others alone.
+   *
+   * Focus and reference offer this; click does not. Unbinding click would be a
+   * plugin that does nothing rather than a preference, while the other two ship
+   * unbound and this is how they get back there.
+   */
+  disableAction(action: JumpAction): void;
   subscribe(listener: (state: BindingRowState) => void): () => void;
 }
 
@@ -55,9 +70,20 @@ export interface BindingRowOptions {
   platform: JumpPlatform;
 }
 
-/** The other action's chord, which a new one must not collide with. */
-function rivalOf(bindings: JumpBindings, action: JumpAction): JumpBindings[JumpAction][] {
-  return [action === "click" ? bindings.focus : bindings.click];
+/**
+ * Every chord a new one must not collide with: the other actions' chords.
+ *
+ * Unbound actions are dropped rather than passed along as null, because a null
+ * is not a chord and `bindingIssue` has nothing to compare it against.
+ */
+function rivalOf(bindings: JumpBindings, action: JumpAction): JumpBinding[] {
+  const others = (["click", "focus", "reference"] as const).filter((name) => name !== action);
+  const taken: JumpBinding[] = [];
+  for (const name of others) {
+    const binding = bindings[name];
+    if (binding !== null) taken.push(binding);
+  }
+  return taken;
 }
 
 export function createBindingsController(options: BindingRowOptions): BindingRowController {
@@ -107,15 +133,33 @@ export function createBindingsController(options: BindingRowOptions): BindingRow
     },
 
     resetAction(action) {
+      // Focus and reference have no shipped chord, so "restore" for them is
+      // "unbind": falling back to a default would invent a chord the reader
+      // never chose and make the mode reachable again.
+      if (action !== "click") {
+        store.set({ ...state.bindings, [action]: null });
+        emit({ bindings: store.get(), recording: null, issue: null });
+        return;
+      }
       const shipped = createDefaultBindings(platform);
       // The other action may already hold the shipped chord, in which case
       // restoring would create the duplicate the recorder refuses. Sweeping the
       // collision onto the other action's own default keeps both usable and is
-      // what "restore defaults" means for a pair that has to stay distinct.
-      const other = action === "click" ? "focus" : "click";
-      const next: JumpBindings = { ...state.bindings, [action]: shipped[action] };
-      if (bindingsEqual(next[action], next[other])) next[other] = shipped[other];
+      // what "restore defaults" means for a set that has to stay distinct.
+      const next: JumpBindings = { ...state.bindings, click: shipped.click };
+      for (const other of ["focus", "reference"] as const) {
+        if (bindingsEqual(next.click, next[other])) next[other] = shipped[other];
+      }
       store.set(next);
+      emit({ bindings: store.get(), recording: null, issue: null });
+    },
+
+    disableAction(action) {
+      // Click always keeps a chord: unbinding it would leave a plugin that does
+      // nothing rather than a preference. The other two modes ship unbound, so
+      // this is how they return there.
+      if (action === "click") return;
+      store.set({ ...state.bindings, [action]: null });
       emit({ bindings: store.get(), recording: null, issue: null });
     },
 

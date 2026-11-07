@@ -63,6 +63,14 @@ export interface AppDeps {
    * tests that do not care, and a no-op must not change navigation.
    */
   onRound?: (phase: "begin" | "end") => void;
+  /**
+   * What reference mode does with the picked element.
+   *
+   * Injected rather than imported so the DOM layer stays free of the composer:
+   * this callback writes into the session's draft, which is a different surface
+   * with its own failure modes.
+   */
+  onReference?: (element: Element) => void;
 }
 
 export interface JumpApp {
@@ -234,9 +242,16 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // field. A chord with a modifier can never be typed by accident, so it
         // stays live everywhere.
         const reachable = bindings.get();
+        // Every unbound mode is skipped: it has no chord, so there is nothing
+        // for the text-entry stand-down to compare against.
         const bareMatch =
           (matchesBinding(event, reachable.click) && !firesInTextEntry(reachable.click)) ||
-          (matchesBinding(event, reachable.focus) && !firesInTextEntry(reachable.focus));
+          (reachable.focus !== null &&
+            matchesBinding(event, reachable.focus) &&
+            !firesInTextEntry(reachable.focus)) ||
+          (reachable.reference !== null &&
+            matchesBinding(event, reachable.reference) &&
+            !firesInTextEntry(reachable.reference));
         if (state.mode === "idle" && bareMatch && isTextEntry(win.document.activeElement)) return;
 
         const before = state.pending;
@@ -263,7 +278,11 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           return;
         }
 
-        if (action.type === "activate-click" || action.type === "activate-focus") {
+        if (
+          action.type === "activate-click" ||
+          action.type === "activate-focus" ||
+          action.type === "activate-reference"
+        ) {
           openRound();
           hints = collectRound();
           return;
@@ -299,6 +318,13 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // contenteditable, all three left activeElement unchanged), while a
         // button has no focus semantics (focusing it runs nothing). Mode then
         // only decides the fallback for targets that do not care.
+        // Reference mode is checked before the target's own activation: it is
+        // the one mode whose whole point is to leave the page alone, so neither
+        // the click sequence nor the focus path may run for it.
+        if (mode === "reference") {
+          deps.onReference?.(hit.element);
+          return;
+        }
         const activation = activationOf(hit.element);
         if (activation === "focus") {
           focusTextEntry(hit.element, win.document);

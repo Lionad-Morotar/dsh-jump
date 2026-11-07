@@ -36,7 +36,27 @@ describe("createBindingsStore", () => {
   it("reads a stored document back", () => {
     const custom = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: true, alt: false, ctrl: false, shift: true } };
     const store = createBindingsStore({ storage: memoryStorage(JSON.stringify(custom)), platform: "macos" });
-    expect(store.get()).toEqual(custom);
+    // A two-key document predates reference mode; it reads back unbound rather
+    // than gaining a chord nobody recorded.
+    expect(store.get()).toEqual({ ...custom, reference: null });
+  });
+
+  it("keeps a focus chord an older document already had", () => {
+    // Focus mode ships unbound now, but a reader who recorded a chord before
+    // that change must not silently lose it.
+    const legacy = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: true, alt: false, ctrl: false, shift: true } };
+    const store = createBindingsStore({ storage: memoryStorage(JSON.stringify(legacy)), platform: "macos" });
+    expect(store.get().focus).toEqual({ key: "j", meta: true, alt: false, ctrl: false, shift: true });
+  });
+
+  it("reads a malformed focus chord as unbound", () => {
+    for (const focus of [null, 42, "nonsense", { key: 7 }, {}]) {
+      const store = createBindingsStore({
+        storage: memoryStorage(JSON.stringify({ focus })),
+        platform: "macos",
+      });
+      expect(store.get().focus, JSON.stringify(focus)).toBeNull();
+    }
   });
 
   it("falls back to the defaults for a corrupt or hostile document", () => {
@@ -75,6 +95,8 @@ describe("createBindingsStore", () => {
     expect(JSON.parse(storage.value ?? "null")).toEqual({
       click: { key: "k", meta: false, alt: false, ctrl: false, shift: false },
       focus: { key: "j", meta: true, alt: false, ctrl: false, shift: false },
+      // A set that omits reference normalizes to unbound, not to a chord.
+      reference: null,
     });
   });
 

@@ -63,7 +63,11 @@ describe("createBindingsController", () => {
     controller.begin("click");
     expect(controller.press(press({ key: "k", metaKey: true, altKey: true }))).toBe("saved");
     expect(controller.getState()).toEqual({
-      bindings: { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: MAC.focus },
+      bindings: {
+        click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
+        focus: null,
+        reference: null,
+      },
       recording: null,
       issue: null,
     });
@@ -72,9 +76,10 @@ describe("createBindingsController", () => {
 
   it("keeps recording after a rejected chord, so the reader can try again", () => {
     const { controller } = setup();
-    controller.begin("click");
-    expect(controller.press(press({ key: "u", metaKey: true }))).toBe("rejected");
-    expect(controller.getState().recording).toBe("click");
+    controller.begin("focus");
+    // ⌘H is click mode's chord, so recording it for focus is a duplicate.
+    expect(controller.press(press({ key: "h", metaKey: true }))).toBe("rejected");
+    expect(controller.getState().recording).toBe("focus");
     expect(controller.getState().issue).toBe("duplicate");
     // 接着按一个合法键就成功，拒绝状态被清掉
     expect(controller.press(press({ key: "k", metaKey: true }))).toBe("saved");
@@ -99,11 +104,35 @@ describe("createBindingsController", () => {
 
   it("clears a stale rejection when recording restarts", () => {
     const { controller } = setup();
-    controller.begin("click");
-    controller.press(press({ key: "u", metaKey: true }));
-    expect(controller.getState().issue).toBe("duplicate");
     controller.begin("focus");
+    controller.press(press({ key: "h", metaKey: true }));
+    expect(controller.getState().issue).toBe("duplicate");
+    controller.begin("reference");
     expect(controller.getState().issue).toBeNull();
+  });
+
+  it("unbinds focus on demand and on restore", () => {
+    const { controller, store } = setup();
+    controller.begin("focus");
+    controller.press(press({ key: "j", metaKey: true }));
+    expect(store.get().focus).toEqual({ key: "j", meta: true, alt: false, ctrl: false, shift: false });
+
+    controller.disableAction("focus");
+    expect(store.get().focus).toBeNull();
+
+    // "Restore" for a mode with no shipped chord means unbound, not the old
+    // shipped letter.
+    controller.begin("focus");
+    controller.press(press({ key: "j", metaKey: true }));
+    controller.resetAction("focus");
+    expect(store.get().focus).toBeNull();
+  });
+
+  it("leaves click bound when focus is disabled", () => {
+    const { controller, store } = setup();
+    const before = store.get().click;
+    controller.disableAction("focus");
+    expect(store.get().click).toEqual(before);
   });
 
   it("restores the defaults and drops any recording", () => {
@@ -137,13 +166,13 @@ describe("createBindingsController", () => {
       controller.press(press({ key: "k", metaKey: true, altKey: true }));
       controller.begin("focus");
       controller.press(press({ key: "j", ctrlKey: true, shiftKey: true }));
-      expect(store.get().focus.key).toBe("j");
+      expect(store.get().focus?.key).toBe("j");
 
       controller.resetAction("click");
       expect(store.get().click).toEqual(MAC.click);
       // 重置一个不该动另一个：页面把两者呈现为独立的行，读者点哪行的
       // 恢复就只该还原哪行。
-      expect(store.get().focus.key).toBe("j");
+      expect(store.get().focus?.key).toBe("j");
     });
 
     it("sweeps a resulting collision onto the other action's default", () => {
@@ -155,12 +184,13 @@ describe("createBindingsController", () => {
       controller.press(press({ key: "k", metaKey: true, altKey: true }));
       controller.begin("focus");
       controller.press(press({ key: "h", metaKey: true }));
-      expect(store.get().focus.key).toBe("h");
+      expect(store.get().focus?.key).toBe("h");
 
       controller.resetAction("click");
       expect(store.get().click).toEqual(MAC.click);
       // 撞上就必须一起扫开，否则还原会产出一个运行时永远轮不到的重复键。
-      expect(store.get().focus).toEqual(MAC.focus);
+      // 聚焦模式的「默认」现在就是未启用，所以扫开的结果是 null。
+      expect(store.get().focus).toBeNull();
     });
 
     it("drops an open recording", () => {
@@ -176,6 +206,7 @@ describe("createBindingsController", () => {
     expect(controller.getState().recording).toBeNull();
     controller.begin("focus");
     expect(controller.getState().recording).toBe("focus");
-    expect(controller.getState().bindings.focus).toEqual(MAC.focus);
+    // Focus mode ships unbound, so recording starts from "off".
+    expect(controller.getState().bindings.focus).toBeNull();
   });
 });

@@ -9,8 +9,13 @@
  * the runtime would refuse to recognize.
  */
 
-/** The two activation modes. Each owns exactly one chord. */
-export type JumpAction = "click" | "focus";
+/**
+ * The activation modes. Each owns at most one chord.
+ *
+ * `reference` is the third mode and the only optional one: it ships unbound, so
+ * a reader who never configures it never has the chord stolen from the host.
+ */
+export type JumpAction = "click" | "focus" | "reference";
 
 /**
  * Keyboards split into the two families the Chords differ on.
@@ -34,10 +39,18 @@ export interface JumpBinding {
   shift: boolean;
 }
 
-/** One chord per action. */
+/**
+ * One chord per action.
+ *
+ * Only `click` ships bound. `focus` and `reference` are nullable rather than
+ * defaulted: "no chord" is a real state for them (the mode is off), and a
+ * shipped chord would make the mode reachable without the reader ever asking
+ * for it. Click keeps its chord because it is the mode the plugin exists for.
+ */
 export interface JumpBindings {
   click: JumpBinding;
-  focus: JumpBinding;
+  focus: JumpBinding | null;
+  reference: JumpBinding | null;
 }
 
 /** Why a chord cannot be used, as a code the settings page turns into copy. */
@@ -141,12 +154,19 @@ export function detectPlatform(navigatorPlatform: string): JumpPlatform {
   return /mac|darwin|iphone|ipad/.test(reported) ? "macos" : "other";
 }
 
-/** The shipped chords: primary+H for click mode, primary+U for focus mode. */
+/**
+ * The shipped chord: primary+H for click mode.
+ *
+ * Focus and reference ship unbound. Binding either by default would take a
+ * chord away from the host on every install for a mode most readers never turn
+ * on, and a mode that cannot be reached is a mode that cannot surprise anyone.
+ */
 export function createDefaultBindings(platform: JumpPlatform): JumpBindings {
   const primary = platform === "macos" ? { meta: true, ctrl: false } : { meta: false, ctrl: true };
   return {
     click: { key: "h", alt: false, shift: false, ...primary },
-    focus: { key: "u", alt: false, shift: false, ...primary },
+    focus: null,
+    reference: null,
   };
 }
 
@@ -194,18 +214,51 @@ export function normalizeBinding(candidate: unknown, fallback: JumpBinding, plat
   };
 }
 
-/** Normalize a whole pair, falling back per action rather than for the pair. */
+/**
+ * Normalize a whole set, falling back per action rather than for the set.
+ *
+ * `focus` and `reference` do not fall back to a default, because they have
+ * none: a document written before a mode existed, or one whose chord is
+ * malformed, normalizes to "unbound" rather than to a chord nobody chose.
+ */
 export function normalizeBindings(candidate: unknown, platform: JumpPlatform = "macos"): JumpBindings {
   const defaults = createDefaultBindings(platform);
   const source = isRecord(candidate) ? candidate : {};
   return {
     click: normalizeBinding(source.click, defaults.click, platform),
-    focus: normalizeBinding(source.focus, defaults.focus, platform),
+    // A document written before this mode shipped unbound may still carry a
+    // chord the reader chose; that one is kept. A missing or malformed value
+    // means "off", never the old shipped letter.
+    focus: normalizeOptionalBinding(source.focus, platform),
+    reference: normalizeOptionalBinding(source.reference, platform),
   };
 }
 
-/** Structural equality over the five fields, normalized first. */
-export function bindingsEqual(left: JumpBinding, right: JumpBinding): boolean {
+/**
+ * Normalize a chord that has no default to fall back on.
+ *
+ * `normalizeBinding` always answers a chord, so "unbound" is expressed by the
+ * empty-key sentinel: anything that does not normalize to a real key is the
+ * absent state, not a chord with a blank key.
+ * @param candidate - the stored value, of any shape.
+ * @param platform - the modifier family to read a legacy letter against.
+ * @returns the chord, or null when the action is unbound.
+ */
+function normalizeOptionalBinding(candidate: unknown, platform: JumpPlatform): JumpBinding | null {
+  if (candidate === null || candidate === undefined) return null;
+  const empty: JumpBinding = { key: "", meta: false, alt: false, ctrl: false, shift: false };
+  const binding = normalizeBinding(candidate, empty, platform);
+  return binding.key === "" ? null : binding;
+}
+
+/**
+ * Structural equality over the five fields, normalized first.
+ *
+ * Null-safe on both sides: an unbound action equals only another unbound one,
+ * so a collision check can compare the whole set without special cases.
+ */
+export function bindingsEqual(left: JumpBinding | null, right: JumpBinding | null): boolean {
+  if (left === null || right === null) return left === right;
   return (
     left.key.toLowerCase() === right.key.toLowerCase() &&
     left.meta === right.meta &&
@@ -222,7 +275,7 @@ export function bindingsEqual(left: JumpBinding, right: JumpBinding): boolean {
  * keymap) already holds: two actions on one chord would make the second one
  * unreachable, since the runtime resolves the first match.
  */
-export function bindingIssue(candidate: JumpBinding, taken: readonly JumpBinding[]): BindingIssue | null {
+export function bindingIssue(candidate: JumpBinding, taken: readonly (JumpBinding | null)[]): BindingIssue | null {
   if (RESERVED_KEYS.includes(candidate.key)) return "reserved-key";
   // Shift alone is not a modifier: shift+a is still a plain letter to every
   // text surface the plugin runs inside. A named key is the exception, because

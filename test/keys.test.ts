@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { createDefaultBindings } from "../src/client/bindings.ts";
+import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 import { HOME_ROW_KEYS } from "../src/client/config.ts";
 import { createKeyState, matchKey } from "../src/client/keys.ts";
 
@@ -19,9 +19,10 @@ const MAC = createDefaultBindings("macos");
 const OTHER = createDefaultBindings("other");
 
 describe("bare named chord as the activation", () => {
-  const BARE = {
+  const BARE: JumpBindings = {
     click: { key: "Insert", meta: false, alt: false, ctrl: false, shift: false },
     focus: { key: "F2", meta: false, alt: false, ctrl: false, shift: false },
+    reference: null,
   };
 
   it("activates on the bare key", () => {
@@ -53,8 +54,16 @@ describe("activation", () => {
     expect(matchKey(createKeyState(), key("h", { metaKey: true }), LABELS, MAC)).toEqual({ type: "activate-click" });
   });
 
-  it("meta+u in idle activates focus mode", () => {
-    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, MAC)).toEqual({ type: "activate-focus" });
+  it("meta+u does nothing while focus mode is unbound", () => {
+    // The old shipped chord is free now: pressing it must not open a round.
+    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, MAC)).toEqual({ type: "ignore" });
+  });
+
+  it("meta+u activates focus mode once the reader records it", () => {
+    const configured: JumpBindings = { ...MAC, focus: { key: "u", meta: true, alt: false, ctrl: false, shift: false } };
+    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, configured)).toEqual({
+      type: "activate-focus",
+    });
   });
 
   it("plain h or u without meta does not activate", () => {
@@ -78,7 +87,7 @@ describe("activation", () => {
   });
 
   it("follows the configured chord rather than the shipped letter", () => {
-    const custom = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false } };
+    const custom = { click: { key: "k", meta: true, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false }, reference: null };
     expect(matchKey(createKeyState(), key("k", { metaKey: true, altKey: true }), LABELS, custom)).toEqual({ type: "activate-click" });
     expect(matchKey(createKeyState(), key("j", { ctrlKey: true }), LABELS, custom)).toEqual({ type: "activate-focus" });
     // 旧默认值不再生效
@@ -107,7 +116,8 @@ describe("label prefix matching", () => {
   it("the first half of a two-key label goes pending, the second completes it", () => {
     const labels = ["as", "ad"];
     const state = createKeyState();
-    matchKey(state, key("u", { metaKey: true }), LABELS, MAC);
+    // Click mode is the one that ships bound, so it opens the round here.
+    matchKey(state, key("h", { metaKey: true }), LABELS, MAC);
     expect(matchKey(state, key("a"), labels, MAC)).toEqual({ type: "label", key: "a" });
     expect(state.pending).toBe("a");
     expect(matchKey(state, key("s"), labels, MAC)).toEqual({ type: "label", key: "s" });
@@ -174,7 +184,7 @@ describe("exit", () => {
   });
 
   it("exits on a non-primary modifier too, so a remapped chord cannot be half-typed", () => {
-    const custom = { click: { key: "k", meta: false, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false } };
+    const custom = { click: { key: "k", meta: false, alt: true, ctrl: false, shift: false }, focus: { key: "j", meta: false, alt: false, ctrl: true, shift: false }, reference: null };
     const state = createKeyState();
     matchKey(state, key("k", { altKey: true }), LABELS, custom);
     expect(state.mode).toBe("click");

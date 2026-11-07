@@ -21,6 +21,17 @@ import { createBindingsController } from "./settings-controller.ts";
 import { JumpSettingsPage, insertPageStyles } from "./settings-page.ts";
 import type { RowReact } from "./react.ts";
 import { createBindingsStore, type BindingsStore } from "./store.ts";
+import {
+  createJumpBridgeView,
+  createJumpReferenceSource,
+  describeElement,
+  insertUiReference,
+  uiReferencePayload,
+  type InputActionsFace,
+  type InputTriggersFace,
+  type JumpReferenceBridgeState,
+  type UiReferenceInsertionResult,
+} from "./reference.ts";
 
 /** The one part of the Cordis context this plugin reads. */
 export interface RuntimeContext {
@@ -48,6 +59,31 @@ interface SlotService {
   ): () => void;
 }
 
+/** The slice of the session input facade the reference write calls. */
+interface SessionInputFace {
+  insertReference(
+    insert: {
+      source: string;
+      ref: string;
+      label: string;
+      clipboardText: string;
+      appearance?: "session" | "file" | "folder";
+    },
+    span: { readonly start: number; readonly end: number; readonly draftRev: number },
+  ): boolean;
+  focus?(): void;
+}
+
+/** The slice of the session service the reference write reads. */
+interface SessionsFace {
+  scope?(sessionId: string): unknown;
+}
+
+/** The slice of the conversation service the reference write reads. */
+interface ConversationFace {
+  input?: { for(actx: unknown): SessionInputFace };
+}
+
 interface LocaleService {
   getSnapshot(): { active: string };
 }
@@ -72,6 +108,18 @@ export const SETTINGS_ID = "jump";
  * built-ins without landing on any of them.
  */
 export const SETTINGS_ORDER = 25;
+
+/**
+ * The session-scope slot the invisible bridge occupies.
+ *
+ * A root-level plugin has no public way to ask "which session is on screen";
+ * this slot is mounted for exactly the session being shown and hands its entry
+ * the Session standard props, which is what makes the composer reachable.
+ */
+export const BRIDGE_SLOT = "conversation.input.overlay";
+/** The bridge's entry id; stable so a re-register replaces rather than stacks. */
+export const BRIDGE_ID = "jump.session-bridge"; /** Below the host's own composer overlays, which own the visible surfaces. */
+export const BRIDGE_ORDER = 95;
 
 export interface RuntimeDeps {
   ctx: RuntimeContext;
@@ -109,15 +157,83 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
   const { ctx, platform, React, config } = deps;
   const store = deps.store ?? createBindingsStore({ platform });
   const imeFetch = deps.imeFetch;
+
+  // What the bridge last published. A plain object rather than a store: the
+  // only reader is the insert closure, and it reads at click time.
+  const bridge: { state: JumpReferenceBridgeState } = { state: { sessionId: null, inputActions: null } };
+  // Whether the chip's trigger source is registered. A mutable flag rather than
+  // a captured boolean: the inject path registers asynchronously, and the insert
+  // closure outlives any single registration.
+  const source: { registered: boolean } = { registered: false };
+
+  /**
+   * Write one picked element into the session's composer.
+   *
+   * Every service is read per call: the facade is per session generation and
+   * throws once that generation is released, and this closure outlives any one
+   * of them. A missing bridge is `no-session` rather than a failure, because
+   * "no session is open" is a state the reader can fix.
+   */
+  const insertFor = (element: Element): UiReferenceInsertionResult => {
+    const { sessionId, inputActions } = bridge.state;
+    if (sessionId === null || inputActions === null) return "no-session";
+    let facade: SessionInputFace | undefined;
+    try {
+      const sessions = ctx.get<SessionsFace>("sessions");
+      const conversation = ctx.get<ConversationFace>("conversation");
+      const actx = sessions?.scope?.(sessionId);
+      if (actx === undefined || conversation?.input?.for === undefined) return "no-session";
+      facade = conversation.input.for(actx);
+    } catch {
+      // A released generation is the same answer as no session at all.
+      return "no-session";
+    }
+    if (facade === undefined || facade === null) return "no-session";
+    const result = insertUiReference(
+      {
+        captureSpan: () => inputActions.captureInsertion?.(),
+        insertReference: (insert, span) => facade?.insertReference?.(insert, span) ?? false,
+        insertText: (text, span) => inputActions.insertText?.(text, span) ?? false,
+        // Without the source a chip would be refused at send time and keep the
+        // draft, so the plain-text write is the honest outcome here.
+        canInsertReference: source.registered,
+      },
+      uiReferencePayload(describeElement(element)),
+    );
+    if (result === "reference" || result === "text") facade.focus?.();
+    return result;
+  };
+
   const app = createApp({
     config,
     bindings: store,
     platform,
     window: deps.window,
     onRound: (phase) => notifyInputSource(phase, imeFetch),
+    onReference: (element) => {
+      insertFor(element);
+    },
   });
 
   const disposers: (() => void)[] = [app.apply()];
+
+  // The chip's send-time identity. Registered outside the React branch: a host
+  // without React still navigates, and a chip already in a draft must still be
+  // sendable there.
+  if (typeof ctx.inject === "function") {
+    disposers.push(
+      ctx.inject(["inputTriggers"], (scope) => {
+        const triggers = scope.get<InputTriggersFace>("inputTriggers");
+        if (triggers === undefined) return;
+        const dispose = triggers.registerSource(createJumpReferenceSource());
+        source.registered = true;
+        return () => {
+          dispose();
+          source.registered = false;
+        };
+      }),
+    );
+  }
 
   // Registering the page has to wait for the slot service to exist. Sampling it
   // once with `get` is the bug this shape exists to prevent: on a host where
@@ -146,10 +262,20 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
         const disposePage = slots.inject(SETTINGS_SLOT, () =>
           slots.register({ name: SETTINGS_SLOT, id: SETTINGS_ID, order: SETTINGS_ORDER, label }, page),
         );
+        // The invisible bridge that publishes the composer. It renders nothing,
+        // so it needs no label; the host only needs the session standard props
+        // it hands every entry of this slot.
+        const Bridge = createJumpBridgeView(React, (state) => {
+          bridge.state = state;
+        });
+        const disposeBridge = slots.inject(BRIDGE_SLOT, () =>
+          slots.register({ name: BRIDGE_SLOT, id: BRIDGE_ID, order: BRIDGE_ORDER }, Bridge),
+        );
         const doc = deps.document ?? globalThis.document;
         const disposeStyles = doc === undefined ? undefined : insertPageStyles(doc);
         return () => {
           disposePage();
+          disposeBridge();
           disposeStyles?.();
         };
       }),

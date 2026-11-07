@@ -33,17 +33,21 @@ function event(over: Mods = {}) {
 
 describe("defaults", () => {
   it("ships one binding per action and nothing shares a chord", () => {
-    expect(Object.keys(MAC).sort()).toEqual(["click", "focus"]);
-    expect(bindingsEqual(MAC.click, MAC.focus)).toBe(false);
-    expect(bindingIssue(MAC.click, [MAC.focus])).toBeNull();
-    expect(bindingIssue(MAC.focus, [MAC.click])).toBeNull();
+    expect(Object.keys(MAC).sort()).toEqual(["click", "focus", "reference"]);
+    // Only click ships bound. Focus and reference take no chord from the host
+    // until the reader records one.
+    expect(MAC.focus).toBeNull();
+    expect(MAC.reference).toBeNull();
+    expect(bindingIssue(MAC.click, [MAC.focus, MAC.reference])).toBeNull();
   });
 
   it("uses the platform's own primary modifier rather than hard-coding meta", () => {
     expect(MAC.click).toEqual(binding({ key: "h", meta: true }));
-    expect(MAC.focus).toEqual(binding({ key: "u", meta: true }));
     expect(OTHER.click).toEqual(binding({ key: "h", meta: false, ctrl: true }));
-    expect(OTHER.focus).toEqual(binding({ key: "u", meta: false, ctrl: true }));
+    // Focus mode ships unbound on both platforms, so there is no shipped chord
+    // whose modifier could be read.
+    expect(MAC.focus).toBeNull();
+    expect(OTHER.focus).toBeNull();
   });
 
   it("detects a mac host from the navigator platform string", () => {

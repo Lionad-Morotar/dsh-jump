@@ -99,10 +99,15 @@ describe("clientPlugin", () => {
     const { ctx, registrations, injections } = registry();
     const dispose = clientPlugin.apply(ctx);
     expect(injections).toContain("settings.section");
-    expect(registrations).toHaveLength(1);
-    expect(registrations[0]?.id).toBe("jump");
-    expect(registrations[0]?.order).toBe(SETTINGS_ORDER);
-    expect(typeof registrations[0]?.label).toBe("function");
+    // Two entries: the settings page and the invisible session bridge that
+    // publishes the composer for reference mode.
+    expect(registrations).toHaveLength(2);
+    const page = registrations.find((reg) => reg.id === "jump");
+    expect(page?.order).toBe(SETTINGS_ORDER);
+    expect(typeof page?.label).toBe("function");
+    const bridge = registrations.find((reg) => reg.id === "jump.session-bridge");
+    expect(bridge?.name).toBe("conversation.input.overlay");
+    expect(bridge?.label).toBeUndefined();
     dispose();
     expect(doc.querySelectorAll("style[data-plugin-css]")).toHaveLength(0);
   });
