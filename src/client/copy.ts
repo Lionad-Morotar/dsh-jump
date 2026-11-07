@@ -26,6 +26,10 @@ export interface Copy {
   referenceTitle: string;
   /** One line under the reference-mode heading. */
   referenceDescription: string;
+  /** Shown in place of a chord while focus mode has none. */
+  focusDisabled: string;
+  /** The control that unbinds focus mode again. */
+  focusDisable: string;
   /** Shown in place of a chord while reference mode has none. */
   referenceDisabled: string;
   /** The control that unbinds reference mode again. */
@@ -57,7 +61,9 @@ export const ZH: Copy = {
   clickTitle: "点击模式",
   clickDescription: "选中后触发一次完整的点击。",
   focusTitle: "聚焦模式",
-  focusDescription: "选中后只把焦点移过去。",
+  focusDescription: "默认未启用。录制一个和弦后，选中目标只把焦点移过去。",
+  focusDisabled: "未启用",
+  focusDisable: "关闭聚焦模式",
   referenceTitle: "引用模式",
   referenceDescription: "选中后把该元素作为引用插入输入框，不点击也不移动焦点。",
   referenceDisabled: "未启用",
@@ -84,7 +90,9 @@ export const EN: Copy = {
   clickTitle: "Click mode",
   clickDescription: "The selected target receives a full click.",
   focusTitle: "Focus mode",
-  focusDescription: "The selected target only receives focus.",
+  focusDescription: "Off by default. Record a shortcut and the selected target only receives focus.",
+  focusDisabled: "Off",
+  focusDisable: "Turn off focus mode",
   referenceTitle: "Reference mode",
   referenceDescription: "The selected element is inserted into the composer as a reference; nothing is clicked and focus does not move.",
   referenceDisabled: "Off",

@@ -192,9 +192,12 @@ function modeRow(props: ModeRowProps): unknown {
   const printed = binding === null ? null : formatBinding(binding, platform);
   const shipped = createDefaultBindings(platform)[action];
   const shippedPrinted = shipped === null ? null : formatBinding(shipped, platform);
-  // Only reference mode can be unbound, so only it gets the control that
-  // unbinds; a "turn off click mode" button would be a plugin that does nothing.
-  const canDisable = action === "reference";
+  // Click always keeps a chord, so only the two optional modes get the control
+  // that unbinds; a "turn off click mode" button would be a plugin that does
+  // nothing.
+  const canDisable = action !== "click";
+  const offLabel = action === "focus" ? copy.focusDisabled : copy.referenceDisabled;
+  const disableLabel = action === "focus" ? copy.focusDisable : copy.referenceDisable;
   return React.createElement(
     "div",
     { "data-dsh-jump-mode": action },
@@ -222,7 +225,7 @@ function modeRow(props: ModeRowProps): unknown {
             controller.begin(action);
           },
         },
-        recording ? copy.recording : (printed ?? copy.referenceDisabled),
+        recording ? copy.recording : (printed ?? offLabel),
       ),
       canDisable
         ? React.createElement(
@@ -235,7 +238,7 @@ function modeRow(props: ModeRowProps): unknown {
                 controller.disableAction(action);
               },
             },
-            copy.referenceDisable,
+            disableLabel,
           )
         : null,
       React.createElement(

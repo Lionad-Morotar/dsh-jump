@@ -63,13 +63,13 @@ export function matchKey(
       state.pending = "";
       return { type: "activate-click" };
     }
-    if (matchesBinding(e, bindings.focus)) {
+    // An unbound mode has no chord to match, which is how "off" is expressed:
+    // there is no stroke that opens it.
+    if (bindings.focus !== null && matchesBinding(e, bindings.focus)) {
       state.mode = "focus";
       state.pending = "";
       return { type: "activate-focus" };
     }
-    // An unbound reference mode has no chord to match, which is how "off" is
-    // expressed: there is no stroke that opens it.
     if (bindings.reference !== null && matchesBinding(e, bindings.reference)) {
       state.mode = "reference";
       state.pending = "";
@@ -96,7 +96,7 @@ export function matchKey(
   // the one activation that cannot be cancelled from the keyboard.
   if (
     matchesBinding(e, bindings.click) ||
-    matchesBinding(e, bindings.focus) ||
+    (bindings.focus !== null && matchesBinding(e, bindings.focus)) ||
     (bindings.reference !== null && matchesBinding(e, bindings.reference))
   ) {
     reset(state);

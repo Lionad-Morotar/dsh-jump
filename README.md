@@ -63,11 +63,14 @@ The top level of that file must always stay a YAML array (`[]` when empty).
 给 DeepSeek Harness Web GUI 的键盘跳跃导航：按下一个组合键，视口里的可交互元素
 会被打上字母标签，再敲标签即可点击或聚焦到它。
 
-- `Cmd+H` 进入点击模式，`Cmd+U` 进入聚焦模式；非 Mac 上默认是 `Ctrl+H` /
-  `Ctrl+U`。`Esc`（或任意 meta 组合键、或再按一次激活键）退出。
-- 两个组合键都可以改：设置 → 「跳跃导航」，点一下快捷键再按新的即可立即生效，
-  无需刷新。两个模式各有自己的恢复按钮。绑定存在浏览器的 `localStorage`
-  （`dsh-jump:bindings:v1`），不写进包配置。
+- `Cmd+H` 进入点击模式；非 Mac 上是 `Ctrl+H`。`Esc`（或任意 meta 组合键、或再按
+  一次激活键）退出。
+- 聚焦模式与引用模式默认未启用，没有和弦就没有按键能打开它们。要开启就进
+  设置 → 「跳跃导航」，点该行的快捷键再按一个组合键；行内另有「关闭」把它解绑
+  回未启用，「恢复默认」对这两行同样是解绑（它们没有出厂和弦可回）。点击模式
+  始终保留一个和弦。
+- 组合键都可以改：点一下快捷键再按新的即可立即生效，无需刷新。绑定存在浏览器的
+  `localStorage`（`dsh-jump:bindings:v1`），不写进包配置。
 - `Insert`、`F1`、`Home` 这类不产生字符的键可以不配修饰键。它们在输入框里
   仍然归输入框：焦点在可编辑区域时裸键不触发，带修饰键的组合键照旧生效。
 - 这一页在设置导航里排第 25 位。位置由注册时声明的 `order` 决定；宿主占用
@@ -117,8 +120,9 @@ Three families, each added because a real element was unreachable:
 
 ## Click versus focus is decided by the target
 
-Both activation keys jump to the same set, and the matched element decides
-what "jumping" means:
+Both activation modes jump to the same set, and the matched element decides
+what "jumping" means. Click mode ships bound; focus mode ships unbound, so a
+reader who wants it records a chord on its settings row first:
 
 - Text entry surfaces (textarea, caret-bearing inputs, contenteditable hosts)
   are focused, and the caret is collapsed to the end of the draft so the next
@@ -182,9 +186,9 @@ structured chip.
 - The activation chords are stored per browser profile in `localStorage`
   (`dsh-jump:bindings:v1`), not in package config. The host's own shortcut
   registry cannot hold them: a bare home-row label stroke is rejected as
-  modifier-less, and the shipped `Cmd+H` / `Cmd+U` defaults collide with
-  reserved primary chords. The listener is therefore plugin-owned, and the
-  settings page writes to the same plugin-owned document.
+  modifier-less, and the shipped `Cmd+H` default collides with reserved primary
+  chords. The listener is therefore plugin-owned, and the settings page writes
+  to the same plugin-owned document.
 - A chord that prints a character must carry ⌘, ⌃ or ⌥: a bare letter would
   type into whatever field has focus, and Shift alone is refused for the same
   reason. A key that prints nothing (Insert, F1, Home, PageUp) may be bound

@@ -98,9 +98,8 @@ function textOf(n: Node): string {
 describe("JumpSettingsPage", () => {
   it("renders one row per mode, each with its own chord", () => {
     const { tree } = setup();
-    // The third row shows the "off" word instead of a chord, because reference
-    // mode ships unbound.
-    expect(chords(tree).map(textOf)).toEqual(["⌘H", "⌘U", ZH.referenceDisabled]);
+    // Only click ships a chord; focus and reference show their own "off" word.
+    expect(chords(tree).map(textOf)).toEqual(["⌘H", ZH.focusDisabled, ZH.referenceDisabled]);
     // 两个模式各有自己的说明，页面不再把两者挤在一句描述里。
     expect(textOf(tree)).toContain(ZH.clickTitle);
     expect(textOf(tree)).toContain(ZH.focusTitle);
@@ -108,6 +107,38 @@ describe("JumpSettingsPage", () => {
     expect(textOf(tree)).toContain(ZH.focusDescription);
     expect(textOf(tree)).toContain(ZH.referenceTitle);
     expect(textOf(tree)).toContain(ZH.referenceDescription);
+  });
+
+  it("shows the off state on the focus row and turns it on by recording", () => {
+    const { controller, tree } = setup();
+    const focusChord = chords(tree).find((n) => n.props["data-dsh-jump-chord"] === "focus");
+    expect(textOf(focusChord as Node)).toBe(ZH.focusDisabled);
+    // No shortcut is announced while the mode is off.
+    expect((focusChord as Node).props["aria-keyshortcuts"]).toBeUndefined();
+
+    controller.begin("focus");
+    expect(controller.press({ key: "j", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false, isComposing: false })).toBe("saved");
+
+    // Re-render against the same controller: the row now prints the chord.
+    const after = JumpSettingsPage({ React: fakeReact(), controller, platform: "macos", copy: ZH }) as Node;
+    const printed = chords(after).find((n) => n.props["data-dsh-jump-chord"] === "focus");
+    expect(textOf(printed as Node)).toBe("⌘J");
+  });
+
+  it("offers a control that turns focus mode off again", () => {
+    const { controller, tree } = setup();
+    const disable = findAll(tree, (n) => n.props["data-dsh-jump-disable"] === "focus")[0];
+    expect(disable).toBeDefined();
+    // Nothing to turn off while the mode is unbound.
+    expect(disable?.props.disabled).toBe(true);
+
+    controller.begin("focus");
+    controller.press({ key: "j", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false, isComposing: false });
+    const after = JumpSettingsPage({ React: fakeReact(), controller, platform: "macos", copy: ZH }) as Node;
+    const enabled = findAll(after, (n) => n.props["data-dsh-jump-disable"] === "focus")[0];
+    expect(enabled?.props.disabled).toBe(false);
+    (enabled?.props.onClick as () => void)();
+    expect(controller.getState().bindings.focus).toBeNull();
   });
 
   it("gives each mode its own restore control", () => {

@@ -201,9 +201,13 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // field. A chord with a modifier can never be typed by accident, so it
         // stays live everywhere.
         const reachable = bindings.get();
+        // Every unbound mode is skipped: it has no chord, so there is nothing
+        // for the text-entry stand-down to compare against.
         const bareMatch =
           (matchesBinding(event, reachable.click) && !firesInTextEntry(reachable.click)) ||
-          (matchesBinding(event, reachable.focus) && !firesInTextEntry(reachable.focus)) ||
+          (reachable.focus !== null &&
+            matchesBinding(event, reachable.focus) &&
+            !firesInTextEntry(reachable.focus)) ||
           (reachable.reference !== null &&
             matchesBinding(event, reachable.reference) &&
             !firesInTextEntry(reachable.reference));

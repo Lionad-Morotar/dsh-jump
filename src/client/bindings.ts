@@ -42,13 +42,14 @@ export interface JumpBinding {
 /**
  * One chord per action.
  *
- * `reference` is nullable rather than defaulted: "no chord" is a real state for
- * it (the mode is off), and a shipped chord would make the mode reachable
- * without the reader ever asking for it.
+ * Only `click` ships bound. `focus` and `reference` are nullable rather than
+ * defaulted: "no chord" is a real state for them (the mode is off), and a
+ * shipped chord would make the mode reachable without the reader ever asking
+ * for it. Click keeps its chord because it is the mode the plugin exists for.
  */
 export interface JumpBindings {
   click: JumpBinding;
-  focus: JumpBinding;
+  focus: JumpBinding | null;
   reference: JumpBinding | null;
 }
 
@@ -154,16 +155,17 @@ export function detectPlatform(navigatorPlatform: string): JumpPlatform {
 }
 
 /**
- * The shipped chords: primary+H for click mode, primary+U for focus mode.
+ * The shipped chord: primary+H for click mode.
  *
- * Reference mode ships unbound. Binding it by default would take a third chord
- * away from the host on every install for a mode most readers never turn on.
+ * Focus and reference ship unbound. Binding either by default would take a
+ * chord away from the host on every install for a mode most readers never turn
+ * on, and a mode that cannot be reached is a mode that cannot surprise anyone.
  */
 export function createDefaultBindings(platform: JumpPlatform): JumpBindings {
   const primary = platform === "macos" ? { meta: true, ctrl: false } : { meta: false, ctrl: true };
   return {
     click: { key: "h", alt: false, shift: false, ...primary },
-    focus: { key: "u", alt: false, shift: false, ...primary },
+    focus: null,
     reference: null,
   };
 }
@@ -215,16 +217,19 @@ export function normalizeBinding(candidate: unknown, fallback: JumpBinding, plat
 /**
  * Normalize a whole set, falling back per action rather than for the set.
  *
- * `reference` does not fall back to a default, because it has none: a document
- * written before this mode existed, or one whose reference chord is malformed,
- * normalizes to "unbound" rather than to a chord nobody chose.
+ * `focus` and `reference` do not fall back to a default, because they have
+ * none: a document written before a mode existed, or one whose chord is
+ * malformed, normalizes to "unbound" rather than to a chord nobody chose.
  */
 export function normalizeBindings(candidate: unknown, platform: JumpPlatform = "macos"): JumpBindings {
   const defaults = createDefaultBindings(platform);
   const source = isRecord(candidate) ? candidate : {};
   return {
     click: normalizeBinding(source.click, defaults.click, platform),
-    focus: normalizeBinding(source.focus, defaults.focus, platform),
+    // A document written before this mode shipped unbound may still carry a
+    // chord the reader chose; that one is kept. A missing or malformed value
+    // means "off", never the old shipped letter.
+    focus: normalizeOptionalBinding(source.focus, platform),
     reference: normalizeOptionalBinding(source.reference, platform),
   };
 }

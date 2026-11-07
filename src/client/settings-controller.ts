@@ -57,9 +57,9 @@ export interface BindingRowController {
   /**
    * Unbind one action, leaving the others alone.
    *
-   * Only reference mode offers this: click and focus always have a chord, and
-   * "unbind the click mode" would be a plugin that does nothing rather than a
-   * preference. Reference mode ships unbound, so this is how it returns there.
+   * Focus and reference offer this; click does not. Unbinding click would be a
+   * plugin that does nothing rather than a preference, while the other two ship
+   * unbound and this is how they get back there.
    */
   disableAction(action: JumpAction): void;
   subscribe(listener: (state: BindingRowState) => void): () => void;
@@ -133,11 +133,11 @@ export function createBindingsController(options: BindingRowOptions): BindingRow
     },
 
     resetAction(action) {
-      // Reference mode has no shipped chord, so "restore" for it is "unbind":
-      // falling back to click/focus's defaults would invent a chord the reader
+      // Focus and reference have no shipped chord, so "restore" for them is
+      // "unbind": falling back to a default would invent a chord the reader
       // never chose and make the mode reachable again.
-      if (action === "reference") {
-        store.set({ ...state.bindings, reference: null });
+      if (action !== "click") {
+        store.set({ ...state.bindings, [action]: null });
         emit({ bindings: store.get(), recording: null, issue: null });
         return;
       }
@@ -146,19 +146,20 @@ export function createBindingsController(options: BindingRowOptions): BindingRow
       // restoring would create the duplicate the recorder refuses. Sweeping the
       // collision onto the other action's own default keeps both usable and is
       // what "restore defaults" means for a set that has to stay distinct.
-      const next: JumpBindings = { ...state.bindings, [action]: shipped[action] };
-      for (const other of ["click", "focus"] as const) {
-        if (other !== action && bindingsEqual(next[action], next[other])) next[other] = shipped[other];
+      const next: JumpBindings = { ...state.bindings, click: shipped.click };
+      for (const other of ["focus", "reference"] as const) {
+        if (bindingsEqual(next.click, next[other])) next[other] = shipped[other];
       }
       store.set(next);
       emit({ bindings: store.get(), recording: null, issue: null });
     },
 
     disableAction(action) {
-      // Click and focus always keep a chord: unbinding them would leave a
-      // plugin that does nothing rather than a preference.
-      if (action !== "reference") return;
-      store.set({ ...state.bindings, reference: null });
+      // Click always keeps a chord: unbinding it would leave a plugin that does
+      // nothing rather than a preference. The other two modes ship unbound, so
+      // this is how they return there.
+      if (action === "click") return;
+      store.set({ ...state.bindings, [action]: null });
       emit({ bindings: store.get(), recording: null, issue: null });
     },
 

@@ -54,8 +54,16 @@ describe("activation", () => {
     expect(matchKey(createKeyState(), key("h", { metaKey: true }), LABELS, MAC)).toEqual({ type: "activate-click" });
   });
 
-  it("meta+u in idle activates focus mode", () => {
-    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, MAC)).toEqual({ type: "activate-focus" });
+  it("meta+u does nothing while focus mode is unbound", () => {
+    // The old shipped chord is free now: pressing it must not open a round.
+    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, MAC)).toEqual({ type: "ignore" });
+  });
+
+  it("meta+u activates focus mode once the reader records it", () => {
+    const configured: JumpBindings = { ...MAC, focus: { key: "u", meta: true, alt: false, ctrl: false, shift: false } };
+    expect(matchKey(createKeyState(), key("u", { metaKey: true }), LABELS, configured)).toEqual({
+      type: "activate-focus",
+    });
   });
 
   it("plain h or u without meta does not activate", () => {
@@ -108,7 +116,8 @@ describe("label prefix matching", () => {
   it("the first half of a two-key label goes pending, the second completes it", () => {
     const labels = ["as", "ad"];
     const state = createKeyState();
-    matchKey(state, key("u", { metaKey: true }), LABELS, MAC);
+    // Click mode is the one that ships bound, so it opens the round here.
+    matchKey(state, key("h", { metaKey: true }), LABELS, MAC);
     expect(matchKey(state, key("a"), labels, MAC)).toEqual({ type: "label", key: "a" });
     expect(state.pending).toBe("a");
     expect(matchKey(state, key("s"), labels, MAC)).toEqual({ type: "label", key: "s" });
