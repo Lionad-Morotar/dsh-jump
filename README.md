@@ -195,6 +195,18 @@ structured chip.
   `inputTriggers`, `sessions` and `conversation` are all soft-probed, so a host
   missing any of them keeps the navigation and loses only the chip's send-time
   identity.
+- **Clicking the chip goes back to the element.** The chip carries a
+  description rather than a live reference, so the element is looked up again
+  on every click, in the same order the description was written in:
+  `data-testid` > `id` > tag plus its authored classes > `role` / `aria-label`
+  > visible text. Each step runs over the whole candidate list before the next
+  one starts, so a stale `id` elsewhere on the page cannot beat a live test id.
+  A hit is scrolled to the centre of the viewport and focused with
+  `preventScroll`, which keeps the focus from undoing the centring. The
+  composer is never a candidate: it is `contenteditable` and its text can hold
+  the very words the target carried, so revealing it would scroll to the chip
+  the reader just clicked and call that a success. A miss answers `false` and
+  the host keeps its own gesture.
 
 ## v1 boundaries
 

@@ -15,7 +15,9 @@ import {
   createJumpBridgeView,
   createJumpReferenceSource,
   describeElement,
+  findDescribedElement,
   insertUiReference,
+  revealElement,
   uiRefClipboardText,
   uiRefModelText,
   uiReferencePayload,
@@ -231,6 +233,116 @@ describe("createJumpReferenceSource", () => {
     await expect(source.codec.serialize("not-json", new AbortController().signal)).resolves.toBe(
       "[ui element not-json]",
     );
+  });
+
+  it("carries the click handler only when the runtime supplied one", () => {
+    // A source with no handler must not answer the host's click at all: the
+    // host reads the key's presence, and a stub returning false would be the
+    // same thing written twice.
+    expect(createJumpReferenceSource().openReference).toBeUndefined();
+    const handler = vi.fn(() => true);
+    const source = createJumpReferenceSource(handler);
+    expect(source.openReference).toBe(handler);
+    expect(source.openReference?.({}, { ref: "x" })).toBe(true);
+    expect(handler).toHaveBeenCalledWith({}, { ref: "x" });
+  });
+});
+
+describe("revealElement", () => {
+  /** A fresh page per case: the lookup walks the whole document. */
+  function page(html: string): Document {
+    return new JSDOM(`<!doctype html><html><body>${html}</body></html>`).window.document;
+  }
+
+  /** jsdom has no layout, so `scrollIntoView` has to be stubbed to observe it. */
+  function spyOnReveal(element: Element): { scrolled: (boolean | ScrollIntoViewOptions)[]; focused: FocusOptions[] } {
+    const scrolled: (boolean | ScrollIntoViewOptions)[] = [];
+    const focused: FocusOptions[] = [];
+    (element as Element & { scrollIntoView: (arg?: boolean | ScrollIntoViewOptions) => void }).scrollIntoView =
+      arg => {
+        if (arg !== undefined) scrolled.push(arg);
+      };
+    (element as Element & { focus: (options?: FocusOptions) => void }).focus = options => {
+      if (options !== undefined) focused.push(options);
+    };
+    return { scrolled, focused };
+  }
+
+  const refOf = (element: Element): string => JSON.stringify(describeElement(element));
+
+  it("finds the element by its test id and centres it", () => {
+    const document = page('<button data-testid="gx-reference">引用</button>');
+    const element = document.querySelector("button");
+    if (element === null) throw new Error("fixture button missing");
+    const seen = spyOnReveal(element);
+    expect(revealElement(refOf(element), document)).toBe(true);
+    expect(seen.scrolled).toEqual([{ block: "center", inline: "center" }]);
+    // The focus must not scroll on its own: the centring above is the decision.
+    expect(seen.focused).toEqual([{ preventScroll: true }]);
+  });
+
+  it("falls back to the id when the test id is gone", () => {
+    const document = page('<div id="gx-panel">面板</div>');
+    const element = document.querySelector("div");
+    if (element === null) throw new Error("fixture div missing");
+    const ref = JSON.stringify({ kind: "ui.element", tag: "div", id: "gx-panel" });
+    const seen = spyOnReveal(element);
+    expect(revealElement(ref, document)).toBe(true);
+    expect(seen.scrolled).toHaveLength(1);
+  });
+
+  it("falls back to the tag plus its meaningful classes", () => {
+    const document = page('<div class="gx-row">a</div><div class="gx-row gx-row-active">b</div>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "div", classes: ["gx-row", "gx-row-active"] });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.textContent).toBe("b");
+  });
+
+  it("falls back to role and aria label", () => {
+    const document = page('<span role="button" aria-label="关闭">×</span><span role="button">+</span>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "span", role: "button", ariaLabel: "关闭" });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.textContent).toBe("×");
+  });
+
+  it("falls back to the visible text", () => {
+    const document = page('<button>保存</button><button>取消</button>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "button", text: "取消" });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.textContent).toBe("取消");
+  });
+
+  it("prefers a live test id over a stale id elsewhere on the page", () => {
+    const document = page('<div id="gx-panel">old</div><div data-testid="gx-panel">new</div>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "div", id: "gx-panel", testId: "gx-panel" });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.textContent).toBe("new");
+  });
+
+  it("never reveals the composer the chip itself lives in", () => {
+    const document = page('<div contenteditable="true"><span>保存</span></div>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "span", text: "保存" });
+    expect(revealElement(ref, document)).toBe(false);
+  });
+
+  it("reports a miss instead of throwing", () => {
+    const document = page("<p>nothing here</p>");
+    expect(revealElement("not-json", document)).toBe(false);
+    expect(revealElement(JSON.stringify({ kind: "ui.element", tag: "" }), document)).toBe(false);
+    expect(revealElement(JSON.stringify({ kind: "ui.element", tag: "button" }), document)).toBe(false);
+  });
+
+  it("skips the scroll when the element cannot scroll and still focuses", () => {
+    const document = page('<input id="gx-field" />');
+    const element = document.querySelector("input");
+    if (element === null) throw new Error("fixture input missing");
+    const focused: FocusOptions[] = [];
+    (element as Element & { focus: (options?: FocusOptions) => void }).focus = options => {
+      if (options !== undefined) focused.push(options);
+    };
+    const ref = JSON.stringify({ kind: "ui.element", tag: "input", id: "gx-field" });
+    expect(revealElement(ref, document)).toBe(true);
+    expect(focused).toEqual([{ preventScroll: true }]);
   });
 });
 

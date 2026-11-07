@@ -26,6 +26,7 @@ import {
   createJumpReferenceSource,
   describeElement,
   insertUiReference,
+  revealElement,
   uiReferencePayload,
   type InputActionsFace,
   type InputTriggersFace,
@@ -225,7 +226,19 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
       ctx.inject(["inputTriggers"], (scope) => {
         const triggers = scope.get<InputTriggersFace>("inputTriggers");
         if (triggers === undefined) return;
-        const dispose = triggers.registerSource(createJumpReferenceSource());
+        // The click handler reads the document per click rather than capturing
+        // one: a host that swaps the page (or a test that injects its own) must
+        // not leave the chip pointing at a document that is gone.
+        const dispose = triggers.registerSource(
+          createJumpReferenceSource((_session, reference) => {
+            const ref =
+              reference !== null && typeof reference === "object"
+                ? (reference as { readonly ref?: unknown }).ref
+                : undefined;
+            if (typeof ref !== "string") return false;
+            return revealElement(ref, deps.document ?? globalThis.document);
+          }),
+        );
         source.registered = true;
         return () => {
           dispose();

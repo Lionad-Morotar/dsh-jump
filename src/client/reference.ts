@@ -251,7 +251,7 @@ export function uiReferencePayload(descriptor: DomReferenceDescriptor): UiRefere
  * @param ref - the chip's `ref` string.
  * @returns the descriptor, or undefined when the ref is not ours.
  */
-function decodeRef(ref: string): DomReferenceDescriptor | undefined {
+export function decodeUiRef(ref: string): DomReferenceDescriptor | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(ref);
@@ -277,14 +277,141 @@ function decodeRef(ref: string): DomReferenceDescriptor | undefined {
 
 /** The clipboard projection of one chip; the codec's synchronous half. */
 export function uiRefClipboardText(ref: string): string {
-  const descriptor = decodeRef(ref);
+  const descriptor = decodeUiRef(ref);
   return descriptor === undefined ? `[ui element ${ref}]` : `[ui element ${identityOf(descriptor)}]`;
 }
 
 /** The model text of one chip; the codec's asynchronous half. */
 export function uiRefModelText(ref: string): string {
-  const descriptor = decodeRef(ref);
+  const descriptor = decodeUiRef(ref);
   return descriptor === undefined ? `[ui element ${ref}]` : modelTextOf(descriptor);
+}
+
+/**
+ * Whether an element sits inside an editable surface.
+ *
+ * A chip lives in the composer, and the composer is a contenteditable region
+ * whose text can easily contain the words the target element carried. Revealing
+ * the composer would scroll to the chip the reader just clicked and report
+ * success, which is worse than reporting nothing found.
+ * @param element - a candidate from the page.
+ * @returns whether the element is part of an editable region.
+ */
+function isInsideEditor(element: Element): boolean {
+  return element.closest('[contenteditable="true"]') !== null;
+}
+
+/**
+ * Find the element one descriptor names, in the order its facts are trusted.
+ *
+ * The order is the same one {@link describeElement} writes in, for the same
+ * reason: a test id survives a restyle, an id usually survives a refactor, and
+ * a class is the first thing to change. Each step is tried over the whole
+ * candidate list before the next one starts, so a page with a stale id cannot
+ * beat a live test id.
+ *
+ * The candidate list is built once: `querySelectorAll` over the descriptor's
+ * own tag is the only page walk this does, and every step filters that array.
+ * @param descriptor - the element's description.
+ * @param doc - the document to search.
+ * @returns the element, or undefined when the page no longer has it.
+ */
+export function findDescribedElement(
+  descriptor: DomReferenceDescriptor,
+  doc: Document,
+): Element | undefined {
+  const tag = descriptor.tag.trim().toLowerCase();
+  const candidates = Array.from(doc.querySelectorAll(tag === "" ? "*" : tag)).filter(
+    element => !isInsideEditor(element),
+  );
+  if (candidates.length === 0) return undefined;
+
+  const testId = descriptor.testId;
+  if (testId !== undefined && testId !== "") {
+    const hit = candidates.find(element => element.getAttribute("data-testid") === testId);
+    if (hit !== undefined) return hit;
+  }
+
+  const id = descriptor.id;
+  if (id !== undefined && id !== "") {
+    const hit = candidates.find(element => element.getAttribute("id") === id);
+    if (hit !== undefined) return hit;
+  }
+
+  const classes = descriptor.classes?.filter(name => name !== "") ?? [];
+  if (classes.length > 0) {
+    const hit = candidates.find(element => classes.every(name => element.classList.contains(name)));
+    if (hit !== undefined) return hit;
+  }
+
+  const role = descriptor.role;
+  const ariaLabel = descriptor.ariaLabel;
+  if ((role !== undefined && role !== "") || (ariaLabel !== undefined && ariaLabel !== "")) {
+    const matches = (element: Element): boolean => {
+      const roleOk = role === undefined || role === "" || element.getAttribute("role") === role;
+      const labelOk =
+        ariaLabel === undefined || ariaLabel === "" || element.getAttribute("aria-label") === ariaLabel;
+      return roleOk && labelOk;
+    };
+    const hit = candidates.find(matches);
+    if (hit !== undefined) return hit;
+  }
+
+  // The description truncates its text with an ellipsis, so the tail is not
+  // part of what the page can be asked to contain.
+  const text = descriptor.text?.replace(/…$/u, "").trim() ?? "";
+  if (text !== "") {
+    const hit = candidates.find(element => (element.textContent ?? "").includes(text));
+    if (hit !== undefined) return hit;
+  }
+
+  return undefined;
+}
+
+/**
+ * Scroll one element into view and give it the keyboard.
+ *
+ * `preventScroll` is what keeps the two halves from fighting: the centring is
+ * this function's own decision, and a focus that also scrolled would land the
+ * element wherever the browser's minimal-scroll rule puts it. An engine that
+ * rejects the options object gets the plain call instead, which still focuses
+ * and only loses that guarantee.
+ * @param element - the element to reveal.
+ */
+function bringIntoView(element: Element): void {
+  const scrollable = element as Element & { scrollIntoView?: (options?: ScrollIntoViewOptions) => void };
+  if (typeof scrollable.scrollIntoView === "function") {
+    scrollable.scrollIntoView({ block: "center", inline: "center" });
+  }
+  const focusable = element as Element & { focus?: (options?: FocusOptions) => void };
+  if (typeof focusable.focus !== "function") return;
+  try {
+    focusable.focus({ preventScroll: true });
+  } catch {
+    // An engine that refuses the options object rather than ignoring it.
+    focusable.focus();
+  }
+}
+
+/**
+ * Take the reader back to the element one chip describes.
+ *
+ * The chip carries a description rather than a live reference, so the element
+ * is looked up again on every click: the page may have re-rendered since the
+ * reference was taken, and the description is what survives that.
+ * @param ref - the chip's `ref` string.
+ * @param doc - the document to search; the page's own when absent.
+ * @returns whether the element was found and revealed.
+ */
+export function revealElement(ref: string, doc?: Document): boolean {
+  const descriptor = decodeUiRef(ref);
+  if (descriptor === undefined) return false;
+  const target = doc ?? (typeof globalThis.document === "undefined" ? undefined : globalThis.document);
+  if (target === undefined) return false;
+  const element = findDescribedElement(descriptor, target);
+  if (element === undefined) return false;
+  bringIntoView(element);
+  return true;
 }
 
 /**
@@ -394,6 +521,14 @@ export interface JumpReferenceSource {
     clipboardText(ref: string): string;
     serialize(ref: string, signal?: AbortSignal): Promise<string>;
   };
+  /**
+   * Take a click on one of this source's chips.
+   *
+   * Absent when the runtime registered no handler, which leaves the host's own
+   * gesture in charge: a chip that cannot be revealed should behave like plain
+   * text rather than swallow the click.
+   */
+  readonly openReference?: (session: unknown, reference: unknown) => boolean;
 }
 
 /**
@@ -401,9 +536,12 @@ export interface JumpReferenceSource {
  *
  * It contributes no `@` menu rows: the reference chord is the only way in, and
  * a group that can never match a query would still take a row in the menu.
+ * @param openReference - the click handler; omitted leaves the host's gesture.
  * @returns the source to register.
  */
-export function createJumpReferenceSource(): JumpReferenceSource {
+export function createJumpReferenceSource(
+  openReference?: (session: unknown, reference: unknown) => boolean,
+): JumpReferenceSource {
   return {
     trigger: JUMP_REFERENCE_TRIGGER,
     name: JUMP_REFERENCE_SOURCE,
@@ -420,5 +558,6 @@ export function createJumpReferenceSource(): JumpReferenceSource {
         return uiRefModelText(ref);
       },
     },
+    ...(openReference === undefined ? {} : { openReference }),
   };
 }
