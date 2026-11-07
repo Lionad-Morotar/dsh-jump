@@ -10,6 +10,10 @@ focused.
 [![license](https://img.shields.io/npm/l/dsh-jump.svg?style=flat-square)](./LICENSE)
 [![topic](https://img.shields.io/badge/topic-dsh--plugin-0e7490.svg?style=flat-square)](https://github.com/topics/dsh-plugin)
 
+[![dsh-jump on dsh.fish](https://dsh.fish/a/dsh-jump/badge.svg)](https://dsh.fish/a/dsh-jump)
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/lionad-morotar/dsh-jump)
+[![Open Plugin Market](https://img.shields.io/endpoint?url=https%3A%2F%2Fdshopen.org%2Fbadge%2Fdsh-jump.json%3Flang%3Den)](https://dshopen.org/plugins/dsh-jump)
+
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
 [中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
