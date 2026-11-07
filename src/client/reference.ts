@@ -302,16 +302,70 @@ function isInsideEditor(element: Element): boolean {
 }
 
 /**
+ * Whether the page is painting this element.
+ *
+ * Only a tie-break between copies of one identity, never a reason to reject
+ * the last copy. `checkVisibility` understands layout; the computed-style
+ * fallback for engines without it still catches the two common ways a
+ * duplicate hides, `display: none` and `visibility: hidden`.
+ * @param element - a candidate from the page.
+ * @returns whether the element is rendered.
+ */
+function isPainted(element: Element): boolean {
+  const el = element as Element & { checkVisibility?: () => boolean };
+  if (typeof el.checkVisibility === "function") return el.checkVisibility();
+  const view = element.ownerDocument?.defaultView;
+  if (view === null || view === undefined) return true;
+  const style = view.getComputedStyle(element);
+  return (
+    style.display !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse"
+  );
+}
+
+/**
+ * The first candidate the page is painting, else the first of them.
+ *
+ * An identity search over the whole document can legitimately hit twice: a
+ * responsive layout renders both copies, and a form keeps a hidden clone in a
+ * closed dialog. The hidden copy is the inert one, and taking it would report
+ * a hit while leaving the reader on something they cannot see.
+ * @param candidates - the elements sharing one identity, in tree order.
+ * @returns the element to reveal.
+ */
+function firstPainted(candidates: readonly Element[]): Element | undefined {
+  return candidates.find(isPainted) ?? candidates[0];
+}
+
+/**
+ * Every element carrying this test id, in tree order.
+ *
+ * The value is compared per element rather than interpolated into a selector:
+ * a test id is arbitrary text, and quoting it would need `CSS.escape`, which
+ * some engines lack.
+ * @param doc - the document to search.
+ * @param testId - the test id to match, verbatim.
+ * @returns the matching elements; empty when the page has none.
+ */
+function elementsWithTestId(doc: Document, testId: string): readonly Element[] {
+  return Array.from(doc.querySelectorAll("[data-testid]")).filter(
+    element => element.getAttribute("data-testid") === testId,
+  );
+}
+
+/**
  * Find the element one descriptor names, in the order its facts are trusted.
  *
  * The order is the same one {@link describeElement} writes in, for the same
  * reason: a test id survives a restyle, an id usually survives a refactor, and
- * a class is the first thing to change. Each step is tried over the whole
- * candidate list before the next one starts, so a page with a stale id cannot
- * beat a live test id.
+ * a class is the first thing to change. Each step is tried before the next one
+ * starts, so a page with a stale id cannot beat a live test id.
  *
- * The candidate list is built once: `querySelectorAll` over the descriptor's
- * own tag is the only page walk this does, and every step filters that array.
+ * The two identity steps search the whole document, because identity is what
+ * outlives a re-render that swaps the tag: a control that turns from `<button>`
+ * into `<a>` keeps its test id, and a lookup confined to the recorded tag would
+ * call that element missing. The tag is still the filter for the unnamed steps
+ * (classes, role, aria label, text): those facts are weak enough that a
+ * page-wide scan would return a different element than the one described.
  * @param descriptor - the element's description.
  * @param doc - the document to search.
  * @returns the element, or undefined when the page no longer has it.
@@ -320,23 +374,24 @@ export function findDescribedElement(
   descriptor: DomReferenceDescriptor,
   doc: Document,
 ): Element | undefined {
-  const tag = descriptor.tag.trim().toLowerCase();
-  const candidates = Array.from(doc.querySelectorAll(tag === "" ? "*" : tag)).filter(
-    element => !isInsideEditor(element),
-  );
-  if (candidates.length === 0) return undefined;
-
   const testId = descriptor.testId;
   if (testId !== undefined && testId !== "") {
-    const hit = candidates.find(element => element.getAttribute("data-testid") === testId);
+    const outside = elementsWithTestId(doc, testId).filter(element => !isInsideEditor(element));
+    const hit = firstPainted(outside);
     if (hit !== undefined) return hit;
   }
 
   const id = descriptor.id;
   if (id !== undefined && id !== "") {
-    const hit = candidates.find(element => element.getAttribute("id") === id);
-    if (hit !== undefined) return hit;
+    const element = doc.getElementById(id);
+    if (element !== null && !isInsideEditor(element)) return element;
   }
+
+  const tag = descriptor.tag.trim().toLowerCase();
+  const candidates = Array.from(doc.querySelectorAll(tag === "" ? "*" : tag)).filter(
+    element => !isInsideEditor(element),
+  );
+  if (candidates.length === 0) return undefined;
 
   const classes = descriptor.classes?.filter(name => name !== "") ?? [];
   if (classes.length > 0) {

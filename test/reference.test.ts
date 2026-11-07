@@ -281,6 +281,41 @@ describe("revealElement", () => {
     expect(seen.focused).toEqual([{ preventScroll: true }]);
   });
 
+  it("finds the test id after the element changes tag", () => {
+    const document = page('<a data-testid="gx-reference" href="#">引用</a>');
+    const element = document.querySelector("a");
+    if (element === null) throw new Error("fixture anchor missing");
+    const seen = spyOnReveal(element);
+    // The chip was taken from a button; the page re-rendered it as a link.
+    const ref = JSON.stringify({ kind: "ui.element", tag: "button", testId: "gx-reference" });
+    expect(revealElement(ref, document)).toBe(true);
+    expect(seen.scrolled).toEqual([{ block: "center", inline: "center" }]);
+    expect(seen.focused).toEqual([{ preventScroll: true }]);
+  });
+
+  it("finds the id without the recorded tag", () => {
+    const document = page('<section id="gx-panel">面板</section>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "div", id: "gx-panel" });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.tagName).toBe("SECTION");
+  });
+
+  it("prefers the painted copy when the test id appears twice", () => {
+    const document = page(
+      '<button data-testid="gx-save" style="display:none">旧</button>' +
+        '<button data-testid="gx-save">新</button>',
+    );
+    const ref = JSON.stringify({ kind: "ui.element", tag: "button", testId: "gx-save" });
+    const hit = findDescribedElement(JSON.parse(ref) as never, document);
+    expect(hit?.textContent).toBe("新");
+  });
+
+  it("matches a test id that could not be written into a selector", () => {
+    const document = page('<button data-testid="gx:save &quot;draft&quot;">保存</button>');
+    const ref = JSON.stringify({ kind: "ui.element", tag: "button", testId: 'gx:save "draft"' });
+    expect(revealElement(ref, document)).toBe(true);
+  });
+
   it("falls back to the id when the test id is gone", () => {
     const document = page('<div id="gx-panel">面板</div>');
     const element = document.querySelector("div");
