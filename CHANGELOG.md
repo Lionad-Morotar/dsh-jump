@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- 引用模式：设置页第三行，独立和弦、默认关闭。按和弦进入同一轮标签，选中目标不点击、不聚焦，把元素的可定位描述作为结构化 chip 插进当前会话输入框
+- 元素描述按 `data-testid` > `id` > 有含义的 class 取身份；宿主缺 `insertReference`、source 未注册时降级纯文本，无会话时返回 `no-session`，任何情况下都不退化成一次点击
+
+### Changed
+
+- 聚焦模式改为默认关闭：出厂不再占用 `Cmd+U` / `Ctrl+U`，需在设置页录制和弦后启用；旧文档里已录制的合法聚焦和弦照旧保留，只有从未写过文档或值非法的用户落到未启用
+
 ## [0.1.2] - 2026-11-02
 
 ### Added
