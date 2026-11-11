@@ -95,26 +95,32 @@ function keysPerLabel(count: number): number {
  * Sort candidates into reading order: rows top to bottom, each row left to
  * right.
  *
- * Two candidates share a row when their vertical extents overlap, which is the
- * only definition that survives mixed heights (a 20px button beside a 36px
- * composer). Rows are then ordered by their top edge and each row by its left
- * edge, so the label stream follows what the eye does instead of the DOM tree.
+ * Rows are found by walking candidates in vertical-centre order and asking
+ * whether the candidate sits on the row being built. The test is the centre
+ * distance against half the shorter of the two heights, never overlap: overlap
+ * is transitive, so one candidate bridging two rows would chain them into a
+ * single row and the label stream would jump from the bottom of the page back
+ * to the top. The centre test also keeps a tall bar and a short button on one
+ * row, which overlap alone would only get right by accident.
  *
- * The sort is stable, so two candidates at the same coordinates keep their DOM
- * order and the result stays deterministic.
+ * Rows are then ordered by their top edge and each row by its left edge, so the
+ * stream follows what the eye does instead of the DOM tree. The sort is stable,
+ * so candidates at the same coordinates keep their DOM order.
  */
 function visualOrder<T extends { rect: HintRect }>(entries: readonly T[]): T[] {
+  const centre = (entry: T): number => entry.rect.y + entry.rect.h / 2;
+  const byCentre = [...entries].sort((a, b) => centre(a) - centre(b));
   const rows: T[][] = [];
-  for (const entry of entries) {
-    const row = rows.find((candidate) =>
-      candidate.some((other) => {
-        const top = Math.max(other.rect.y, entry.rect.y);
-        const bottom = Math.min(other.rect.y + other.rect.h, entry.rect.y + entry.rect.h);
-        return bottom > top;
-      }),
-    );
-    if (row === undefined) rows.push([entry]);
-    else row.push(entry);
+  for (const entry of byCentre) {
+    const row = rows[rows.length - 1];
+    const anchor = row?.[0];
+    if (row === undefined || anchor === undefined) {
+      rows.push([entry]);
+      continue;
+    }
+    const tolerance = Math.min(anchor.rect.h, entry.rect.h) / 2;
+    if (Math.abs(centre(entry) - centre(anchor)) <= tolerance) row.push(entry);
+    else rows.push([entry]);
   }
   rows.sort((a, b) => Math.min(...a.map((e) => e.rect.y)) - Math.min(...b.map((e) => e.rect.y)));
   return rows.flatMap((row) => [...row].sort((a, b) => a.rect.x - b.rect.x));

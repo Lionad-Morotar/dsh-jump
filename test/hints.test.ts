@@ -174,6 +174,40 @@ describe("visual order", () => {
     const hints = collectHints(select(...bottom, ...top), VIEWPORT, { isVisible: visible });
     expect(hints.map((h) => h.element)).toEqual([top[1], top[0], bottom[1], bottom[0]]);
   });
+
+  it("does not chain three candidates into one row through a bridging middle one", () => {
+    // A 与 C 的垂直区间不相交，B 分别与两者相交。按重叠传递会把三者并成一行，
+    // C 因 x 最小反而先拿标签，从上往下读时标签落在最下面。
+    const a = document.createElement("button");
+    place(a, 200, 0);
+    const b = document.createElement("button");
+    place(b, 100, 8);
+    const c = document.createElement("button");
+    place(c, 0, 15);
+    // 补到 10 个候选：整轮双键，首三枚是 as、ad、af。
+    const fillers = row(300, [0, 10, 20, 30, 40, 50, 60]);
+    document.body.append(a, b, c);
+
+    const hints = collectHints(select(c, b, a, ...fillers), VIEWPORT, { isVisible: visible });
+    const labelOf = (el: Element): string | undefined => hints.find((h) => h.element === el)?.label;
+    expect(labelOf(a)).toBe("as");
+    expect(labelOf(b)).toBe("ad");
+    expect(labelOf(c)).toBe("af");
+  });
+
+  it("keeps a tall bar and a short button on one row when their centres nearly agree", () => {
+    // 52px 输入条旁放 28px 按钮：中心差 4px，小于较矮者的一半（14px），仍是一行。
+    // 拆成两行会按上边排序，输入条反而排在按钮前面。
+    const bar = document.createElement("input");
+    place(bar, 100, 660, 300, 52);
+    const button = document.createElement("button");
+    place(button, 10, 668, 20, 28);
+    document.body.append(bar, button);
+
+    const hints = collectHints(select(bar, button), { width: 800, height: 800 }, { isVisible: visible });
+    expect(hints.map((h) => h.element)).toEqual([button, bar]);
+    expect(hints.map((h) => h.label)).toEqual(["a", "s"]);
+  });
 });
 
 describe("label memory across rounds", () => {
