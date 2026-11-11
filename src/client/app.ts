@@ -17,6 +17,7 @@ import {
   type JumpPlatform,
 } from "./bindings.ts";
 import { collectHints, type Hint } from "./hints.ts";
+import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
@@ -183,6 +184,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   const fixed = createDefaultBindings(platform);
   const bindings: BindingSource = deps.bindings ?? { get: () => fixed };
   const onRound = deps.onRound ?? (() => undefined);
+  // One table for the page load: it is what lets a label stay on its element
+  // across activations, and it dies with the module instance, so a reload
+  // starts clean.
+  const memory = createLabelMemory();
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
@@ -210,7 +215,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     const hints = collectHints(
       () => Array.from(win.document.querySelectorAll(config.candidateSelector)),
       { width: win.innerWidth, height: win.innerHeight },
-      { isVisible },
+      { isVisible, memory },
     );
     overlay.render(hints);
     return hints;

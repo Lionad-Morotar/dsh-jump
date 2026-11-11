@@ -16,7 +16,7 @@ focused.
 
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
-[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [Performance](#performance-on-a-busy-page) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
+[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [How labels are assigned](#how-labels-are-assigned) · [Performance](#performance-on-a-busy-page) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
 ## Install
 
@@ -128,6 +128,28 @@ Three families, each added because a real element was unreachable:
   purpose — Lexical marks chips and command tokens inside the composer with
   it, and the deepest-candidate rule would otherwise let a chip steal the
   label from the composer that owns it.
+
+## How labels are assigned
+
+Labels follow the eye, not the DOM. Candidates are clustered into rows by
+vertical overlap, rows are ordered top to bottom, and each row is consumed left
+to right, so a row rendered right-to-left in the markup still reads `as`, `ad`
+from the left edge. Nothing about this is remembered: the same page always
+produces the same order.
+
+An element keeps the label it had last round. After each round the plugin
+records which label each element carried, keyed by the element's identity (an
+explicit `data-row-key`, the composer marker, or a `data-slot` boundary plus the
+control's accessible name and tag). The next round hands a remembered label
+back to its element first, and the remaining labels fill the gaps, so a button
+that appears above the one you use does not push its label onto a neighbour.
+
+Memory is spent only when it is unambiguous. A remembered label is ignored when
+its length differs from the round's label length, and when two candidates share
+one identity both are dropped rather than guessed. The table holds 64 entries
+for the current page load and evicts the entry that has gone longest without a
+hit. It is never written to `localStorage` or `sessionStorage`, so a reload
+starts with no memory and labels are assigned fresh.
 
 ## Click versus focus is decided by the target
 

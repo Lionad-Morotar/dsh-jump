@@ -705,6 +705,39 @@ describe("activation clears the page so the next letter is a label", () => {
   });
 });
 
+describe("labels survive a second activation", () => {
+  /** 当前轮徽章上的 label，按绘制顺序（即视觉序）。 */
+  function badgeLabels(): (string | undefined)[] {
+    return [...(overlayRoot()?.children ?? [])].map((b) => (b as HTMLElement).dataset.jumpLabel);
+  }
+
+  it("Cmd+H twice then the same label hits the same element after a new button lands ahead of it", () => {
+    const els = buttons(3);
+    els.forEach((el, i) => el.setAttribute("data-row-key", "row-" + String(i)));
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+
+    activate();
+    expect(badgeLabels()).toEqual(["a", "s", "d"]);
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    // 新按钮插在 DOM 与视觉序里都排在第三个按钮之前，无记忆时它会把 d 顶走。
+    const intruder = doc.createElement("button");
+    place(intruder, 55, 10);
+    doc.body.insertBefore(intruder, els[2] as HTMLElement);
+
+    const hits: string[] = [];
+    els[2]?.addEventListener("click", () => hits.push("target"));
+    intruder.addEventListener("click", () => hits.push("intruder"));
+
+    activate();
+    expect(badgeLabels()).toEqual(["a", "s", "f", "d"]);
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    expect(hits).toEqual(["target"]);
+    teardown();
+  });
+});
+
 describe("configurable activation chords", () => {
   const custom: JumpBindings = {
     click: { key: "k", meta: true, alt: true, ctrl: false, shift: false },
