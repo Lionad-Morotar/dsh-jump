@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { collectHints } from "../src/client/hints.ts";
+import { createLabelMemory } from "../src/client/identity.ts";
 import { CANDIDATE_SELECTOR, HOME_ROW_KEYS } from "../src/client/config.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
@@ -140,6 +141,124 @@ describe("label assignment", () => {
   });
 });
 
+describe("visual order", () => {
+  /** 一排等高的候选，x 由调用方给，y 固定。 */
+  function row(y: number, xs: number[]): Element[] {
+    return xs.map((x) => {
+      const el = document.createElement("button");
+      place(el, x, y);
+      document.body.append(el);
+      return el;
+    });
+  }
+
+  it("labels left to right within a row even when the DOM lists them the other way", () => {
+    // 10 个候选把整轮推到两键：首键 as，次键 ad。
+    const right = document.createElement("button");
+    place(right, 200, 0);
+    const left = document.createElement("button");
+    place(left, 10, 0);
+    const below = row(100, [0, 10, 20, 30, 40, 50, 60, 70]);
+    document.body.append(right, left);
+
+    const hints = collectHints(select(right, left, ...below), VIEWPORT, { isVisible: visible });
+    const labelOf = (el: Element): string | undefined => hints.find((h) => h.element === el)?.label;
+    expect(labelOf(left)).toBe("as");
+    expect(labelOf(right)).toBe("ad");
+  });
+
+  it("clusters vertically overlapping candidates into one row and orders rows top down", () => {
+    // 第二行的候选 y 只差 4px，与第一行不重叠：两行各自按 x 升序。
+    const top = row(0, [100, 0]);
+    const bottom = row(14, [50, 5]);
+    const hints = collectHints(select(...bottom, ...top), VIEWPORT, { isVisible: visible });
+    expect(hints.map((h) => h.element)).toEqual([top[1], top[0], bottom[1], bottom[0]]);
+  });
+});
+
+describe("label memory across rounds", () => {
+  /** 一排带身份键的候选，视觉序与 DOM 序一致。 */
+  function keyed(n: number): Element[] {
+    return Array.from({ length: n }, (_, i) => {
+      const el = document.createElement("button");
+      el.setAttribute("data-row-key", "k" + String(i));
+      place(el, 10 + i * 10, 0);
+      document.body.append(el);
+      return el;
+    });
+  }
+
+  function labelOf(hints: { element: Element; label: string }[], el: Element): string | undefined {
+    return hints.find((h) => h.element === el)?.label;
+  }
+
+  it("returns the remembered label even when a new candidate lands ahead of it", () => {
+    const memory = createLabelMemory();
+    const els = keyed(10);
+    const first = collectHints(select(...els), VIEWPORT, { isVisible: visible, memory });
+    expect(labelOf(first, els[4] as Element)).toBe("ah");
+
+    const intruder = document.createElement("button");
+    place(intruder, 5, 0);
+    document.body.append(intruder);
+
+    // 没有记忆时第 5 个候选会被挤到第 6 位，拿 aj。
+    const fresh = collectHints(select(intruder, ...els), VIEWPORT, { isVisible: visible });
+    expect(labelOf(fresh, els[4] as Element)).toBe("aj");
+
+    const second = collectHints(select(intruder, ...els), VIEWPORT, { isVisible: visible, memory });
+    expect(labelOf(second, els[4] as Element)).toBe("ah");
+    // 记忆把 as 到 sa 全占了，新候选只能吃流里剩下的第一个洞。
+    expect(labelOf(second, intruder)).toBe("sd");
+  });
+
+  it("refuses a two-key memory when this round is single-key", () => {
+    const memory = createLabelMemory();
+    const els = keyed(10);
+    const first = collectHints(select(...els), VIEWPORT, { isVisible: visible, memory });
+    expect(labelOf(first, els[4] as Element)).toBe("ah");
+
+    // 去掉最左一个，本轮只剩 9 个候选，整轮单键。
+    (els[0] as Element).remove();
+    const second = collectHints(select(...els.slice(1)), VIEWPORT, { isVisible: visible, memory });
+    expect(second.map((h) => h.label)).toEqual(["a", "s", "d", "f", "g", "h", "j", "k", "l"]);
+    expect(labelOf(second, els[4] as Element)).toBe("f");
+  });
+
+  it("abandons both memories when two candidates share one identity", () => {
+    const memory = createLabelMemory();
+    const els = keyed(10);
+    // 第 3 与第 7 个候选撞键：整组放弃记忆，谁也不许猜。
+    (els[2] as Element).setAttribute("data-row-key", "dup");
+    (els[6] as Element).setAttribute("data-row-key", "dup");
+    const first = collectHints(select(...els), VIEWPORT, { isVisible: visible, memory });
+    expect(labelOf(first, els[2] as Element)).toBe("af");
+    expect(labelOf(first, els[6] as Element)).toBe("ak");
+
+    const intruder = document.createElement("button");
+    place(intruder, 5, 0);
+    document.body.append(intruder);
+    const second = collectHints(select(intruder, ...els), VIEWPORT, { isVisible: visible, memory });
+
+    // 唯一身份都回收了，剩下的洞按流序发给新候选与那对撞键候选。
+    expect(labelOf(second, intruder)).toBe("af");
+    expect(labelOf(second, els[2] as Element)).toBe("ak");
+    expect(labelOf(second, els[6] as Element)).toBe("sd");
+  });
+
+  it("keeps keyless elements out of the memory", () => {
+    const memory = createLabelMemory();
+    const els = Array.from({ length: 10 }, (_, i) => {
+      const el = document.createElement("button");
+      place(el, 10 + i * 10, 0);
+      document.body.append(el);
+      return el;
+    });
+    collectHints(select(...els), VIEWPORT, { isVisible: visible, memory });
+    expect(memory.size).toBe(0);
+  });
+});
+
 describe("text entry hosts in a real composer shape", () => {
   it("labels the composer host, not the Lexical chip inside it", () => {
     // 真实 composer：可编辑宿主里嵌 contenteditable=false 的 chip。
@@ -180,8 +299,8 @@ describe("text entry hosts in a real composer shape", () => {
       VIEWPORT,
       { isVisible: visible },
     );
-    // 文档顺序即 label 顺序：composer 先插入，所以它拿到首键。
-    expect(hints.map((h) => h.element)).toEqual([composer, button]);
+    // 标签顺序按视觉序：按钮在 y=10，composer 在 y=500，所以按钮先拿首键。
+    expect(hints.map((h) => h.element)).toEqual([button, composer]);
   });
 });
 

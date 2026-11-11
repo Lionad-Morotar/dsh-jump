@@ -5,6 +5,7 @@
  * tests and the real viewport in the browser.
  */
 import { HOME_ROW_KEYS } from "./config.ts";
+import { identityKey, recallLabels, type LabelMemory } from "./identity.ts";
 
 export interface HintRect {
   x: number;
@@ -22,6 +23,14 @@ export interface Hint {
 export interface CollectDeps {
   /** Visibility oracle (offsetParent / checkVisibility in real DOM). */
   isVisible: (element: Element) => boolean;
+  /**
+   * Label memory of the page load.
+   *
+   * Optional so a caller can ask for a single stateless round; the app passes
+   * one instance for the page's lifetime, which is what keeps a label on its
+   * element across activations.
+   */
+  memory?: LabelMemory;
 }
 
 /**
@@ -83,10 +92,44 @@ function keysPerLabel(count: number): number {
 }
 
 /**
+ * Sort candidates into reading order: rows top to bottom, each row left to
+ * right.
+ *
+ * Two candidates share a row when their vertical extents overlap, which is the
+ * only definition that survives mixed heights (a 20px button beside a 36px
+ * composer). Rows are then ordered by their top edge and each row by its left
+ * edge, so the label stream follows what the eye does instead of the DOM tree.
+ *
+ * The sort is stable, so two candidates at the same coordinates keep their DOM
+ * order and the result stays deterministic.
+ */
+function visualOrder<T extends { rect: HintRect }>(entries: readonly T[]): T[] {
+  const rows: T[][] = [];
+  for (const entry of entries) {
+    const row = rows.find((candidate) =>
+      candidate.some((other) => {
+        const top = Math.max(other.rect.y, entry.rect.y);
+        const bottom = Math.min(other.rect.y + other.rect.h, entry.rect.y + entry.rect.h);
+        return bottom > top;
+      }),
+    );
+    if (row === undefined) rows.push([entry]);
+    else row.push(entry);
+  }
+  rows.sort((a, b) => Math.min(...a.map((e) => e.rect.y)) - Math.min(...b.map((e) => e.rect.y)));
+  return rows.flatMap((row) => [...row].sort((a, b) => a.rect.x - b.rect.x));
+}
+
+/**
  * Filter candidates to the visible viewport, keep only the deepest element on
  * any ancestor chain (clicking a button inside a button must hit the inner
- * one), and assign labels in stream order. Labels are decided only after the
+ * one), and assign labels in visual order. Labels are decided only after the
  * final candidate array exists so the whole round shares one label length.
+ *
+ * A label already spent on a candidate last round is handed back to it first,
+ * and the rest of the stream fills the gaps. The stream is walked in order and
+ * a remembered label is skipped when it is already taken, so the labels left
+ * over stay a prefix of the stream and no label is ever issued twice.
  */
 export function collectHints(
   selectCandidates: () => Element[],
@@ -114,10 +157,26 @@ export function collectHints(
   const deepest = kept.filter(
     ({ element }) => !kept.some((other) => other.element !== element && element.contains(other.element)),
   );
-  const labels = generateLabels(keysPerLabel(deepest.length));
-  return deepest.map((entry) => {
-    const label = labels.next();
-    if (label.done) throw new Error("dsh-jump: label space exhausted");
-    return { element: entry.element, label: label.value, rect: entry.rect };
+  const ordered = visualOrder(deepest);
+  const keys = keysPerLabel(ordered.length);
+  const recalled = deps.memory === undefined
+    ? new Map<Element, string>()
+    : recallLabels(deps.memory, ordered.map((entry) => entry.element), keys);
+  const taken = new Set(recalled.values());
+  const labels = generateLabels(keys);
+  const hints = ordered.map((entry) => {
+    const remembered = recalled.get(entry.element);
+    if (remembered !== undefined) return { element: entry.element, label: remembered, rect: entry.rect };
+    for (;;) {
+      const next = labels.next();
+      if (next.done === true) throw new Error("dsh-jump: label space exhausted");
+      if (taken.has(next.value)) continue;
+      taken.add(next.value);
+      return { element: entry.element, label: next.value, rect: entry.rect };
+    }
   });
+  if (deps.memory !== undefined) {
+    for (const hint of hints) deps.memory.record(identityKey(hint.element), hint.label);
+  }
+  return hints;
 }
