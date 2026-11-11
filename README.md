@@ -16,7 +16,7 @@ focused.
 
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
-[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
+[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [Performance](#performance-on-a-busy-page) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
 ## Install
 
@@ -215,6 +215,36 @@ structured chip.
   the very words the target carried, so revealing it would scroll to the chip
   the reader just clicked and call that a success. A miss answers `false` and
   the host keeps its own gesture.
+
+## Performance on a busy page
+
+A round costs one collection pass and one paint, and both used to grow with the
+square of the page. Measured on a 1841×1274 view with 1189 visible candidates
+over 25k DOM nodes, a round took 72ms to collect and 5.4ms to repaint on every
+stroke of a three-key label. Neither is on the critical path now:
+
+- Containers are decided by ancestor marking. A candidate that contains another
+  candidate is a wrapper and the deepest target wins; comparing every pair is
+  quadratic with an ancestor walk inside it, while walking up from each
+  candidate and marking the candidates it passes costs O(n · depth) and lands
+  on the same set, because `contains` means exactly "is an ancestor of". 72ms
+  to 8ms.
+- Badges are keyed by label and updated in place. The lit/dim split is a
+  function of the typed prefix alone, so a badge whose prefix did not change is
+  not touched at all; only the badges the prefix rules out get an opacity
+  write, and only the few it still reaches are re-segmented. 5.4ms to 0.1ms per
+  stroke.
+- Badges share one containing block. They are `position:absolute` inside a
+  container that is `fixed; inset:0` rather than fixed themselves: the viewport
+  coordinate system is the same, and the browser tracks one containing block
+  instead of one per badge. Rendering was verified pixel-identical against the
+  previous build.
+
+In-place updating leans on the snapshot rule in
+[v1 boundaries](#v1-boundaries): label, target and rect are fixed when the round
+opens, so only the prefix can change inside a round. A new round mints new
+badges, which is what stops a label from staying over a target that has moved
+since.
 
 ## v1 boundaries
 
