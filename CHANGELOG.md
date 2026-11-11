@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- 元素很多的界面上，开启一轮标签的耗时不随候选数平方增长：容器判定从两两包含比对改为祖先打标（成本 O(候选数 × 祖先深度)），1189 枚可见标签实测 72ms 降到 8ms
+
 ### Added
 
 - 引用模式：设置页第三行，独立和弦、默认关闭。按和弦进入同一轮标签，选中目标不点击、不聚焦，把元素的可定位描述作为结构化 chip 插进当前会话输入框

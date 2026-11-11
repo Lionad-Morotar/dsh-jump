@@ -185,3 +185,36 @@ describe("text entry hosts in a real composer shape", () => {
   });
 });
 
+
+describe("nesting dedupe over a busy page", () => {
+  it("keeps only the innermost candidate on a three-level chain", () => {
+    // 「谁是容器」的判定从两两比对换成了祖先打标（O(n²) → O(n · depth)）。
+    // 判据本身不能变：三层都是候选时，只有最内层拿到标签。
+    const top = document.createElement("div");
+    top.setAttribute("role", "treeitem");
+    const middle = document.createElement("button");
+    const inner = document.createElement("a");
+    inner.setAttribute("href", "#");
+    top.append(middle);
+    middle.append(inner);
+    place(top, 0, 0, 100, 100);
+    place(middle, 10, 10, 80, 80);
+    place(inner, 20, 20, 60, 60);
+    document.body.append(top);
+    const hints = collectHints(select(top, middle, inner), VIEWPORT, { isVisible: visible });
+    expect(hints.map((h) => h.element)).toEqual([inner]);
+  });
+
+  it("keeps every sibling on a wide flat page", () => {
+    // 反向守护：祖先打标不能把兄弟误认成容器。600 个平铺候选一个都不能少。
+    const els: Element[] = [];
+    for (let i = 0; i < 600; i += 1) {
+      const el = document.createElement("button");
+      place(el, (i % 60) * 12, Math.floor(i / 60) * 12);
+      document.body.append(el);
+      els.push(el);
+    }
+    const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
+    expect(hints).toHaveLength(600);
+  });
+});
