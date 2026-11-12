@@ -424,6 +424,57 @@ export function findDescribedElement(
 }
 
 /**
+ * Scroll every scrollable ancestor until the element sits inside the viewport.
+ *
+ * `scrollIntoView` is the first ask, but a host that owns its scroll position
+ * (a chat that re-asserts "stick to the bottom" after any layout change, a
+ * container with its own paging logic) can undo it on the next frame. Setting
+ * `scrollTop` on the containers themselves, innermost first, is the second ask:
+ * the rect is re-read after each step because scrolling an inner container
+ * moves the element for every outer one.
+ * @param element - the element to bring into view.
+ * @returns whether the element is inside the viewport afterwards.
+ */
+function scrollAncestorsIntoView(element: Element): boolean {
+  const view = element.ownerDocument.defaultView;
+  if (view === null) return false;
+  let node = element.parentElement;
+  while (node !== null && node !== element.ownerDocument.documentElement) {
+    const style = view.getComputedStyle(node);
+    const scrolls = /(auto|scroll)/u.test(style.overflowY);
+    if (scrolls && node.scrollHeight > node.clientHeight + 1) {
+      const rect = element.getBoundingClientRect();
+      const box = node.getBoundingClientRect();
+      const hiddenAbove = rect.top < box.top;
+      const hiddenBelow = rect.bottom > box.bottom;
+      if (hiddenAbove || hiddenBelow) {
+        const centre = rect.top - box.top + rect.height / 2;
+        node.scrollTop += centre - node.clientHeight / 2;
+      }
+    }
+    node = node.parentElement;
+  }
+  return isInsideViewport(element, view);
+}
+
+/**
+ * Whether the element is on screen.
+ *
+ * A zero-sized rect is read as "this environment has no layout to judge"
+ * rather than "not painted": jsdom and hidden tabs answer every rect with
+ * zeros, and calling that a failure would turn every test and every background
+ * tab into a false alarm.
+ * @param element - the element to test.
+ * @param view - the window it lives in.
+ * @returns whether the element occupies viewport space, or layout is unknown.
+ */
+function isInsideViewport(element: Element, view: Window): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return true;
+  return rect.bottom > 0 && rect.top < view.innerHeight && rect.right > 0 && rect.left < view.innerWidth;
+}
+
+/**
  * Scroll one element into view and give it the keyboard.
  *
  * `preventScroll` is what keeps the two halves from fighting: the centring is
@@ -432,35 +483,49 @@ export function findDescribedElement(
  * rejects the options object gets the plain call instead, which still focuses
  * and only loses that guarantee.
  * @param element - the element to reveal.
+ * @returns whether the element ended up on screen.
  */
-function bringIntoView(element: Element): void {
+function bringIntoView(element: Element): boolean {
   const scrollable = element as Element & { scrollIntoView?: (options?: ScrollIntoViewOptions) => void };
   if (typeof scrollable.scrollIntoView === "function") {
     scrollable.scrollIntoView({ block: "center", inline: "center" });
   }
   const focusable = element as Element & { focus?: (options?: FocusOptions) => void };
-  if (typeof focusable.focus !== "function") return;
-  try {
-    focusable.focus({ preventScroll: true });
-  } catch {
-    // An engine that refuses the options object rather than ignoring it.
-    focusable.focus();
+  if (typeof focusable.focus === "function") {
+    try {
+      focusable.focus({ preventScroll: true });
+    } catch {
+      // An engine that refuses the options object rather than ignoring it.
+      focusable.focus();
+    }
   }
+  const view = element.ownerDocument.defaultView;
+  if (view === null) return true;
+  if (isInsideViewport(element, view)) return true;
+  return scrollAncestorsIntoView(element);
 }
 
 /**
  * Which hop of a reveal failed, so the click handler can say so instead of
  * returning an unexplained false that reads as "the click did nothing".
  */
-export type RevealFailure = "bad-ref" | "no-document" | "not-found";
+export type RevealFailure = "bad-ref" | "no-document" | "not-found" | "found-hidden";
 
 export interface RevealOutcome {
   readonly ok: boolean;
   readonly failure?: RevealFailure;
+  /** The element that was found, so the caller can retry once it settles. */
+  readonly element?: Element;
 }
 
 /**
  * The revealing half of {@link revealElement} with the failure reason kept.
+ *
+ * `found-hidden` is its own failure: the description still resolves, so the
+ * chip is not stale, but the page refuses to scroll the element into view (a
+ * closed overlay, or a scroll owner that cancelled the move). Reporting that
+ * separately keeps "the element is gone" and "the page did not move" from
+ * looking like the same bug from the outside.
  * @param ref - The chip's `ref` string.
  * @param doc - The document to search.
  * @returns whether the element was found and revealed, else why not.
@@ -472,8 +537,34 @@ export function revealElementDetailed(ref: string, doc?: Document): RevealOutcom
   if (target === undefined) return { ok: false, failure: "no-document" };
   const element = findDescribedElement(descriptor, target);
   if (element === undefined) return { ok: false, failure: "not-found" };
+  // "Found" is success: whether the page actually moved is a separate question
+  // answered one frame later by {@link confirmReveal}, because the surface that
+  // owns the scroll position can still cancel the move after this returns.
   bringIntoView(element);
-  return { ok: true };
+  return { ok: true, element };
+}
+
+/**
+ * Re-apply a reveal once the page has settled.
+ *
+ * A scroll that lands during the click's own turn can be undone by the surface
+ * that owns the scroll position (a chat that follows the newest message
+ * re-asserts the bottom on the next layout). The retry runs a frame later, on
+ * the element the first pass found, and only touches the scroll: focus already
+ * moved, and stealing it again would fight the reader's next click.
+ * @param element - the element a first pass revealed.
+ * @returns whether the element is inside the viewport afterwards.
+ */
+export function confirmReveal(element: Element): boolean {
+  const view = element.ownerDocument.defaultView;
+  if (view === null) return false;
+  if (isInsideViewport(element, view)) return true;
+  const scrollable = element as Element & { scrollIntoView?: (options?: ScrollIntoViewOptions) => void };
+  if (typeof scrollable.scrollIntoView === "function") {
+    scrollable.scrollIntoView({ block: "center", inline: "center" });
+  }
+  if (isInsideViewport(element, view)) return true;
+  return scrollAncestorsIntoView(element);
 }
 
 /**

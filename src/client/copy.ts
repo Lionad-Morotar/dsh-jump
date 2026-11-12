@@ -38,6 +38,8 @@ export interface Copy {
   referenceNeedsSession: string;
   /** One-shot notice when a chip's element can no longer be found on the page. */
   referenceLost: string;
+  /** One-shot notice when the element exists but the page would not scroll to it. */
+  referenceHidden: string;
   /** Shown in place of a chord while the reader is pressing keys. */
   recording: string;
   /** The instruction under the rows while recording. */
@@ -72,6 +74,7 @@ export const ZH: Copy = {
   referenceDisable: "关闭引用模式",
   referenceNeedsSession: "需要先打开一个会话，引用要插进它的输入框。",
   referenceLost: "找不到引用的那个元素了，它可能已被页面移除。",
+  referenceHidden: "找到了那个元素，但页面没有滚动过去。",
   recording: "按下快捷键",
   recordingHint: "Esc 取消",
   reset: "恢复默认",
@@ -102,6 +105,7 @@ export const EN: Copy = {
   referenceDisable: "Turn off reference mode",
   referenceNeedsSession: "Open a session first: the reference is inserted into its composer.",
   referenceLost: "The referenced element could not be found; the page may have removed it.",
+  referenceHidden: "The element is there, but the page would not scroll to it.",
   recording: "Press a shortcut",
   recordingHint: "Esc to cancel",
   reset: "Restore default",

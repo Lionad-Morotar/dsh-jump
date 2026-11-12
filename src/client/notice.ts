@@ -35,3 +35,26 @@ export function flashNotice(doc: Document, text: string, durationMs = 1400): HTM
   else win.setTimeout(remove, durationMs);
   return el;
 }
+
+/**
+ * Run `task` after the page has settled one frame.
+ *
+ * A scroll issued during the click's own turn can be undone by whichever
+ * surface owns the scroll position (a chat that follows the newest message
+ * re-asserts the bottom on the next layout). One frame later that surface has
+ * had its say, so the retry is the last word rather than a race.
+ * @param doc - the document whose window schedules the callback.
+ * @param task - what to run.
+ */
+export function scheduleAfterLayout(doc: Document, task: () => void): void {
+  const view = doc.defaultView;
+  if (view === null) {
+    task();
+    return;
+  }
+  if (typeof view.requestAnimationFrame === "function") {
+    view.requestAnimationFrame(() => view.requestAnimationFrame(task));
+    return;
+  }
+  view.setTimeout(task, 16);
+}

@@ -26,6 +26,7 @@ import {
   createJumpReferenceSource,
   describeElement,
   insertUiReference,
+  confirmReveal,
   revealElementDetailed,
   uiReferencePayload,
   type InputActionsFace,
@@ -33,7 +34,7 @@ import {
   type JumpReferenceBridgeState,
   type UiReferenceInsertionResult,
 } from "./reference.ts";
-import { flashNotice } from "./notice.ts";
+import { flashNotice, scheduleAfterLayout } from "./notice.ts";
 
 /** The one part of the Cordis context this plugin reads. */
 export interface RuntimeContext {
@@ -237,19 +238,27 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
                 ? (reference as { readonly ref?: unknown }).ref
                 : undefined;
             if (typeof ref !== "string") return false;
-            const outcome = revealElementDetailed(ref, deps.document ?? globalThis.document);
-            if (!outcome.ok) {
+            const doc = deps.document ?? globalThis.document;
+            const locale = scope.get<{ getSnapshot(): { active: string } }>("locale");
+            const copy = copyFor(locale?.getSnapshot().active ?? "zh");
+            const outcome = revealElementDetailed(ref, doc);
+            if (outcome.element === undefined) {
               // A silent false reads as "the click did nothing" and gets filed
               // as a plugin bug; the notice says the element is gone and the
               // warning records which hop failed for the next diagnosis.
               console.warn("[dsh-jump] reference reveal failed:", outcome.failure ?? "unknown", ref.slice(0, 160));
-              const locale = scope.get<{ getSnapshot(): { active: string } }>("locale");
-              flashNotice(
-                deps.document ?? globalThis.document,
-                copyFor(locale?.getSnapshot().active ?? "zh").referenceLost,
-              );
+              flashNotice(doc, copy.referenceLost);
+              return false;
             }
-            return outcome.ok;
+            // The scroll can still be cancelled by whichever surface owns the
+            // scroll position, so the verdict comes one frame later, after that
+            // surface has had its say.
+            scheduleAfterLayout(doc, () => {
+              if (confirmReveal(outcome.element as Element)) return;
+              console.warn("[dsh-jump] reference reveal failed: found-hidden", ref.slice(0, 160));
+              flashNotice(doc, copy.referenceHidden);
+            });
+            return true;
           }),
         );
         source.registered = true;

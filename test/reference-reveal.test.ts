@@ -57,6 +57,8 @@ function host(services: HostServices) {
 beforeEach(() => {
   doc.body.replaceChildren();
   doc.head.replaceChildren();
+  // 提示挂在 documentElement 上，不会随 body 清空消失；留着会让下一条断言读到上一条的文案
+  doc.querySelectorAll("[data-dsh-jump-notice]").forEach(node => node.remove());
 });
 
 describe("host click contract (dsh 0.2.2 dispatch mirror)", () => {
@@ -136,6 +138,42 @@ describe("host click contract (dsh 0.2.2 dispatch mirror)", () => {
 
     expect(handled).toBe(false);
     expect(doc.querySelector("[data-dsh-jump-notice]")?.textContent).toContain("找不到");
+
+    runtime.dispose();
+  });
+
+  it("says so when the page refuses to scroll the element into view", async () => {
+    const services: HostServices = { registered: [] };
+    const runtime = createRuntime({ ctx: host(services), platform: "macos", React: REACT, ...HOST });
+
+    const button = doc.createElement("button");
+    button.setAttribute("aria-label", "far-away");
+    doc.body.appendChild(button);
+    // 布局层替身：元素始终在视口下方 5000px 处，页面谁也不许滚
+    button.getBoundingClientRect = () =>
+      ({ x: 0, y: 5000, width: 40, height: 20, top: 5000, bottom: 5020, left: 0, right: 40, toJSON: () => ({}) }) as DOMRect;
+
+    const owner = services.registered[0] as JumpReferenceSource & {
+      openReference?: (s: unknown, r: unknown) => boolean;
+    };
+    const ref = JSON.stringify({ kind: "ui.element", tag: "button", ariaLabel: "far-away" });
+
+    const originalWarn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+    let handled: boolean | undefined;
+    try {
+      handled = owner.openReference?.({ sessionId: "s" }, { ref, appearance: "session" });
+      await new Promise(resolve => setTimeout(resolve, 60));
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    expect(handled).toBe(true);
+    expect(doc.querySelector("[data-dsh-jump-notice]")?.textContent).toContain("没有滚动过去");
+    expect(warnings.some(args => String(args[0]).includes("found-hidden"))).toBe(true);
 
     runtime.dispose();
   });
