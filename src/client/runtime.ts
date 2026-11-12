@@ -26,13 +26,14 @@ import {
   createJumpReferenceSource,
   describeElement,
   insertUiReference,
-  revealElement,
+  revealElementDetailed,
   uiReferencePayload,
   type InputActionsFace,
   type InputTriggersFace,
   type JumpReferenceBridgeState,
   type UiReferenceInsertionResult,
 } from "./reference.ts";
+import { flashNotice } from "./notice.ts";
 
 /** The one part of the Cordis context this plugin reads. */
 export interface RuntimeContext {
@@ -236,7 +237,19 @@ export function createRuntime(deps: RuntimeDeps): JumpRuntime {
                 ? (reference as { readonly ref?: unknown }).ref
                 : undefined;
             if (typeof ref !== "string") return false;
-            return revealElement(ref, deps.document ?? globalThis.document);
+            const outcome = revealElementDetailed(ref, deps.document ?? globalThis.document);
+            if (!outcome.ok) {
+              // A silent false reads as "the click did nothing" and gets filed
+              // as a plugin bug; the notice says the element is gone and the
+              // warning records which hop failed for the next diagnosis.
+              console.warn("[dsh-jump] reference reveal failed:", outcome.failure ?? "unknown", ref.slice(0, 160));
+              const locale = scope.get<{ getSnapshot(): { active: string } }>("locale");
+              flashNotice(
+                deps.document ?? globalThis.document,
+                copyFor(locale?.getSnapshot().active ?? "zh").referenceLost,
+              );
+            }
+            return outcome.ok;
           }),
         );
         source.registered = true;

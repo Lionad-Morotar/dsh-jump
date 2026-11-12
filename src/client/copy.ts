@@ -36,6 +36,8 @@ export interface Copy {
   referenceDisable: string;
   /** Why reference mode cannot be used right now, when it cannot. */
   referenceNeedsSession: string;
+  /** One-shot notice when a chip's element can no longer be found on the page. */
+  referenceLost: string;
   /** Shown in place of a chord while the reader is pressing keys. */
   recording: string;
   /** The instruction under the rows while recording. */
@@ -69,6 +71,7 @@ export const ZH: Copy = {
   referenceDisabled: "未启用",
   referenceDisable: "关闭引用模式",
   referenceNeedsSession: "需要先打开一个会话，引用要插进它的输入框。",
+  referenceLost: "找不到引用的那个元素了，它可能已被页面移除。",
   recording: "按下快捷键",
   recordingHint: "Esc 取消",
   reset: "恢复默认",
@@ -98,6 +101,7 @@ export const EN: Copy = {
   referenceDisabled: "Off",
   referenceDisable: "Turn off reference mode",
   referenceNeedsSession: "Open a session first: the reference is inserted into its composer.",
+  referenceLost: "The referenced element could not be found; the page may have removed it.",
   recording: "Press a shortcut",
   recordingHint: "Esc to cancel",
   reset: "Restore default",

@@ -449,6 +449,34 @@ function bringIntoView(element: Element): void {
 }
 
 /**
+ * Which hop of a reveal failed, so the click handler can say so instead of
+ * returning an unexplained false that reads as "the click did nothing".
+ */
+export type RevealFailure = "bad-ref" | "no-document" | "not-found";
+
+export interface RevealOutcome {
+  readonly ok: boolean;
+  readonly failure?: RevealFailure;
+}
+
+/**
+ * The revealing half of {@link revealElement} with the failure reason kept.
+ * @param ref - The chip's `ref` string.
+ * @param doc - The document to search.
+ * @returns whether the element was found and revealed, else why not.
+ */
+export function revealElementDetailed(ref: string, doc?: Document): RevealOutcome {
+  const descriptor = decodeUiRef(ref);
+  if (descriptor === undefined) return { ok: false, failure: "bad-ref" };
+  const target = doc ?? (typeof globalThis.document === "undefined" ? undefined : globalThis.document);
+  if (target === undefined) return { ok: false, failure: "no-document" };
+  const element = findDescribedElement(descriptor, target);
+  if (element === undefined) return { ok: false, failure: "not-found" };
+  bringIntoView(element);
+  return { ok: true };
+}
+
+/**
  * Take the reader back to the element one chip describes.
  *
  * The chip carries a description rather than a live reference, so the element
@@ -459,14 +487,7 @@ function bringIntoView(element: Element): void {
  * @returns whether the element was found and revealed.
  */
 export function revealElement(ref: string, doc?: Document): boolean {
-  const descriptor = decodeUiRef(ref);
-  if (descriptor === undefined) return false;
-  const target = doc ?? (typeof globalThis.document === "undefined" ? undefined : globalThis.document);
-  if (target === undefined) return false;
-  const element = findDescribedElement(descriptor, target);
-  if (element === undefined) return false;
-  bringIntoView(element);
-  return true;
+  return revealElementDetailed(ref, doc).ok;
 }
 
 /**
