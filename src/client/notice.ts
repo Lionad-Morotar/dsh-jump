@@ -11,8 +11,13 @@ const FADE_MS = 160;
 
 /** Paint one notice and schedule its removal; returns the element for tests. */
 export function flashNotice(doc: Document, text: string, durationMs = 1400): HTMLElement {
+  // Rapid clicks on stale chips would otherwise pile pills on one spot; the
+  // newest reason is the only one still true.
+  doc.querySelectorAll("[data-dsh-jump-notice]").forEach((stale) => stale.remove());
   const el = doc.createElement("div");
   el.dataset.dshJumpNotice = "";
+  el.setAttribute("role", "status");
+  el.setAttribute("aria-live", "polite");
   el.textContent = text;
   el.style.cssText =
     "position:fixed;left:50%;bottom:28px;transform:translateX(-50%);" +
