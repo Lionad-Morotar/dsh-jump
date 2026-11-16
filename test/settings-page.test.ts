@@ -190,6 +190,19 @@ describe("JumpSettingsPage", () => {
     expect(textOf(issue[0] as Node)).toBe(ZH.issues["no-modifier"]);
   });
 
+  it("ties the refusal to the chord button that was being recorded", () => {
+    const { controller } = setup();
+    controller.begin("focus");
+    controller.press({ key: "k", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, isComposing: false });
+    const tree = JumpSettingsPage({ React: fakeReact(), controller, platform: "macos", copy: ZH }) as Node;
+    const issue = findAll(tree, (n) => "data-dsh-jump-issue" in n.props)[0];
+    const focusChord = chords(tree).find((n) => n.props["data-dsh-jump-chord"] === "focus");
+    const clickChord = chords(tree).find((n) => n.props["data-dsh-jump-chord"] === "click");
+    expect(typeof issue?.props.id).toBe("string");
+    expect(focusChord?.props["aria-describedby"]).toBe(issue?.props.id);
+    expect(clickChord?.props["aria-describedby"]).toBeUndefined();
+  });
+
   it("mentions that a key which prints nothing may be bound bare", () => {
     const { tree } = setup();
     expect(textOf(tree)).toContain(ZH.bareNote);

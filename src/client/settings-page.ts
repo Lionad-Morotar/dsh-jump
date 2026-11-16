@@ -152,6 +152,9 @@ export const PAGE_CSS = `
 }
 `;
 
+/** The settings page is mounted once, so a fixed id cannot collide. */
+const ISSUE_ID = "dsh-jump-issue";
+
 /** Tag id for the page stylesheet, so a reload does not insert a second copy. */
 const STYLE_TAG = "dsh-jump/page.css";
 
@@ -221,6 +224,9 @@ function modeRow(props: ModeRowProps): unknown {
           // of that swap.
           "aria-label": name,
           ...(printed === null ? {} : { "aria-keyshortcuts": printed }),
+          // The refusal is printed under all rows; this ties it to the button
+          // whose recording it rejected, so focus there reads the reason too.
+          ...(recording && state.issue !== null ? { "aria-describedby": ISSUE_ID } : {}),
           onClick: () => {
             controller.begin(action);
           },
@@ -315,7 +321,7 @@ export function JumpSettingsPage(props: SettingsPageProps): unknown {
     }),
     // A refusal belongs to the recording row; the page repeats it once under the
     // rows so it is announced even while the reader's focus is on the button.
-    state.issue === null ? null : React.createElement("p", { "data-dsh-jump-issue": "", role: "status" }, copy.issues[state.issue]),
+    state.issue === null ? null : React.createElement("p", { id: ISSUE_ID, "data-dsh-jump-issue": "", role: "status" }, copy.issues[state.issue]),
     React.createElement("p", { "data-dsh-jump-note": "" }, copy.bareNote),
   );
 }
