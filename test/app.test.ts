@@ -807,3 +807,44 @@ describe("configurable activation chords", () => {
   });
 });
 
+describe("stacked background cards stay out of the label set", () => {
+  it("labels only the foreground button when the background card is aria-hidden and pointer-events:none", () => {
+    // 不注入 isVisible：走真实 defaultIsVisible 的组合判定。jsdom 没有
+    // checkVisibility 也不做布局，可见性一半靠内联 position:fixed 走
+    // getComputedStyle 分支；不可交互一半由后台卡的 aria-hidden 阻断。
+    const fgCard = doc.createElement("aside");
+    const fgButton = doc.createElement("button");
+    fgButton.setAttribute("style", "position: fixed");
+    fgCard.append(fgButton);
+
+    const bgCard = doc.createElement("aside");
+    bgCard.setAttribute("aria-hidden", "true");
+    bgCard.setAttribute("style", "pointer-events: none");
+    const bgButton = doc.createElement("button");
+    bgButton.setAttribute("style", "position: fixed");
+    bgButton.setAttribute("tabindex", "-1");
+    bgCard.append(bgButton);
+
+    doc.body.append(fgCard, bgCard);
+    place(fgButton, 10, 10);
+    place(bgButton, 30, 30);
+
+    const teardown = createApp({ window: win }).apply();
+    activate();
+
+    const root = overlayRoot();
+    expect(root).not.toBeNull();
+    const labels = [...(root?.children ?? [])].map((b) => (b as HTMLElement).dataset.jumpLabel);
+    expect(labels).toEqual(["a"]);
+
+    // 唯一的标签属于前景按钮：敲它命中的就是前景按钮本身。
+    const hits: string[] = [];
+    fgButton.addEventListener("click", () => hits.push("foreground"));
+    bgButton.addEventListener("click", () => hits.push("background"));
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(hits).toEqual(["foreground"]);
+
+    teardown();
+  });
+});
+

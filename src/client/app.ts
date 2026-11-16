@@ -22,6 +22,7 @@ import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
 import { createOverlay } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
+import { isUserReachable } from "./reach.ts";
 
 /** 测试桩是 jsdom 的 window，监听签名不能比它更窄。 */
 type JumpListen = (type: string, listener: (event: Event) => void, options?: { capture?: boolean }) => void;
@@ -81,10 +82,17 @@ export interface JumpApp {
 
 function defaultIsVisible(element: Element): boolean {
   const el = element as HTMLElement;
-  if (typeof el.checkVisibility === "function") return el.checkVisibility();
-  // offsetParent is also null for position:fixed, which stays clickable.
-  const view = el.ownerDocument?.defaultView;
-  return el.offsetParent !== null || view?.getComputedStyle(el).position === "fixed";
+  let rendered: boolean;
+  if (typeof el.checkVisibility === "function") rendered = el.checkVisibility();
+  else {
+    // offsetParent is also null for position:fixed, which stays clickable.
+    const view = el.ownerDocument?.defaultView;
+    rendered = el.offsetParent !== null || view?.getComputedStyle(el).position === "fixed";
+  }
+  // Rendered but unreachable (aria-hidden / inert / pointer-events:none up the
+  // chain) is the stacked-background-card shape: a label there would send the
+  // synthetic click to a button no user can see or hit.
+  return rendered && isUserReachable(element);
 }
 
 /** Click-mode dispatch: the full pointer/mouse sequence a real user produces. */

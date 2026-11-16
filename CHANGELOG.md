@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- 叠放卡片等被隐藏或不可交互的元素不再被标上跳跃标签，敲标签不会再点到看不见也点不到的按钮
+
 ## [0.2.0] - 2026-11-12
 
 ### Changed
