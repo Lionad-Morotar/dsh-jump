@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - 叠放卡片等被隐藏或不可交互的元素不再被标上跳跃标签，敲标签不会再点到看不见也点不到的按钮
+- 面板外壳声明 `pointer-events: none` 但按钮自身重新开启命中时（右侧边栏开始页一类），按钮照常拿到标签并可选中
 
 ## [0.2.0] - 2026-11-12
 
