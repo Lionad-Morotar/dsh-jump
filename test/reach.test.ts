@@ -45,6 +45,20 @@ describe("isUserReachable", () => {
     expect(isUserReachable(buttonIn(card))).toBe(false);
   });
 
+  // The right sidebar's start page is the shape this guards: the panel shell is
+  // pointer-events:none so gaps pass through, and each tile re-enables itself.
+  // Hit-testing reads the target's own computed value, so an `auto` tile inside
+  // a `none` shell is reachable and must keep its label.
+  it("keeps a button that re-enables pointer-events inside a none shell", () => {
+    const shell = document.createElement("aside");
+    shell.setAttribute("style", "pointer-events: none");
+    const tile = document.createElement("button");
+    tile.setAttribute("style", "pointer-events: auto");
+    shell.append(tile);
+    document.body.append(shell);
+    expect(isUserReachable(tile)).toBe(true);
+  });
+
   it("keeps a plain button without any blocking marker", () => {
     expect(isUserReachable(buttonIn(document.createElement("aside")))).toBe(true);
   });

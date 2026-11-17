@@ -4,17 +4,18 @@
  * something the user can neither see nor hit (the host's stacked notification
  * cards keep their background card `aria-hidden` + `pointer-events:none`).
  *
- * Three markers block, each checked along the ancestor chain including the
- * element itself:
+ * Two markers block along the ancestor chain, including the element itself:
  * - `aria-hidden` present with any value except "false" ("" blocks too);
- * - the `inert` attribute;
- * - computed `pointer-events: none`.
+ * - the `inert` attribute.
+ * Both describe a subtree, so a descendant can never opt back in.
  *
- * The style check walks every ancestor instead of reading the element alone
- * because jsdom does not resolve CSS inheritance, so each level is queried by
- * hand; in real browsers the walk is redundant (pointer-events inherits) but
- * still correct. dsh-jump's own overlay container is pointer-events:none and
- * never an ancestor of candidates, so it needs no special case.
+ * `pointer-events` is a different matter: it inherits, but a descendant may
+ * re-declare it and become hittable again. Hit-testing reads the target's own
+ * computed value, which already carries the inherited result, so this reads
+ * that one value and never walks up. The right sidebar's start page is exactly
+ * that shape: the panel shell is `pointer-events:none` so the gaps between
+ * cards pass clicks through, and every tile re-enables itself with `auto`.
+ * Walking the chain would strip the label off all of them.
  *
  * Verdicts are intentionally stateless: a cached "blocked" ancestor would
  * outlive the host un-hiding that card between rounds and wrongly keep it out
@@ -27,8 +28,8 @@ export function isUserReachable(element: Element): boolean {
     const hidden = node.getAttribute("aria-hidden");
     if (hidden !== null && hidden !== "false") return false;
     if (node.hasAttribute("inert")) return false;
-    const view = node.ownerDocument?.defaultView;
-    if (view !== null && view !== undefined && view.getComputedStyle(node).pointerEvents === "none") return false;
   }
+  const view = element.ownerDocument?.defaultView;
+  if (view !== null && view !== undefined && view.getComputedStyle(element).pointerEvents === "none") return false;
   return true;
 }
