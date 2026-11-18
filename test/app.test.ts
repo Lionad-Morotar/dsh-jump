@@ -620,89 +620,43 @@ describe("activation clears the page so the next letter is a label", () => {
     teardown();
   });
 
-  it("asks the host to take the latin input source on activation and to give it back on escape", () => {
-    buttons(1);
-    const calls: string[] = [];
-    const teardown = createApp({
-      window: win,
-      isVisible: () => true,
-      onRound: (phase) => calls.push(phase),
-    }).apply();
+  // 契约：激活先失焦（collectRound 的第一步就是 releaseFocus）。焦点离开输入面
+  // 后标签键以裸 keydown 到达，输入法不吃键，因此无需通知宿主切系统输入源
+  //（那条通道已删）。
+  it("releases a focused contenteditable before collecting, so the labels it shows are usable", () => {
+    const [first] = buttons(2);
+    let clickTarget: Element | null = null;
+    doc.body.addEventListener("click", (e) => {
+      clickTarget = e.target as Element;
+    });
+    const editable = doc.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    place(editable, 10, 10);
+    doc.body.append(editable);
+    editable.focus();
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
 
-    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
-    win.dispatchEvent(keydown({ key: "Escape" }));
+    activate();
+    expect(doc.activeElement).not.toBe(editable);
+    expect(doc.activeElement).toBe(doc.body);
+    expect(overlayRoot()).not.toBeNull();
 
-    expect(calls).toEqual(["begin", "end"]);
-    teardown();
-  });
-
-  it("gives the input source back once a label completes, not only on escape", () => {
-    buttons(1);
-    const calls: string[] = [];
-    const teardown = createApp({
-      window: win,
-      isVisible: () => true,
-      onRound: (phase) => calls.push(phase),
-      // Focus mode ships unbound, so this mount carries the chord a reader
-      // would have recorded in the settings page.
-      bindings: { get: () => WITH_FOCUS },
-    }).apply();
-
-    win.dispatchEvent(keydown({ key: "u", metaKey: true }));
     win.dispatchEvent(keydown({ key: "a" }));
-
-    expect(calls).toEqual(["begin", "end"]);
-    teardown();
-  });
-
-  it("gives the input source back when the window is hidden mid-round", () => {
-    buttons(1);
-    const calls: string[] = [];
-    const teardown = createApp({
-      window: win,
-      isVisible: () => true,
-      onRound: (phase) => calls.push(phase),
-    }).apply();
-
-    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
-    Object.defineProperty(doc, "visibilityState", { configurable: true, get: () => "hidden" });
-    doc.dispatchEvent(new dom.window.Event("visibilitychange"));
-
-    expect(calls).toEqual(["begin", "end"]);
     expect(overlayRoot()).toBeNull();
+    expect(clickTarget).toBe(first);
     teardown();
   });
 
-  it("gives the input source back when the page is going away mid-round", () => {
-    buttons(1);
-    const calls: string[] = [];
-    const teardown = createApp({
-      window: win,
-      isVisible: () => true,
-      onRound: (phase) => calls.push(phase),
-    }).apply();
+  it("leaves a round whose focus already sits on body untouched and still opens", () => {
+    buttons(2);
+    const teardown = createApp({ window: win, isVisible: () => true }).apply();
 
-    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
-    win.dispatchEvent(new dom.window.Event("pagehide"));
-
-    expect(calls).toEqual(["begin", "end"]);
+    expect(() => activate()).not.toThrow();
+    expect(doc.activeElement).toBe(doc.body);
+    expect(overlayRoot()).not.toBeNull();
     teardown();
   });
 
-  it("gives the input source back if the plugin unloads while a round is open", () => {
-    buttons(1);
-    const calls: string[] = [];
-    const teardown = createApp({
-      window: win,
-      isVisible: () => true,
-      onRound: (phase) => calls.push(phase),
-    }).apply();
-
-    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
-    teardown();
-
-    expect(calls).toEqual(["begin", "end"]);
-  });
 });
 
 describe("labels survive a second activation", () => {
