@@ -7,11 +7,13 @@
  * Two costs scale with the round: minting the badges, and repainting them on
  * every stroke of a label. The first is unavoidable — N targets need N marks —
  * so the second is what has to stay off the keystroke path. Badges are keyed
- * by label and updated in place: a stroke rewrites opacity on the badges the
- * prefix ruled out (one property each) and re-segments only the few it still
- * reaches, leaving position, size and node identity untouched. Rebuilding the
- * whole run per stroke is what made a busy page feel sluggish while typing,
- * and that cost was paid on every stroke of a three-key label.
+ * by label and updated in place: a stroke only touches badges whose look
+ * changes, dimming the ones it rules out and re-segmenting the few it still
+ * reaches. A badge ruled out by an earlier stroke stays out at every longer
+ * prefix, so it is skipped entirely. Position, size and node identity stay
+ * untouched. Rebuilding the whole run per stroke is what made a busy page feel
+ * sluggish while typing, and that cost was paid on every stroke of a three-key
+ * label.
  *
  * Badges are absolutely positioned inside the fixed container rather than fixed
  * themselves. The container already spans the viewport, so the coordinate
@@ -45,11 +47,18 @@ interface Badge {
   /** The target this badge was minted for; a new round replaces the badge. */
   target: Element;
   /**
-   * Prefix currently painted.
+   * Whether the last paint left this badge lit.
    *
-   * The whole lit/dim split is a function of the prefix, so an unchanged prefix
-   * means an unchanged badge: that is the check that keeps a stroke from
-   * touching the other hundreds of badges in the round.
+   * Kept apart from the prefix because a ruled-out badge looks identical at
+   * every prefix that does not reach it: once dim, a longer prefix must not
+   * touch it again.
+   */
+  matched: boolean;
+  /**
+   * Prefix whose text split this badge currently shows.
+   *
+   * Only meaningful while `matched`; a dim badge always reads as its whole
+   * label, whichever prefix ruled it out.
    */
   drawn: string;
 }
@@ -150,7 +159,7 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       "font:11px/1.3 ui-monospace,Menlo,monospace;pointer-events:none;" +
       "opacity:" + (matched ? "1" : "0.3");
     el.append(...segments(hint, matched ? pending : ""));
-    return { element: el, target: hint.element, drawn: pending };
+    return { element: el, target: hint.element, matched, drawn: pending };
   }
 
   /**
@@ -161,10 +170,15 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
    * and goes dim.
    */
   function paint(badge: Badge, hint: Hint, pending: string): void {
-    if (badge.drawn === pending) return;
-    badge.drawn = pending;
     const matched = hint.label.startsWith(pending);
-    badge.element.style.opacity = matched ? "1" : "0.3";
+    const flips = badge.matched !== matched;
+    // A badge already ruled out stays ruled out under every longer prefix:
+    // same opacity, same whole-label run, so both writes would be invisible.
+    if (!flips && (!matched || badge.drawn === pending)) return;
+    badge.matched = matched;
+    badge.drawn = pending;
+    // While the badge stays lit the opacity is already 1; only the split moves.
+    if (flips) badge.element.style.opacity = matched ? "1" : "0.3";
     badge.element.replaceChildren(...segments(hint, matched ? pending : ""));
   }
 

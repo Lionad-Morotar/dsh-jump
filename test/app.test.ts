@@ -429,6 +429,137 @@ describe("a completing stroke tears the round down without repainting it", () =>
   });
 });
 
+/**
+ * 前缀增长时，视觉上没变化的徽章必须整枚跳过。
+ *
+ * 首键 "a" 之后已经变暗的徽章，到 "as" 仍然不匹配：opacity 还是 0.3，
+ * 文字还是单段整标签。它们不该收到 opacity 写入，也不该重建子节点。
+ * 断言落在 MutationObserver 记录上，因为修复前后最终视觉完全相同。
+ */
+describe("a growing prefix only repaints badges whose look changes", () => {
+  let stop: (() => void) | undefined;
+  let watcher: MutationObserver | undefined;
+  afterEach(() => {
+    watcher?.disconnect();
+    watcher = undefined;
+    stop?.();
+    stop = undefined;
+  });
+
+  function mount(): void {
+    stop = createApp({ window: win, isVisible: () => true }).apply();
+  }
+
+  function allBadges(): HTMLElement[] {
+    return [...(overlayRoot()?.children ?? [])] as HTMLElement[];
+  }
+
+  function badge(label: string): HTMLElement {
+    const found = allBadges().find((child) => child.dataset.jumpLabel === label);
+    expect(found).toBeDefined();
+    return found as HTMLElement;
+  }
+
+  function parts(label: string): [string | undefined, string | null][] {
+    return [...badge(label).children].map((part) => [
+      (part as HTMLElement).dataset.jumpPart,
+      part.textContent,
+    ]);
+  }
+
+  function labelsByOpacity(opacity: string): string[] {
+    return allBadges()
+      .filter((child) => child.style.opacity === opacity)
+      .map((child) => child.dataset.jumpLabel ?? "");
+  }
+
+  function watch(): () => MutationRecord[] {
+    const root = overlayRoot();
+    if (root === null) throw new Error("浮层不存在，无法观察");
+    const observer = new dom.window.MutationObserver(() => undefined);
+    observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["style"] });
+    watcher = observer;
+    return () => observer.takeRecords();
+  }
+
+  /** 一条记录算在哪枚徽章上；徽章内部 span 的写入也算它的。 */
+  function owner(record: MutationRecord): string | undefined {
+    const holder = (record.target as Element).closest?.("[data-jump-label]");
+    return (holder as HTMLElement | null | undefined)?.dataset.jumpLabel;
+  }
+
+  it("leaves the badges that were already dim untouched on the second stroke", () => {
+    // 90 个候选超过双键容量（81），整轮升到三键；两击之后 "as" 仍是活前缀。
+    // 首键 "a" 留下 81 枚点亮，9 枚以 s 开头的标签在这一击就变暗。
+    buttons(90);
+    mount();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    const lit = labelsByOpacity("1");
+    const dim = labelsByOpacity("0.3");
+    expect(lit).toHaveLength(81);
+    expect(dim).toHaveLength(9);
+    expect(dim).toContain("saa");
+
+    const drain = watch();
+    win.dispatchEvent(keydown({ key: "s" }));
+    const records = drain();
+
+    // 已经变暗的那批继续不匹配，整批零写入。
+    const dimWrites = records.filter((record) => dim.includes(owner(record) ?? ""));
+    expect(dimWrites).toHaveLength(0);
+    // 第二击改动的正好是首键仍点亮的那批：as 组重分段，其余在这一击被排除。
+    const touched = [...new Set(records.map(owner).filter((label): label is string => label !== undefined))];
+    expect(touched.sort()).toEqual([...lit].sort());
+    expect(parts("asd")).toEqual([
+      ["typed", "as"],
+      ["rest", "d"],
+    ]);
+  });
+
+  it("dims a badge the moment the growing prefix rules it out", () => {
+    buttons(90);
+    mount();
+    activate();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(badge("ada").style.opacity).toBe("1");
+    expect(parts("ada")).toEqual([
+      ["typed", "a"],
+      ["rest", "da"],
+    ]);
+
+    win.dispatchEvent(keydown({ key: "s" }));
+
+    expect(badge("ada").style.opacity).toBe("0.3");
+    expect(parts("ada")).toEqual([["whole", "ada"]]);
+  });
+
+  it("relights every badge when a dead key clears the prefix", () => {
+    buttons(90);
+    mount();
+    activate();
+
+    // 两击之后只剩 as 组点亮；s 组那 9 枚从首击起就没亮过，第二击也被跳过。
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "s" }));
+    expect(labelsByOpacity("1")).toHaveLength(9);
+    expect(badge("saa").style.opacity).toBe("0.3");
+
+    // "x" 不在主行，接不上任何 label，前缀被清空。
+    win.dispatchEvent(keydown({ key: "x" }));
+
+    expect(labelsByOpacity("1")).toHaveLength(90);
+    for (const child of allBadges()) {
+      expect(child.style.opacity).toBe("1");
+      expect([...child.children]).toHaveLength(1);
+      expect((child.children[0] as HTMLElement).dataset.jumpPart).toBe("whole");
+      expect(child.textContent).toBe(child.dataset.jumpLabel);
+    }
+  });
+});
+
 describe("active-mode key swallowing", () => {
   it("Enter in a focused input is eaten while click mode is active", () => {
     const input = doc.createElement("input");

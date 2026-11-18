@@ -86,6 +86,9 @@ describe("prefix painting", () => {
     // 敲了 a：as 拆成已敲与未敲两段并保持点亮，sd 被前缀排除、整枚变暗。
     expect(as?.children).toHaveLength(2);
     expect((as?.children[0] as HTMLElement).dataset.jumpPart).toBe("typed");
+    // 已敲与未敲的字重分工也是用户看到的形态，不能被重分段改掉。
+    expect((as?.children[0] as HTMLElement).style.fontWeight).toBe("700");
+    expect((as?.children[1] as HTMLElement).style.fontWeight).toBe("400");
     expect(as?.style.opacity).toBe("1");
     expect(sd?.style.opacity).toBe("0.3");
     expect(sd?.children).toHaveLength(1);
