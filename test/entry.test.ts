@@ -24,6 +24,10 @@ Object.defineProperty(globalThis, "removeEventListener", {
   value: (type: string, listener: EventListener, options?: unknown) => dom.window.removeEventListener(type, listener, options as AddEventListenerOptions),
   configurable: true,
 });
+// jsdom 没有视口尺寸；app 从 globalThis 读它裁掉屏幕外的候选，缺了它一轮
+// 激活只会画出空容器，徽章断言无从谈起。
+Object.defineProperty(globalThis, "innerWidth", { value: 1024, configurable: true });
+Object.defineProperty(globalThis, "innerHeight", { value: 768, configurable: true });
 
 const { default: clientPlugin, boot } = await import("../src/client/entry.ts");
 const { SETTINGS_ORDER } = await import("../src/client/runtime.ts");
@@ -63,9 +67,39 @@ function registry() {
   return { ctx, registrations, injections };
 }
 
+/** 一个带可用矩形的可标目标；jsdom 没有布局引擎，矩形与 fixed 都只能手工给。 */
+function addTarget(): HTMLButtonElement {
+  const button = doc.createElement("button");
+  // 可见性判定读 offsetParent，而 jsdom 里它恒为 null；fixed 是它认的另一条路。
+  button.style.position = "fixed";
+  button.getBoundingClientRect = () =>
+    ({ x: 0, y: 0, width: 10, height: 10, left: 0, top: 0, right: 10, bottom: 10, toJSON: () => ({}) }) as DOMRect;
+  doc.body.append(button);
+  return button;
+}
+
+/** 点击模式出厂和弦；平台由 setup 钉成 macOS。 */
+function activationChord(): void {
+  dom.window.dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "h", metaKey: true, bubbles: true, cancelable: true }),
+  );
+}
+
+/** 页面上真正画出来的浮层容器，用户能看见的就是它。 */
+function overlayCount(): number {
+  return doc.querySelectorAll("[data-dsh-jump-overlay]").length;
+}
+
+/** 浮层里的标签徽章；一轮激活只该产出一组。 */
+function badgeCount(): number {
+  return doc.querySelectorAll("[data-jump-label]").length;
+}
+
 beforeEach(() => {
   doc.body.replaceChildren();
   doc.head.replaceChildren();
+  // 浮层挂在 documentElement 上而不是 body 里，上面的清理带不走它。
+  doc.querySelectorAll("[data-dsh-jump-overlay]").forEach((el) => el.remove());
 });
 
 describe("clientPlugin", () => {
@@ -141,6 +175,20 @@ describe("clientPlugin", () => {
     first();
   });
 
+  it("retires the earlier runtime when the same plugin applies twice", () => {
+    addTarget();
+    const bare = { get: () => undefined, inject: () => () => undefined };
+    const first = clientPlugin.apply(bare);
+    const second = clientPlugin.apply(bare);
+    activationChord();
+    // 两套运行时各画一份浮层：一次激活只该产出一份容器和一轮徽章。
+    expect(overlayCount()).toBe(1);
+    expect(badgeCount()).toBe(1);
+    second();
+    first();
+    expect(overlayCount()).toBe(0);
+  });
+
   it("removes its listener on dispose, leaving the page as it found it", () => {
     const win = dom.window;
     const bare = { get: () => undefined, inject: () => () => undefined };
@@ -151,6 +199,46 @@ describe("clientPlugin", () => {
     win.dispatchEvent(new win.KeyboardEvent("keydown", { key: "h", metaKey: true, bubbles: true, cancelable: true }));
     expect(teardownSpy).toHaveBeenCalled();
     expect(doc.querySelector("[data-dsh-jump-overlay]")).toBeNull();
+  });
+});
+
+describe("page-level singleton", () => {
+  it("keeps one overlay when the client factory is evaluated twice", async () => {
+    addTarget();
+    // 整张模块图重新求值：第二份 entry 实例的模块级变量是空的，只有挂在
+    // globalThis 上的登记能跨这两份共享。
+    vi.resetModules();
+    const fresh: typeof import("../src/client/entry.ts") = await import("../src/client/entry.ts");
+    expect(fresh.default).not.toBe(clientPlugin);
+
+    const bare = { get: () => undefined, inject: () => () => undefined };
+    const disposeOld = clientPlugin.apply(bare);
+    const disposeNew = fresh.default.apply(bare);
+
+    activationChord();
+    expect(overlayCount()).toBe(1);
+    expect(badgeCount()).toBe(1);
+
+    // 旧实例的卸载已经过时，它不该带走新实例画出来的那一份。
+    disposeOld();
+    expect(overlayCount()).toBe(1);
+    disposeNew();
+    expect(overlayCount()).toBe(0);
+  });
+
+  it("keeps the newer runtime alive when a stale dispose runs again", () => {
+    addTarget();
+    const bare = { get: () => undefined, inject: () => () => undefined };
+    const stale = clientPlugin.apply(bare);
+    stale();
+    const live = clientPlugin.apply(bare);
+    // 宿主可能在换人之后又调一次旧卸载；那一下不能把新登记一起删掉。
+    stale();
+    activationChord();
+    expect(overlayCount()).toBe(1);
+    expect(badgeCount()).toBe(1);
+    live();
+    expect(overlayCount()).toBe(0);
   });
 });
 
