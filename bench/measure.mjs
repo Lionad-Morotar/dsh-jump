@@ -186,9 +186,9 @@ export function frameVerdict(excessPct) {
  *
  * Reading badges before stage A settles used to leave this check comparing 300
  * hints against the 96 badges of the first two frames. The bench now polls
- * `app.labels()` until the round reaches the expected count; this function
- * makes the invariant explicit and lets `--check` prove that a partial read is
- * rejected.
+ * `app.visibleLabels()` until the painted count reaches the expected total;
+ * this function makes the invariant explicit and lets `--check` prove that a
+ * partial read is rejected.
  */
 export function identityCalibrationDrift(identityCalls, identityHints, paintedLabels) {
   if (identityCalls === paintedLabels && identityHints === paintedLabels) return null;
@@ -213,10 +213,11 @@ export const SETTLE_TIMEOUT_MS = 3000;
 /**
  * The settle gate, as a pure decision so `--check` can exercise both limits.
  *
- * Stage A paints nothing until it commits, so `labels()` is empty for the whole
- * walk. Polling the expected total is the only readiness signal the bench has;
- * without this gate a 300-candidate round that has not started painting looks
- * exactly like a fixture whose identity count drifted to zero.
+ * Stage A paints nothing until it commits, and an oversized round keeps
+ * painting after that, so only `visibleLabels()` reaches the expected total.
+ * Polling it is the only readiness signal the bench has; without this gate a
+ * 300-candidate round that has not started painting looks exactly like a
+ * fixture whose identity count drifted to zero.
  */
 export function collectionSettleFailure(expected, actual, frames, elapsedMs) {
   if (actual === expected) return null;
@@ -226,6 +227,31 @@ export function collectionSettleFailure(expected, actual, frames, elapsedMs) {
     String(actual) + " after " + String(frames) + " frames / " +
     String(Math.round(elapsedMs * 1000) / 1000) + "ms"
   );
+}
+
+/**
+ * The readiness gate over both round counts.
+ *
+ * `assigned` is `app.labels()`, which `finish()` fills in one synchronous step.
+ * `painted` is `app.visibleLabels()`, the only count that grows frame by frame
+ * when a round is too large for one paint. Readiness is painted, never
+ * assigned: a 2001-candidate round assigns all labels in the commit frame while
+ * the canvas still shows the first 1000, and reading the assigned count there
+ * would call a half-painted round usable. Both counts stay in the diagnostic
+ * because "assigned 2001, painted 1000" is a different bug from "assigned 0".
+ */
+export function collectionReadiness(expected, assigned, painted, frames, elapsedMs) {
+  if (painted >= expected) return null;
+  const failure = collectionSettleFailure(expected, painted, frames, elapsedMs);
+  if (failure === null) return null;
+  if (assigned >= expected) {
+    return (
+      "collection assigned " + String(assigned) + " labels but painted " +
+      String(painted) + " after " + String(frames) + " frames / " +
+      String(Math.round(elapsedMs * 1000) / 1000) + "ms"
+    );
+  }
+  return failure;
 }
 
 /**
@@ -439,6 +465,7 @@ function pageScript(config) {
   const SETTLE_FRAME_LIMIT = ${SETTLE_FRAME_LIMIT};
   const SETTLE_TIMEOUT_MS = ${SETTLE_TIMEOUT_MS};
   const collectionSettleFailure = ${collectionSettleFailure.toString()};
+  const collectionReadiness = ${collectionReadiness.toString()};
   const summarizeTimeToUsable = ${summarizeTimeToUsable.toString()};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
@@ -545,17 +572,24 @@ function pageScript(config) {
   }
 
   /**
-   * Labels of the current round.
+   * Painted labels of the current round.
    *
    * The canvas overlay owns them; there is no DOM node per badge anymore, so
    * reading [data-jump-label] would always count zero and turn every
-   * calibration into a false drift report.
+   * calibration into a false drift report. app.visibleLabels() is also the
+   * readiness signal: it is the only count that grows while an oversized round
+   * is still painting.
    */
   function roundLabels() {
-    return app.labels();
+    return app.visibleLabels();
   }
 
   function labelCount() {
+    return app.visibleLabels().length;
+  }
+
+  /** Assigned labels: full as soon as finish() commits, painted or not. */
+  function assignedCount() {
     return app.labels().length;
   }
 
@@ -618,14 +652,14 @@ function pageScript(config) {
     let frames = 0;
     return new Promise((resolve, reject) => {
       function check() {
-        const actual = labelCount();
+        const painted = labelCount();
         const elapsed = performance.now() - sinceMs;
-        const failure = collectionSettleFailure(expected, actual, frames, elapsed);
+        const failure = collectionReadiness(expected, assignedCount(), painted, frames, elapsed);
         if (failure !== null) {
           reject(new Error(failure));
           return;
         }
-        if (actual === expected) {
+        if (painted >= expected) {
           resolve({ ms: elapsed, frames: frames });
           return;
         }
@@ -796,10 +830,11 @@ function pageScript(config) {
     const activateRound = async () => {
       rounds += 1;
       const activation = beginActivation(identity.labels);
-      // Stage A is interruptible, so the label count, not a frame count, is
-      // the readiness signal. A round that never reaches the expected count
-      // rejects with "collection did not settle" instead of yielding a
-      // half-round that the calibration would then blame on the fixture.
+      // Stage A is interruptible and an oversized round paints across frames,
+      // so the painted label count, not a frame count, is the readiness
+      // signal. A round that never reaches the expected count rejects with
+      // "collection did not settle" instead of yielding a half-round that the
+      // calibration would then blame on the fixture.
       const usable = await activation.usable;
       return {
         handlerMs: activation.handlerMs,
@@ -1434,6 +1469,7 @@ const REQUIRED_HOOKS = [
   "dispatchEvent",
   "data-dsh-jump-overlay",
   "app.labels()",
+  "app.visibleLabels()",
   "timeToUsable",
   "collection did not settle",
   "handlerMs",
@@ -1667,6 +1703,28 @@ function assertSettleContract() {
 }
 
 /**
+ * Readiness contract.
+ *
+ * `finish()` fills `app.labels()` in one synchronous step, so its count says
+ * the round exists, not that a reader can see it. Only `visibleLabels()` grows
+ * with painted frames on the oversized path. The gate must therefore read the
+ * painted count: a round whose assignment is complete but whose paint is not
+ * keeps waiting, then fails, and never resolves as usable.
+ */
+function assertReadinessContract() {
+  if (collectionReadiness(2001, 2001, 1000, 0, 0) !== null) {
+    throw new Error("an assigned-but-unpainted round must keep waiting, not resolve");
+  }
+  const late = collectionReadiness(2001, 2001, 1000, SETTLE_FRAME_LIMIT, 10);
+  if (late === null || !late.includes("2001") || !late.includes("1000")) {
+    throw new Error("an assigned-but-unpainted round must fail after the settle limits");
+  }
+  if (collectionReadiness(2001, 2000, 2001, SETTLE_FRAME_LIMIT, SETTLE_TIMEOUT_MS) !== null) {
+    throw new Error("a fully painted round must pass even after both limits");
+  }
+}
+
+/**
  * Freshness contract.
  *
  * A fresh tier is a result produced by this navigation in this document. The
@@ -1862,6 +1920,9 @@ export async function check() {
 
   assertSettleContract();
   console.log("check settle guard: ok (frame and wall-clock limits, a settled round passes)");
+
+  assertReadinessContract();
+  console.log("check readiness: ok (assigned full but painted short is not ready)");
 
   assertFreshnessContract();
   console.log("check freshness: ok (pre-existing result, reload, timestamp, foreign realm rejected)");

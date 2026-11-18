@@ -323,13 +323,15 @@ foreground tab and read the page's own JSON.
 
 For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
-discards their readings. Every activation waits until `app.labels()` holds the
-expected number of labels before the page reads them or sends the first label
-stroke: stage A paints nothing until it commits, so a fixed frame count would
-measure a prefix of the round. The wait is bounded at 200 animation frames or
-3 seconds and fails the tier with `collection did not settle` instead of
-silently comparing a half-round. Warmup is still required: without it the first
-tier pays JIT compilation, first layout and GC warmup and reports a cold start
+discards their readings. Every activation waits until `app.visibleLabels()`
+holds the expected number of painted labels before the page reads them or sends
+the first label stroke: `app.labels()` is complete the moment stage A commits,
+so it would call a round usable while the canvas is still painting it, and a
+fixed frame count would measure a prefix of the round. The wait is bounded at
+200 animation frames or 3 seconds and fails the tier with `collection did not
+settle` instead of silently comparing a half-round. Warmup is still required:
+without it the first tier pays JIT compilation, first layout and GC warmup and
+reports a cold start
 as a tier cost, so `--warmup <n>` only tunes the count. Then it times `runs`
 complete activations, `runs` first label strokes, `runs` second label strokes,
 `runs` complete labels (each on a fresh activation) and one Esc exit on a fully
@@ -338,10 +340,10 @@ on a three-key label it must stay untouched while the live prefix splits
 further (on a two-key tier it is the completing stroke). The close reading
 reports the label count it tore down as `nodes`.
 
-A tier reports `candidates`, `labels` (the round's labels, read through
-`app.labels()`; the canvas overlay keeps them, there is no per-badge DOM node
-to query), `warmup` (cycles discarded before sampling), `overlayCount`, which
-must stay `1`, and the identity pair below; a second runtime would show up as a
+A tier reports `candidates`, `labels` (the round's painted labels, read
+through `app.visibleLabels()`; the canvas overlay keeps them, there is no
+per-badge DOM node to query), `warmup` (cycles discarded before sampling),
+`overlayCount`, which must stay `1`, and the identity pair below; a second runtime would show up as a
 second overlay and its cost would contaminate the reading. The verdict fields
 are:
 
