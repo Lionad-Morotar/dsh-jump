@@ -83,9 +83,10 @@ export interface AppDeps {
   /**
    * Time one badge batch may spend before yielding to the next frame.
    *
-   * A host with a measured display cadence injects it here; the default is a
-   * 60Hz frame. Seven milliseconds is not hard-coded because it is one machine's
-   * panel, not a property of the plugin.
+   * An explicit override for hosts that already measured their display; the
+   * overlay otherwise samples the page's own frame cadence once. Seven
+   * milliseconds is not hard-coded because it is one machine's panel, not a
+   * property of the plugin.
    */
   frameBudgetMs?: number;
 }

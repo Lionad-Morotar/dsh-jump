@@ -32,7 +32,7 @@ export interface OverlayViewport {
  *
  * Browsers supply requestAnimationFrame; tests supply a stepper so a batch is
  * only inserted when the test says a frame happened. `now` is on the clock so a
- * batch can measure the gap from its own insertion to the next frame.
+ * batch can measure how long the frame it started in really took.
  */
 export interface FrameClock {
   now(): number;
@@ -76,18 +76,37 @@ export interface OverlayDeps {
   doc?: Document;
   viewport?: () => OverlayViewport;
   clock?: FrameClock;
+  /** Explicit display budget; when set the sampler never runs. */
+  frameBudgetMs?: number;
+  /**
+   * Sampler seam. Browsers sample requestAnimationFrame; tests wrap this to
+   * count runs, and an embedding page may replace it outright.
+   */
+  frameBudgetSampler?: (deps: FrameBudgetSamplerDeps) => Promise<FrameBudgetSample>;
 }
 
 /** Badge box estimate for clamping; hint rects are target-sized, not badge-sized. */
 const BADGE_W = 24;
 const BADGE_H = 16;
 
-/** A 60Hz frame, used until the host injects the display's measured cadence. */
+/**
+ * The 60Hz frame budget. Batches are stated at this cadence and scaled by the
+ * ratio of the measured budget to it; it is also the fallback when the display
+ * cannot be measured (hidden page, no requestAnimationFrame, too few samples).
+ */
 const DEFAULT_FRAME_BUDGET_MS = 16.7;
-/** Conservative first batch: small enough to leave room for style and layout. */
-const DEFAULT_INITIAL_BATCH = 32;
-const MIN_BATCH = 8;
-const MAX_BATCH = 256;
+/** Median of this many frame intervals: about two seconds at 60Hz. */
+const FRAME_BUDGET_SAMPLES = 120;
+/** Fewer usable intervals cannot outvote a janky start, so keep the fallback. */
+const MIN_FRAME_BUDGET_SAMPLES = 8;
+/** Batch sizes at the 60Hz budget; every display scales them by budget / 16.7. */
+const BASE_INITIAL_BATCH = 32;
+const BASE_MIN_BATCH = 8;
+const BASE_MAX_BATCH = 256;
+/** Absolute floor: a 240Hz panel must not decay to one badge per frame. */
+const MIN_BATCH_FLOOR = 4;
+/** Absolute ceiling: a very slow budget must not insert the whole round at once. */
+const MAX_BATCH_CEILING = 256;
 /** Below this share of the budget the next batch may grow. */
 const GROW_UNDER_BUDGET = 0.5;
 const GROWTH_FACTOR = 1.5;
@@ -158,12 +177,21 @@ function clampBatch(value: number, min: number, max: number): number {
 }
 
 /**
- * A measured display cadence injected by the embedding page.
+ * One batch scaled from its 60Hz baseline: base × (budget / 16.7).
  *
- * An embedding page that measures the display cadence can publish it here;
- * reading it per activation lets one page measure tiers at different cadences.
- * Ordinary pages leave it unset and get the 60Hz default, so seven milliseconds
- * is never a property of the plugin itself.
+ * The floor stays absolute rather than proportional, so a fast display still
+ * inserts a few badges per frame instead of one; the ceiling caps how much a
+ * very slow budget can put into a single frame.
+ */
+function scaleBatch(base: number, budgetMs: number, floor: number, ceiling: number): number {
+  return clampBatch(base * (budgetMs / DEFAULT_FRAME_BUDGET_MS), floor, ceiling);
+}
+
+/**
+ * A display cadence published by the embedding page, overriding the sampler.
+ *
+ * Bench pages measure each tier themselves and publish the result here; a
+ * normal page leaves it unset and the overlay samples its own display once.
  */
 function environmentFrameBudget(): number | undefined {
   const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: unknown };
@@ -171,15 +199,130 @@ function environmentFrameBudget(): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+export interface FrameBudgetSample {
+  /** Budget to use for the coming activation. */
+  budgetMs: number;
+  /**
+   * Whether the value came from enough visible frame intervals.
+   *
+   * A fallback is not a measurement: the overlay retries on a later activation
+   * once the page is visible again.
+   */
+  measured: boolean;
+}
+
+export interface FrameBudgetSamplerDeps {
+  doc?: Document;
+  clock?: FrameClock;
+  /** Intervals to sample; tests shorten the wait. */
+  samples?: number;
+}
+
+function medianOf(values: readonly number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[middle];
+  return ((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2;
+}
+
+/**
+ * Median frame interval of the display, rounded up to 0.1ms.
+ *
+ * The median ignores one-off hitches; rounding up keeps a 6.999ms cadence from
+ * being filed just under 7ms and marking every frame as over budget. Never
+ * rejects: a hidden page (background tabs are throttled to seconds), a host
+ * without requestAnimationFrame, or a sample interrupted by either resolves to
+ * the 60Hz fallback with `measured: false`.
+ */
+export function sampleFrameBudget(deps: FrameBudgetSamplerDeps = {}): Promise<FrameBudgetSample> {
+  const doc = deps.doc ?? globalThis.document;
+  const clock = deps.clock ?? defaultClock(doc);
+  const wanted = Math.max(
+    MIN_FRAME_BUDGET_SAMPLES,
+    Math.round(deps.samples ?? FRAME_BUDGET_SAMPLES),
+  );
+  const fallback = (): FrameBudgetSample => ({
+    budgetMs: DEFAULT_FRAME_BUDGET_MS,
+    measured: false,
+  });
+  if (clock === undefined || doc.hidden) return Promise.resolve(fallback());
+  return new Promise((resolve) => {
+    const intervals: number[] = [];
+    // A host whose timestamps never produce a usable gap must still degrade to
+    // the fallback instead of keeping a frame callback alive forever.
+    const maxTicks = wanted * 4;
+    let ticks = 0;
+    let previous: number | undefined;
+    const tick = (time: number): void => {
+      ticks += 1;
+      // A tab that went to the background mid-sample reports throttled gaps;
+      // stop instead of caching a budget the display never had.
+      if (doc.hidden) {
+        resolve(fallback());
+        return;
+      }
+      if (previous !== undefined) {
+        const gap = time - previous;
+        if (Number.isFinite(gap) && gap > 0) intervals.push(gap);
+      }
+      previous = time;
+      if (intervals.length >= wanted) {
+        const median = medianOf(intervals);
+        resolve(
+          median === undefined
+            ? fallback()
+            : { budgetMs: Math.ceil(median * 10 - 1e-9) / 10, measured: true },
+        );
+        return;
+      }
+      if (ticks >= maxTicks) {
+        resolve(fallback());
+        return;
+      }
+      try {
+        clock.request(tick);
+      } catch {
+        resolve(fallback());
+      }
+    };
+    try {
+      clock.request(tick);
+    } catch {
+      resolve(fallback());
+    }
+  });
+}
+
+function isUsableBudget(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function sameViewport(a: OverlayViewport, b: OverlayViewport): boolean {
+  return a.width === b.width && a.height === b.height;
+}
+
 export function createOverlay(deps: OverlayDeps = {}): Overlay {
   const doc = deps.doc ?? globalThis.document;
   const viewport =
     deps.viewport ?? (() => ({ width: globalThis.innerWidth, height: globalThis.innerHeight }));
   const clock = deps.clock ?? defaultClock(doc);
+  const fixedBudgetMs = deps.frameBudgetMs;
+  const sampler = deps.frameBudgetSampler ?? sampleFrameBudget;
   let container: HTMLElement | undefined;
   /** Badges of the current round; labels are unique within a round. */
   let badges = new Map<string, Badge>();
   let progressive: ProgressiveRound | undefined;
+  /** Last successful display sample, kept until the viewport changes. */
+  let measuredBudgetMs: number | undefined;
+  let measuredViewport: OverlayViewport | undefined;
+  let sampling = false;
+  let samplingViewport: OverlayViewport | undefined;
+  // One sample per overlay, started here rather than at the first activation:
+  // a 120-frame sample cannot finish inside the activation it would otherwise
+  // be measuring, so that whole first round would run on the fallback. The
+  // probe is a single callback per frame and never repeats.
+  if (!isUsableBudget(fixedBudgetMs)) startBudgetSampling();
 
   function ensureContainer(): HTMLElement {
     if (container !== undefined) return container;
@@ -313,6 +456,59 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     return hints.every((hint) => badges.get(hint.label)?.target === hint.element);
   }
 
+  /**
+   * Start the one display sample this overlay gets, if frames exist and the
+   * page is in front. A hidden page would only report throttled gaps.
+   */
+  function startBudgetSampling(): void {
+    if (sampling || clock === undefined || doc.hidden) return;
+    sampling = true;
+    samplingViewport = viewport();
+    void sampler({ doc, clock })
+      .then((sample) => {
+        sampling = false;
+        if (!sample.measured) return;
+        measuredBudgetMs = sample.budgetMs;
+        measuredViewport = samplingViewport;
+      })
+      .catch(() => {
+        sampling = false;
+      });
+  }
+
+  /**
+   * The frame budget for an activation starting now.
+   *
+   * Precedence: the caller's explicit value, the overlay's fixed value, the
+   * embedding page's published measurement, the cached display sample, then
+   * 60Hz. The sample runs once per overlay; later activations reuse the cached
+   * value.
+   *
+   * Cache invalidation: a successful sample survives visibility changes because
+   * the panel did not change, only whether its page is frontmost; re-measuring
+   * on every tab switch would collect the same cadence again. A viewport resize
+   * does invalidate, because switching display modes or external monitors can
+   * change the refresh rate under the same window. The old value still serves
+   * the round that starts now; the fresh sample lands for the next one.
+   */
+  function budgetForActivation(override: number | undefined): number {
+    if (isUsableBudget(override)) return override;
+    if (isUsableBudget(fixedBudgetMs)) return fixedBudgetMs;
+    const published = environmentFrameBudget();
+    if (published !== undefined) return published;
+    if (doc.hidden) return DEFAULT_FRAME_BUDGET_MS;
+    const current = viewport();
+    if (measuredBudgetMs !== undefined) {
+      if (measuredViewport === undefined || sameViewport(measuredViewport, current)) {
+        return measuredBudgetMs;
+      }
+      startBudgetSampling();
+      return measuredBudgetMs;
+    }
+    startBudgetSampling();
+    return DEFAULT_FRAME_BUDGET_MS;
+  }
+
   function removeContainer(): void {
     const el = container as (HTMLElement & { hidePopover?: () => void }) | undefined;
     if (el !== undefined && typeof el.hidePopover === "function") {
@@ -361,6 +557,10 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   /** Append the next slice of the round in one DOM write. */
   function insertBatch(round: ProgressiveRound, count: number): void {
     const root = ensureContainer();
+    // Read the clock before the DOM write: next frame timestamp minus this
+    // start is the frame the batch occupied. Reading it after the write would
+    // leave only the idle tail, which shrinks exactly when the work grows.
+    round.lastInsertAt = round.clock?.now() ?? 0;
     const end = Math.min(round.nextIndex + count, round.hints.length);
     const nodes: HTMLElement[] = [];
     for (let index = round.nextIndex; index < end; index += 1) {
@@ -371,7 +571,6 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       nodes.push(badge.element);
     }
     round.nextIndex = end;
-    round.lastInsertAt = round.clock?.now() ?? 0;
     if (nodes.length > 0) root.append(...nodes);
     round.done = round.nextIndex >= round.hints.length;
   }
@@ -382,9 +581,9 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     round.handle = frameClock.request((time) => {
       round.handle = undefined;
       if (progressive !== round) return;
-      // The frame timestamp can predate the end of the previous insertion when
-      // that batch overran its frame. Reading that as a negative gap would grow
-      // the next batch exactly when the page is behind; treat it as a miss.
+      // A frame timestamp that predates the batch start means the clock ran
+      // backwards; reading that as a negative gap would grow the next batch
+      // exactly when the page is behind, so treat it as a miss.
       const elapsed = time >= round.lastInsertAt ? time - round.lastInsertAt : Number.POSITIVE_INFINITY;
       round.batchSize = nextBatchSize(round, elapsed);
       insertBatch(round, round.batchSize);
@@ -401,17 +600,36 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     const root = ensureContainer();
     root.replaceChildren();
     badges = new Map();
-    const minBatch = Math.max(1, Math.round(options.minBatch ?? MIN_BATCH));
-    const maxBatch = Math.max(minBatch, Math.round(options.maxBatch ?? MAX_BATCH));
-    const initial = clampBatch(options.initialBatch ?? DEFAULT_INITIAL_BATCH, minBatch, maxBatch);
+    const budgetMs = budgetForActivation(options.frameBudgetMs);
+    // One batch is sized from its 60Hz baseline by budget / 16.7. Explicit
+    // options stay literal; the floor and ceiling are absolute so neither a
+    // 240Hz panel nor a very slow one degenerates the batching.
+    const minBatch =
+      options.minBatch !== undefined
+        ? Math.max(1, Math.round(options.minBatch))
+        : scaleBatch(BASE_MIN_BATCH, budgetMs, MIN_BATCH_FLOOR, BASE_MAX_BATCH);
+    const maxBatch =
+      options.maxBatch !== undefined
+        ? Math.max(minBatch, Math.round(options.maxBatch))
+        : Math.max(
+            minBatch,
+            scaleBatch(BASE_MAX_BATCH, budgetMs, MIN_BATCH_FLOOR, MAX_BATCH_CEILING),
+          );
+    // An explicit first batch is taken literally: the caller is describing a
+    // fixed shape, not asking for the display-scaled default.
+    const initial =
+      options.initialBatch !== undefined
+        ? clampBatch(options.initialBatch, 1, maxBatch)
+        : clampBatch(
+            scaleBatch(BASE_INITIAL_BATCH, budgetMs, MIN_BATCH_FLOOR, BASE_MAX_BATCH),
+            minBatch,
+            maxBatch,
+          );
     const round: ProgressiveRound = {
       hints,
       bounds: viewport(),
       clock,
-      budgetMs:
-        options.frameBudgetMs !== undefined && options.frameBudgetMs > 0
-          ? options.frameBudgetMs
-          : (environmentFrameBudget() ?? DEFAULT_FRAME_BUDGET_MS),
+      budgetMs,
       minBatch,
       maxBatch,
       pending,

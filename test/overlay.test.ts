@@ -12,7 +12,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { generateLabels, type Hint } from "../src/client/hints.ts";
-import { createOverlay, type FrameClock } from "../src/client/overlay.ts";
+import { createOverlay, sampleFrameBudget, type FrameClock } from "../src/client/overlay.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -291,17 +291,20 @@ describe("top layer", () => {
 });
 
 /** 手动推进的帧时钟：jsdom 没有真实帧，分批只在该步进时发生。 */
-function frameClock(start = 0): FrameClock & { step(ms: number): void } {
+function frameClock(start = 0): FrameClock & { step(ms: number): void; requests(): number } {
   let time = start;
   let nextHandle = 1;
+  let requests = 0;
   const queued = new Map<number, (time: number) => void>();
   return {
     now: () => time,
     request: (callback) => {
+      requests += 1;
       const handle = nextHandle++;
       queued.set(handle, callback);
       return handle;
     },
+    requests: () => requests,
     cancel: (handle) => {
       queued.delete(handle);
     },
@@ -440,5 +443,122 @@ describe("progressive badge insertion", () => {
       expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1] as number);
     }
     overlay.destroy();
+  });
+});
+
+/** jsdom 默认按 prerender 报 hidden，测量用例先把它掰成真实前台页面。 */
+function setDocumentHidden(value: boolean): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(document, "hidden");
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
+  return () => {
+    if (descriptor === undefined) {
+      delete (document as unknown as Record<string, unknown>)["hidden"];
+    } else {
+      Object.defineProperty(document, "hidden", descriptor);
+    }
+  };
+}
+
+describe("frame budget measurement", () => {
+  it("measures the display cadence as the median frame interval", async () => {
+    const restore = setDocumentHidden(false);
+    const clock = frameClock();
+    try {
+      const sample = sampleFrameBudget({ doc: document, clock });
+      for (let frame = 0; frame < 121; frame += 1) clock.step(7);
+      await expect(sample).resolves.toEqual({ budgetMs: 7, measured: true });
+    } finally {
+      restore();
+    }
+  });
+
+  it("samples the display once and reuses the budget across later activations", async () => {
+    const restore = setDocumentHidden(false);
+    const clock = frameClock();
+    let runs = 0;
+    const overlay = createOverlay({
+      doc: document,
+      viewport: () => VIEWPORT,
+      clock,
+      frameBudgetSampler: (deps) => {
+        runs += 1;
+        return sampleFrameBudget(deps);
+      },
+    });
+    try {
+      const hints = progressiveHints(300);
+      overlay.renderProgressive(hints);
+      for (let frame = 0; frame < 121; frame += 1) clock.step(7);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      overlay.renderProgressive(hints);
+      overlay.renderProgressive(hints);
+
+      expect(runs).toBe(1);
+      // 缓存命中后按 7ms 缩放首批，与 16.7ms 的 32 枚不同。
+      expect(badges()).toHaveLength(13);
+    } finally {
+      overlay.destroy();
+      restore();
+    }
+  });
+
+  it("falls back to the 60Hz budget on a hidden page instead of measuring throttled frames", async () => {
+    const restore = setDocumentHidden(true);
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    try {
+      await expect(sampleFrameBudget({ doc: document, clock })).resolves.toEqual({
+        budgetMs: 16.7,
+        measured: false,
+      });
+      expect(clock.requests()).toBe(0);
+
+      overlay.renderProgressive(progressiveHints(300));
+      expect(badges()).toHaveLength(32);
+    } finally {
+      overlay.destroy();
+      restore();
+    }
+  });
+
+  it("scales the activation batch with the frame budget", () => {
+    const sixty = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: frameClock() });
+    sixty.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 16.7 });
+    const atSixty = badges().length;
+    sixty.destroy();
+
+    const fast = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: frameClock() });
+    fast.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 7 });
+    const atFast = badges().length;
+    fast.destroy();
+
+    expect(atSixty).toBe(32);
+    expect(atFast).toBeLessThan(atSixty);
+  });
+
+  it("keeps scaled batches inside an absolute floor and ceiling", () => {
+    const tinyClock = frameClock();
+    const tiny = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: tinyClock });
+    tiny.renderProgressive(progressiveHints(2000), "", { frameBudgetMs: 1 });
+    const tinyDeltas = [badges().length];
+    for (let frame = 0; frame < 3; frame += 1) {
+      const before = badges().length;
+      tinyClock.step(0.1);
+      tinyDeltas.push(badges().length - before);
+    }
+    tiny.destroy();
+    expect(Math.min(...tinyDeltas)).toBe(4);
+    expect(Math.max(...tinyDeltas)).toBeLessThanOrEqual(15);
+
+    const hugeClock = frameClock();
+    const huge = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: hugeClock });
+    huge.renderProgressive(progressiveHints(2000), "", { frameBudgetMs: 100 });
+    const firstHuge = badges().length;
+    hugeClock.step(0.1);
+    const secondHuge = badges().length - firstHuge;
+    huge.destroy();
+    expect(firstHuge).toBe(192);
+    expect(secondHuge).toBe(256);
   });
 });
