@@ -271,7 +271,9 @@ critical path of a stroke:
   the DOM round. There is no per-badge node, no containing-block bookkeeping
   and no style invalidation for the host page.
 
-The quantity that answers "when can I start typing" is `timeToUsable`: the
+The quantity that answers "when can I start typing" is the activation
+keydown's Event Timing `duration`, which the bench reads from input to next
+paint; the gate allows two frames. `timeToUsable` remains a diagnostic: the
 wall clock from the activation dispatch returning to every label of the round
 being painted, plus the animation frames observed in that wait. A background
 tab throttles animation frames and inflates the wall clock, so the frame count
@@ -285,10 +287,11 @@ has moved since.
 
 ## Frame budget bench
 
-`bench/measure.mjs` turns the cost of one activation and of every label stroke
-into a repeatable accept/reject reading. It bundles `src/client/app.ts` with the
-repo's own esbuild into one browser IIFE, writes a self-contained measurement
-page, and prints its path:
+`bench/measure.mjs` produces two acceptance readings in one run: the plugin's
+own cost inside long frames, and the latency of a real activation keydown. It
+bundles `src/client/app.ts` with the repo's own esbuild into one browser IIFE,
+writes the measurement page and its external bundle side by side, and prints
+both paths:
 
 ```sh
 node bench/measure.mjs                              # or: pnpm bench
@@ -301,6 +304,10 @@ node bench/measure.mjs --no-browser                 # generate the page only
 node bench/measure.mjs --check                      # CI-safe self-check, no browser
 ```
 
+The bundle is a separate `<script src>` next to the page, never inlined. Long
+Animation Frame attribution only reports a `sourceURL` for an external script;
+an inline bundle would make every plugin cost invisible to the gate.
+
 When a local Chrome is found, the script drives it over the DevTools protocol
 and gives every candidate tier a brand-new browser context: a new target, new
 storage and a new JS realm, navigated to the page with a random query string.
@@ -309,17 +316,23 @@ by a navigation (`performance.getEntriesByType("navigation")[0].type ===
 "navigate"`), that its `timeOrigin` matches the tier it just ran, and that the
 result carries the same random run token. This is what makes two runs of the
 same source comparable: one tier can never read the previous tier's
-`window.__BENCH_RESULT__`. When Chrome is missing, or `--no-browser` is passed,
-the script only generates and prints the page, then exits 0 and asks for a real
-browser. Serve that page over HTTP and open it in a foreground tab; the page
-clears `window.__BENCH_RESULT__` on load, so a second run in the same tab cannot
-read the first one's JSON.
+`window.__BENCH_RESULT__`. The driver also answers the page's trusted-input
+requests with real CDP key events, because Event Timing ignores synthetic
+events. When Chrome is missing, or `--no-browser` is passed, the script only
+generates and prints the page, then exits 0 and asks for a real browser. Serve
+that page over HTTP and open it in a foreground tab; the page clears
+`window.__BENCH_RESULT__` on load, so a second run in the same tab cannot read
+the first one's JSON.
 
-Headless Chrome reports its own compositor cadence, typically 60Hz, not the
-physical display's. That is still the right environment for a reproducible
-accept/reject run and for catching a hitch, but when the question is whether
-the page meets a 143Hz panel's budget, open the same generated page in a real
-foreground tab and read the page's own JSON.
+Headless Chrome with `--disable-gpu` is a regression smoke test, never
+acceptance evidence. It reports its own compositor cadence, and it draws the
+canvas through software raster, which is exactly the part whose cost differs
+from a GPU-composited page. Each tier therefore stamps `judgeable`: false when
+the user agent contains `Headless`, when no display budget was measured, or
+when no long frame actually ran the plugin bundle. A non-judgeable tier reports
+`verdictAttributed: "smoke-only"` instead of `pass` or `fail`. Open the same
+generated page in a real foreground tab, and drive it through the built-in
+Chrome path or a real browser session, when the question is acceptance.
 
 For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
@@ -331,80 +344,108 @@ fixed frame count would measure a prefix of the round. The wait is bounded at
 200 animation frames or 3 seconds and fails the tier with `collection did not
 settle` instead of silently comparing a half-round. Warmup is still required:
 without it the first tier pays JIT compilation, first layout and GC warmup and
-reports a cold start
-as a tier cost, so `--warmup <n>` only tunes the count. Then it times `runs`
-complete activations, `runs` first label strokes, `runs` second label strokes,
-`runs` complete labels (each on a fresh activation) and one Esc exit on a fully
-inserted round. The second stroke is the phase where the dimmed batch matters:
-on a three-key label it must stay untouched while the live prefix splits
-further (on a two-key tier it is the completing stroke). The close reading
-reports the label count it tore down as `nodes`.
+reports a cold start as a tier cost, so `--warmup <n>` only tunes the count.
+Then it times `runs` complete activations, `runs` first label strokes, `runs`
+second label strokes, `runs` complete labels (each on a fresh activation) and
+one Esc exit on a fully inserted round. The second stroke is the phase where
+the dimmed batch matters: on a three-key label it must stay untouched while the
+live prefix splits further (on a two-key tier it is the completing stroke). The
+close reading reports the label count it tore down as `nodes`.
 
-A tier reports `candidates`, `labels` (the round's painted labels, read
-through `app.visibleLabels()`; the canvas overlay keeps them, there is no
-per-badge DOM node to query), `warmup` (cycles discarded before sampling),
-`overlayCount`, which must stay `1`, and the identity pair below; a second runtime would show up as a
-second overlay and its cost would contaminate the reading. The verdict fields
-are:
+### The two acceptance criteria
+
+A tier's `verdictAttributed` is `pass` only when both halves hold:
+
+- Attribution: `attributedPluginMs.p99 <= frameBudgetMs * 0.5`. A
+  `PerformanceObserver` collects `long-animation-frame` entries with their
+  `scripts`. Only entries whose `sourceURL` path is the generated bundle file
+  are summed, per frame, into `attributedPluginMs`; frames with no plugin
+  script are counted as `excludedLongFrames` and left out of the percentiles.
+  They are the system preempting the frame, not plugin work.
+  `attributedForcedLayoutMs` repeats the sum with
+  `forcedStyleAndLayoutDuration`. `p50` and `min` estimate the plugin's
+  intrinsic cost because preemption inflates wall clock; `p99` is the upper
+  bound the gate uses and `max` prints the worst attributed frame.
+- Interaction latency: `activationEventDurationMs.p95 <= frameBudgetMs * 2`.
+  A `PerformanceObserver` listens to `event` with `durationThreshold: 0`,
+  keeps `keydown` entries, and reads `PerformanceEventTiming.duration`, which
+  is input to next paint. Two frames, not one: an activation legitimately
+  spans the frame it lands in and the next presentation. This replaces
+  `nextFrameMs` as the interaction gate because the double-rAF construction
+  always crosses two frames and cannot be compared with a one-frame budget.
+
+Event Timing reports trusted events only, so the page publishes a request and
+the driver answers it with real key input. Chrome also floors observed event
+duration at 16ms, so `activationEventSamples` is printed beside the
+percentiles: an empty sample set does not prove a fast activation, and the gate
+refuses to pass without a sample.
+
+The old differential verdict is kept for trend reading but no longer decides
+acceptance. It compares the active over-budget rate with a blank control window
+on the same tier. That comparison cannot answer whether the plugin ran in the
+hitched frame: a blank page on this machine already misses 45-50% of 7ms frames
+under `fileproviderd` load, so the difference between two unstable rates is
+mostly noise, and the gate fails with zero plugin work. `verdictLegacyNote`
+states this in every tier and in the protocol block.
+
+The tier fields are:
 
 - `frameBudgetMs`: the display budget the page measured for this tier. It runs
   240 animation frames under a continuous animation and takes the median gap,
   rounded up to 0.1ms, so a 143Hz panel reports about 7.0 rather than a
   nominal 60/120/144 constant.
-- `maxFrameMs`: the largest single frame gap during the measured window, not a
-  percentile. A single hitch survives this number even when 95% of frames are
-  fast.
-- `overBudgetFrames`: how many sampled gaps were strictly greater than
-  `frameBudgetMs`, with `frameCount` and `overBudgetPct` beside it.
-- `idleFrameBudgetMs`: the cadence of a blank control window on the same tier,
-  sampled before any activation. It exposes a machine whose idle cadence itself
-  drifted between the budget sample and the measured window.
-- `idleOverBudgetFrames`: how many blank-control gaps exceeded the tier's
-  `frameBudgetMs`, with `idleFrameCount` and `idleOverBudgetPct`. Both windows
-  are counted against the same budget so the two rates answer one question.
-- `excessOverBudgetPct`: active over-budget rate minus the idle control rate, in
-  percentage points. Negative means the active window was calmer than the
-  control.
-- `verdict`: `pass` only when `excessOverBudgetPct` is at most 5 percentage
-  points (`noiseBandPct`). With `--verify-fresh`, a result that cannot prove it
-  came from this navigation is `stale` instead.
+- `attributedPluginMs`: `p50`, `p99`, `max` and `min` of the plugin bundle's
+  summed `duration` in every long frame that ran it. Nulls when no long frame
+  ran the plugin.
+- `attributedForcedLayoutMs`: the same shape, summing
+  `forcedStyleAndLayoutDuration` instead.
+- `excludedLongFrames`: how many long frames carried no plugin script and were
+  therefore excluded from attribution. `loafFrames` is the total long-frame
+  count and `attributedFrames` the ones that entered the percentiles.
+- `activationEventDurationMs`: `p50`, `p95` and `max` of the activation
+  keydown's Event Timing `duration`, with `activationEventSamples` beside it
+  and `eventTimingSupported` recording whether the entry type exists.
+- `trustedActivations`: how many of the tier's activations were driven by real
+  key input rather than `dispatchEvent`. It is the evidence behind an
+  interaction sample.
+- `verdictAttributed`: `pass`, `fail`, `smoke-only` or `stale`. Only a
+  judgeable tier can pass or fail; `--verify-fresh` marks an unprovable result
+  `stale` exactly like the legacy verdict.
+- `judgeable`: true only for a non-headless browser with a measured display
+  budget and at least one attributed long frame.
+- `verdict`: the legacy differential verdict, kept for trend reading.
+  `verdictLegacyNote` explains why it is not acceptance.
+- `maxFrameMs`, `overBudgetFrames`, `overBudgetPct`, `idleFrameBudgetMs`,
+  `idleOverBudgetFrames`, `idleOverBudgetPct`, `excessOverBudgetPct` and
+  `noiseBandPct`: the raw differential inputs, unchanged so the old trend line
+  can still be recomputed by hand.
 - `timeToUsable`: how long a reader waits before the first label stroke can
   land. `ms` carries p50/p95/max of the wall clock from the activation
-  `dispatchEvent` returning to every label of the round being painted;
-  `frames` carries p50/max of the animation frames observed in the same wait.
-  A background tab throttles animation frames and inflates the milliseconds,
-  so `frames` is the steadier relative quantity across runs. Add the phase's
-  `activate.handlerMs` for the full keypress-to-typing span.
+  dispatch returning to every label of the round being painted; `frames`
+  carries p50/max of the animation frames observed in the same wait. This is a
+  historical diagnostic, not the interaction gate: it starts after dispatch
+  and waits for paint, while Event Timing starts at the input timestamp and
+  ends at the next paint.
 
-The idle control is what makes the gate falsifiable. The budget is a median, so
-roughly half of any window's frames sit above it even on a blank page, and a
-loaded machine reaches 45-50% without the plugin doing anything. An absolute
-`overBudgetFrames === 0` rule therefore measured the machine and failed forever.
-The bench now prints both windows and compares their rates; the raw counts stay
-in the result so the difference can be recomputed by hand. `maxFrameMs`,
-`overBudgetFrames`, `overBudgetPct` and the idle numbers are kept unchanged for
-that audit.
-
-The p50/p95 fields are retained, unchanged: each phase still carries
-`handlerMs` (synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from
-dispatch return to the second animation frame), and the phase-level `p50`/`p95`
-mirror `handlerMs`. They are useful for tracking a change, but they no longer
-decide the gate; the gate is the excess over the idle control, while
-`maxFrameMs`, `overBudgetFrames` and the idle counts remain the absolute audit
-numbers. `timeToUsable` is the separate read that answers when typing can
-start, because a phase's two-frame window can end while stage A is still
-walking. Percentiles use the nearest rank, not interpolation, so any reading
+The phase readings are retained unchanged: each phase carries `handlerMs`
+(synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from dispatch
+return to the second animation frame), and the phase-level `p50`/`p95` mirror
+`handlerMs`. They are useful for tracking a change, but they no longer decide
+the gate. Percentiles use the nearest rank, not interpolation, so any reading
 can be recomputed from the samples by hand.
 
-Treat the retained p95 from fewer than 50 samples as a reference only: at 19 or
-fewer samples nearest-rank p95 is literally the maximum, and the bench prints a
-样本偏少 warning below 20. The gate does not depend on p95, which is why a small
-sample count weakens the historical comparison without weakening the verdict.
+Treat a p95 from fewer than 50 samples as a reference only: at 19 or fewer
+samples nearest-rank p95 is literally the maximum, and the bench prints a
+样本偏少 warning below 20. The attribution gate uses p99, which is even more
+sample-hungry: a tier with a handful of long frames can only report what those
+frames did.
 
 `worstLoaf` is the longest `long-animation-frame` entry recorded during the
 measured window: `duration`, `blockingDuration`, `renderStart` and `startTime`
 in milliseconds. `loafSupported` is `true` when the browser exposes the entry
 type. When it does not, `loafSupported` is `false` and `worstLoaf` is `null`.
+Per-frame script attribution is not copied into `worstLoaf`; it lives in
+`attributedPluginMs` and `excludedLongFrames`.
 
 Every button on the measurement grid lives under `data-slot="bench.grid"` and
 carries an `aria-label`, so `identityKey` produces non-empty keys and the label
@@ -422,36 +463,37 @@ and that a round which never reaches its expected count fails with
 
 `--verify-fresh` makes the freshness contract fatal. The automated Chrome path
 already checks every tier; the flag records the requirement in the protocol and
-turns any violation into `verdict: "stale"` with a non-zero exit. The page
-itself performs the same check at the end of each tier: `window.__BENCH_RESULT__`
-must not have existed before the page ran, the document must have
-`navigation.type === "navigate"`, and the result timestamp must be later than
-the navigation start. In page-only mode the JSON carries the `stale` verdict
-even though the process cannot exit for the reader.
+turns any violation into `verdict: "stale"` and `verdictAttributed: "stale"`
+with a non-zero exit. The page itself performs the same check at the end of
+each tier: `window.__BENCH_RESULT__` must not have existed before the page ran,
+the document must have `navigation.type === "navigate"`, and the result
+timestamp must be later than the navigation start. In page-only mode the JSON
+carries the `stale` verdict even though the process cannot exit for the reader.
 
 `--archive <dir>` writes the aggregated JSON the page produced to
 `<dir>/dsh-jump-bench-<label>-<stamp>.json` (stamp in UTC), creating the
 directory if needed. The file name carries the label, and an unlabelled run is
 archived as `unlabeled`. Two archive runs share one automated protocol, which
 is what makes them comparable to each other. Archive mode needs a local Chrome
-(`CHROME_PATH` overrides the usual install paths) because the page itself cannot
-write files and the repo ships no third-party browser driver.
+(`CHROME_PATH` overrides the usual install paths) because the page itself
+cannot write files and the repo ships no third-party browser driver.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
-still carries every measurement hook (including `frameBudgetMs`, `maxFrameMs`,
-`overBudgetFrames`, `idleOverBudgetFrames`, `idleFrameBudgetMs`,
-`excessOverBudgetPct`, `verdict`, `worstLoaf`, `timeToUsable`, `secondStroke`,
-`close`, `identityKeys` and `identityPath`), exercises the percentile and
-frame-budget implementations with fixed inputs (median and 0.1ms ceiling, max
-rather than p95, and the 5-point noise-band verdict boundary), checks the
-idle-control arithmetic on fixed counts, proves that reading labels before
-stage A commits fails the identity calibration, verifies the `timeToUsable`
-summary shape and that both the 200-frame and 3-second settle limits fail with
-`collection did not settle`, checks the freshness contract against a
-pre-existing result, a reload, an old timestamp and a foreign realm, verifies
-archive file naming and a JSON round-trip into a fresh directory, and fails if
-the page or the script imports anything outside the local toolchain allowlist
-(`node:child_process` is there only for the local Chrome driver).
+still carries every measurement hook (including `attributedPluginMs`,
+`attributedForcedLayoutMs`, `excludedLongFrames`, `activationEventDurationMs`,
+`verdictAttributed`, `judgeable`, `verdictLegacyNote`, `frameBudgetMs`,
+`worstLoaf`, `timeToUsable`, `secondStroke`, `close`, `identityKeys` and
+`identityPath`), and proves the attribution arithmetic on a fixed set of LoAF
+entries: vendor scripts are not summed, a long frame without a plugin script is
+excluded, and two plugin slices in one frame add up. It also pins the
+`verdictAttributed` boundaries (p99 at exactly half the budget and p95 at
+exactly two frames pass, one hundredth over fails, a missing half fails), the
+`judgeable` rule (a HeadlessChrome user agent is false), the percentile and
+frame-budget implementations, the legacy idle-control arithmetic, the identity
+calibration, both settle limits, the freshness contract, archive naming and a
+JSON round-trip, and fails if the page or the script imports anything outside
+the local toolchain allowlist (`node:child_process` is there only for the local
+Chrome driver).
 
 ## v1 boundaries
 

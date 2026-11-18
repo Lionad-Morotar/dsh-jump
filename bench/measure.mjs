@@ -14,10 +14,11 @@
  */
 import { build } from "esbuild";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = join(HERE, "..");
@@ -178,6 +179,158 @@ export function excessOverBudgetPct(
 export function frameVerdict(excessPct) {
   if (excessPct === null || !Number.isFinite(excessPct)) return "fail";
   return excessPct <= NOISE_BAND_PCT ? "pass" : "fail";
+}
+
+/** Share of the frame the plugin may own; the rest belongs to the host. */
+export const ATTRIBUTION_BUDGET_SHARE = 0.5;
+
+/** Activation latency may span two frames; double-rAF is not a single frame. */
+export const ACTIVATION_BUDGET_FRAMES = 2;
+
+/** Why the differential verdict remains in the JSON without deciding acceptance. */
+export const VERDICT_LEGACY_NOTE =
+  "legacy differential verdict: pass when the active over-budget rate minus the idle control rate is at most " +
+  String(NOISE_BAND_PCT) +
+  " percentage points. A loaded machine misses frames with the plugin idle, so this fails with zero plugin work; " +
+  "it is kept as a trend only.";
+
+/** Milliseconds rounded to three decimals; null stays null instead of becoming 0. */
+export function roundMillis(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  return Math.round(value * 1000) / 1000;
+}
+
+/**
+ * The plugin bundle's scripts inside one long-animation-frame entry.
+ *
+ * Only an exact file-name match on the URL path counts. A query string that
+ * merely mentions the bundle name belongs to some other script, and the page's
+ * own inline harness must never be attributed to the plugin just because it
+ * shares the document URL.
+ */
+export function pluginScriptEntries(entry, bundleName) {
+  const scripts = entry !== null && typeof entry === "object" && Array.isArray(entry.scripts) ? entry.scripts : [];
+  const cleanBundle = String(bundleName === null || bundleName === undefined ? "" : bundleName).split(/[?#]/)[0];
+  const slash = cleanBundle.lastIndexOf("/");
+  const fileName = slash === -1 ? cleanBundle : cleanBundle.slice(slash + 1);
+  if (fileName === "") return [];
+  const matched = [];
+  for (const script of scripts) {
+    if (script === null || typeof script !== "object") continue;
+    const source = typeof script.sourceURL === "string" ? script.sourceURL.split(/[?#]/)[0] : "";
+    if (source === "") continue;
+    const sourceSlash = source.lastIndexOf("/");
+    const sourceName = sourceSlash === -1 ? source : source.slice(sourceSlash + 1);
+    if (sourceName !== fileName) continue;
+    matched.push(script);
+  }
+  return matched;
+}
+
+/**
+ * Attribute long frames to the plugin.
+ *
+ * A long frame with no plugin script is system preemption, not plugin cost:
+ * counting it as a zero would dilute the percentile and counting its duration
+ * would blame the plugin for a stalled compositor. Such frames are counted
+ * separately as `excludedLongFrames`. A frame that did run the bundle sums every
+ * plugin entry in it, so two slices in one frame are one frame cost.
+ */
+export function summarizeScriptAttribution(entries, bundleName) {
+  const list = Array.isArray(entries) ? entries : [];
+  const frames = [];
+  let excludedLongFrames = 0;
+  for (const entry of list) {
+    const scripts = pluginScriptEntries(entry, bundleName);
+    if (scripts.length === 0) {
+      excludedLongFrames += 1;
+      continue;
+    }
+    let pluginMs = 0;
+    let forcedLayoutMs = 0;
+    for (const script of scripts) {
+      if (Number.isFinite(script.duration)) pluginMs += script.duration;
+      if (Number.isFinite(script.forcedStyleAndLayoutDuration)) forcedLayoutMs += script.forcedStyleAndLayoutDuration;
+    }
+    frames.push({ pluginMs: pluginMs, forcedLayoutMs: forcedLayoutMs });
+  }
+  const summarize = (field) => {
+    const values = frames.map((frame) => frame[field]);
+    return {
+      p50: roundMillis(nearestRankPercentile(values, 50)),
+      p99: roundMillis(nearestRankPercentile(values, 99)),
+      max: roundMillis(maxFrameIntervalMs(values)),
+      // Preemption inflates wall clock, so the smallest frame is the closest
+      // reading to the plugin's intrinsic cost; p50 is the stable estimator.
+      min: roundMillis(
+        values.length === 0 ? null : values.reduce((smallest, value) => Math.min(smallest, value), Infinity),
+      ),
+    };
+  };
+  return {
+    attributedPluginMs: summarize("pluginMs"),
+    attributedForcedLayoutMs: summarize("forcedLayoutMs"),
+    excludedLongFrames: excludedLongFrames,
+    attributedFrames: frames.length,
+    loafFrames: list.length,
+  };
+}
+
+/**
+ * Activation keydown durations reported by Event Timing.
+ *
+ * `duration` is input to next paint, which is the latency a reader feels. The
+ * p50/p95/max shape mirrors the other gates; an empty window is nulls, never
+ * zeros, because "no sample" and "zero milliseconds" are different claims.
+ */
+export function summarizeEventDurations(durations) {
+  const values = Array.isArray(durations) ? durations.filter((value) => Number.isFinite(value)) : [];
+  return {
+    p50: roundMillis(nearestRankPercentile(values, 50)),
+    p95: roundMillis(nearestRankPercentile(values, 95)),
+    max: roundMillis(maxFrameIntervalMs(values)),
+  };
+}
+
+/**
+ * Whether a tier's numbers can decide acceptance.
+ *
+ * Headless Chrome has no GPU presentation path, and the canvas cost sits
+ * exactly in the part software raster distorts. Such a run is a regression
+ * smoke test. A headed run also needs a measured display budget and at least
+ * one long frame that actually ran the plugin; without an attributed frame the
+ * bench has no plugin cost to judge.
+ */
+export function isJudgeable({ userAgent, frameBudgetMs, attributedPluginMs }) {
+  const agent = typeof userAgent === "string" ? userAgent : "";
+  if (agent.includes("Headless")) return false;
+  if (!Number.isFinite(frameBudgetMs) || frameBudgetMs <= 0) return false;
+  if (attributedPluginMs === null || attributedPluginMs === undefined) return false;
+  return Number.isFinite(attributedPluginMs.p99);
+}
+
+/**
+ * The attributed acceptance rule.
+ *
+ * The plugin owns at most half a frame at p99, and a real activation may span
+ * two frames end to end. Both conditions must hold; a missing activation
+ * sample cannot prove the second half and therefore fails instead of passing
+ * by default. A non-judgeable environment is reported as `smoke-only`, never
+ * as a pass.
+ */
+export function attributedVerdict({ judgeable, frameBudgetMs, attributedPluginMs, activationEventDurationMs }) {
+  if (!judgeable) return "smoke-only";
+  if (!Number.isFinite(frameBudgetMs) || frameBudgetMs <= 0) return "fail";
+  const pluginP99 = attributedPluginMs === null || attributedPluginMs === undefined ? null : attributedPluginMs.p99;
+  const activationP95 =
+    activationEventDurationMs === null || activationEventDurationMs === undefined
+      ? null
+      : activationEventDurationMs.p95;
+  if (!Number.isFinite(pluginP99) || !Number.isFinite(activationP95)) return "fail";
+  return pluginP99 <= frameBudgetMs * ATTRIBUTION_BUDGET_SHARE &&
+    activationP95 <= frameBudgetMs * ACTIVATION_BUDGET_FRAMES
+    ? "pass"
+    : "fail";
 }
 
 /**
@@ -467,6 +620,15 @@ function pageScript(config) {
   const collectionSettleFailure = ${collectionSettleFailure.toString()};
   const collectionReadiness = ${collectionReadiness.toString()};
   const summarizeTimeToUsable = ${summarizeTimeToUsable.toString()};
+  const roundMillis = ${roundMillis.toString()};
+  const pluginScriptEntries = ${pluginScriptEntries.toString()};
+  const summarizeScriptAttribution = ${summarizeScriptAttribution.toString()};
+  const summarizeEventDurations = ${summarizeEventDurations.toString()};
+  const isJudgeable = ${isJudgeable.toString()};
+  const attributedVerdict = ${attributedVerdict.toString()};
+  const ATTRIBUTION_BUDGET_SHARE = ${ATTRIBUTION_BUDGET_SHARE};
+  const ACTIVATION_BUDGET_FRAMES = ${ACTIVATION_BUDGET_FRAMES};
+  const VERDICT_LEGACY_NOTE = ${JSON.stringify(VERDICT_LEGACY_NOTE)};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
   const output = document.querySelector("[data-bench-output]");
@@ -512,6 +674,50 @@ function pageScript(config) {
     const init = { key: key, bubbles: true, cancelable: true };
     if (modifiers !== undefined) Object.assign(init, modifiers);
     return new KeyboardEvent("keydown", init);
+  }
+
+  /**
+   * Event Timing only reports trusted events, so an automated activation has
+   * to come from the driver rather than from dispatchEvent. The page publishes
+   * a request and waits; a page opened without a driver falls back to the
+   * synthetic path after this budget so a manual reader is never blocked.
+   */
+  const DRIVE_TRUSTED_INPUT = new URLSearchParams(window.location.search).get("drive") === "1";
+  const TRUSTED_INPUT_TIMEOUT_MS = 1500;
+  let trustedPending = null;
+  let trustedSequence = 0;
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      if (trustedPending === null) return;
+      if (!event.isTrusted) return;
+      if (event.key !== "h" || event.metaKey !== true) return;
+      const pending = trustedPending;
+      trustedPending = null;
+      window.__BENCH_TRUSTED_REQUEST__ = null;
+      pending.resolve({ startedAt: performance.now() });
+    },
+    true,
+  );
+
+  function requestTrustedActivation() {
+    return new Promise((resolve) => {
+      const id = ++trustedSequence;
+      const timer = setTimeout(() => {
+        if (trustedPending === null || trustedPending.id !== id) return;
+        trustedPending = null;
+        window.__BENCH_TRUSTED_REQUEST__ = null;
+        resolve(null);
+      }, TRUSTED_INPUT_TIMEOUT_MS);
+      trustedPending = {
+        id: id,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+      };
+      window.__BENCH_TRUSTED_REQUEST__ = { id: id, key: "h", metaKey: true };
+    });
   }
 
   function buildGrid(count) {
@@ -680,11 +886,24 @@ function pageScript(config) {
    * clock: the second-frame gap is sampled beside the poll so a long collection
    * cannot move the phase reading.
    */
-  function beginActivation(expected) {
-    const event = keydown("h", { metaKey: true });
-    const startedAt = performance.now();
-    window.dispatchEvent(event);
-    const dispatchedAt = performance.now();
+  async function beginActivation(expected) {
+    let startedAt = null;
+    let dispatchedAt = null;
+    let trusted = false;
+    if (DRIVE_TRUSTED_INPUT) {
+      const requested = await requestTrustedActivation();
+      if (requested !== null) {
+        startedAt = requested.startedAt;
+        dispatchedAt = performance.now();
+        trusted = true;
+      }
+    }
+    if (!trusted) {
+      const event = keydown("h", { metaKey: true });
+      startedAt = performance.now();
+      window.dispatchEvent(event);
+      dispatchedAt = performance.now();
+    }
     const nextFrameMs = new Promise((resolve) => {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => resolve(performance.now() - dispatchedAt));
@@ -693,6 +912,7 @@ function pageScript(config) {
     return {
       handlerMs: dispatchedAt - startedAt,
       nextFrameMs: nextFrameMs,
+      trusted: trusted,
       usable: waitForUsable(expected, dispatchedAt),
     };
   }
@@ -757,27 +977,89 @@ function pageScript(config) {
     };
   }
 
+  /**
+   * Long frames with their script attribution.
+   *
+   * The entry is snapshotted because entry.scripts is a live-ish view that
+   * the caller keeps after the observer is disconnected, and the aggregation
+   * needs every script's URL and forced-layout time. Attribution is the whole
+   * point: a frame with no plugin script is system preemption and must not be
+   * blamed on the plugin.
+   */
   function startLoafObserver() {
-    if (typeof PerformanceObserver !== "function") {
-      return { supported: false, entries: [], stop: () => {} };
-    }
+    const unsupported = { supported: false, entries: [], stop: () => {} };
+    if (typeof PerformanceObserver !== "function") return unsupported;
     const supportedTypes = PerformanceObserver.supportedEntryTypes;
-    if (!Array.isArray(supportedTypes) || !supportedTypes.includes("long-animation-frame")) {
-      return { supported: false, entries: [], stop: () => {} };
-    }
+    if (!Array.isArray(supportedTypes) || !supportedTypes.includes("long-animation-frame")) return unsupported;
     const entries = [];
     let observer = null;
     try {
       observer = new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) entries.push(entry);
+        for (const entry of list.getEntries()) {
+          entries.push({
+            duration: entry.duration,
+            blockingDuration: entry.blockingDuration,
+            renderStart: entry.renderStart,
+            startTime: entry.startTime,
+            scripts: Array.isArray(entry.scripts)
+              ? entry.scripts.map((script) => ({
+                  invoker: typeof script.invoker === "string" ? script.invoker : "",
+                  sourceURL: typeof script.sourceURL === "string" ? script.sourceURL : "",
+                  sourceFunctionName:
+                    typeof script.sourceFunctionName === "string" ? script.sourceFunctionName : "",
+                  duration: Number.isFinite(script.duration) ? script.duration : 0,
+                  forcedStyleAndLayoutDuration: Number.isFinite(script.forcedStyleAndLayoutDuration)
+                    ? script.forcedStyleAndLayoutDuration
+                    : 0,
+                  pauseDuration: Number.isFinite(script.pauseDuration) ? script.pauseDuration : 0,
+                }))
+              : [],
+          });
+        }
       });
       observer.observe({ type: "long-animation-frame", buffered: false });
     } catch {
-      return { supported: false, entries: [], stop: () => {} };
+      return unsupported;
     }
     return {
       supported: true,
       entries: entries,
+      stop: () => {
+        observer.disconnect();
+      },
+    };
+  }
+
+  /**
+   * Activation keydown latency from Event Timing.
+   *
+   * duration is input to next paint, including the wait for the next frame,
+   * which is why the gate allows two frames instead of one. durationThreshold:
+   * 0 is the lowest value the API accepts; Chrome still floors observation at
+   * 16ms, so a fast activation leaves no entry and the sample count is reported
+   * beside the percentiles.
+   */
+  function startEventObserver() {
+    const unsupported = { supported: false, durations: [], stop: () => {} };
+    if (typeof PerformanceObserver !== "function") return unsupported;
+    const supportedTypes = PerformanceObserver.supportedEntryTypes;
+    if (!Array.isArray(supportedTypes) || !supportedTypes.includes("event")) return unsupported;
+    const durations = [];
+    let observer = null;
+    try {
+      observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (entry.entryType !== "event" || entry.name !== "keydown") continue;
+          if (Number.isFinite(entry.duration)) durations.push(entry.duration);
+        }
+      });
+      observer.observe({ type: "event", durationThreshold: 0, buffered: false });
+    } catch {
+      return unsupported;
+    }
+    return {
+      supported: true,
+      durations: durations,
       stop: () => {
         observer.disconnect();
       },
@@ -827,9 +1109,11 @@ function pageScript(config) {
     // One activation per round; counted rather than derived so the identity
     // total below multiplies a measured unit by an observed round count.
     let rounds = 0;
+    let trustedActivations = 0;
     const activateRound = async () => {
       rounds += 1;
-      const activation = beginActivation(identity.labels);
+      const activation = await beginActivation(identity.labels);
+      if (activation.trusted) trustedActivations += 1;
       // Stage A is interruptible and an oversized round paints across frames,
       // so the painted label count, not a frame count, is the readiness
       // signal. A round that never reaches the expected count rejects with
@@ -858,8 +1142,12 @@ function pageScript(config) {
       warmed += 1;
     }
 
+    // Warmup trusted activations must not enter the interaction sample; they
+    // exist to warm the path, not to describe it.
+    trustedActivations = 0;
     const frameSampler = startFrameSampler();
     const loaf = startLoafObserver();
+    const eventTiming = startEventObserver();
 
     const activate = [];
     const firstStroke = [];
@@ -918,11 +1206,19 @@ function pageScript(config) {
     const close = await stroke("Escape");
 
     const frameIntervals = frameSampler.stop();
-    // Let the observer deliver the entries queued by the final frames before
-    // disconnecting; a LoAF raised by the last measured frame is still part of
-    // the tier.
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Let both observers deliver entries queued by the final frame. Event
+    // Timing entries are delivered after the next paint, which is later than a
+    // microtask; dropping them would undercount the interaction tail.
+    await new Promise((resolve) => setTimeout(resolve, 120));
     loaf.stop();
+    eventTiming.stop();
+    const attribution = summarizeScriptAttribution(loaf.entries, CONFIG.pluginBundle);
+    const activationEventDurationMs = summarizeEventDurations(eventTiming.durations);
+    const judgeable = isJudgeable({
+      userAgent: navigator.userAgent,
+      frameBudgetMs: frameBudgetMs,
+      attributedPluginMs: attribution.attributedPluginMs,
+    });
     const maxFrameMs = roundMs(maxFrameIntervalMs(frameIntervals));
     const overBudgetFrames =
       frameIntervals.length === 0 ? null : frameIntervals.filter((gap) => gap > frameBudgetMs).length;
@@ -945,6 +1241,15 @@ function pageScript(config) {
       if (!(finishedAtMs > navigationStartMs)) staleReasons.push("result timestamp is not after navigation start");
     }
     const verdict = staleReasons.length > 0 ? "stale" : frameVerdict(excess);
+    const verdictAttributed =
+      staleReasons.length > 0
+        ? "stale"
+        : attributedVerdict({
+            judgeable: judgeable,
+            frameBudgetMs: frameBudgetMs,
+            attributedPluginMs: attribution.attributedPluginMs,
+            activationEventDurationMs: activationEventDurationMs,
+          });
 
     return {
       candidates: candidates,
@@ -968,6 +1273,18 @@ function pageScript(config) {
       excessOverBudgetPct: excess,
       noiseBandPct: NOISE_BAND_PCT,
       verdict: verdict,
+      verdictLegacyNote: VERDICT_LEGACY_NOTE,
+      verdictAttributed: verdictAttributed,
+      judgeable: judgeable,
+      attributedPluginMs: attribution.attributedPluginMs,
+      attributedForcedLayoutMs: attribution.attributedForcedLayoutMs,
+      attributedFrames: attribution.attributedFrames,
+      excludedLongFrames: attribution.excludedLongFrames,
+      loafFrames: attribution.loafFrames,
+      activationEventDurationMs: activationEventDurationMs,
+      activationEventSamples: eventTiming.durations.length,
+      eventTimingSupported: eventTiming.supported,
+      trustedActivations: trustedActivations,
       staleReasons: staleReasons,
       loafSupported: loaf.supported,
       worstLoaf: worstLoafOf(loaf.entries),
@@ -1025,9 +1342,18 @@ function pageScript(config) {
         frameBudgetSamples: FRAME_BUDGET_SAMPLES,
         idleFrameBudgetSamples: FRAME_BUDGET_SAMPLES,
         verdictRule:
-          "pass when active over-budget rate minus idle control rate is at most " +
+          "legacy differential rule, trend only: pass when active over-budget rate minus idle control rate is at most " +
           String(NOISE_BAND_PCT) +
           " percentage points",
+        attributionRule:
+          "attributedPluginMs.p99 <= frameBudgetMs * " +
+          String(ATTRIBUTION_BUDGET_SHARE) +
+          " and activationEventDurationMs.p95 <= frameBudgetMs * " +
+          String(ACTIVATION_BUDGET_FRAMES),
+        judgeableRule:
+          "judgeable only when the user agent is not Headless, the display budget was measured, and at least one long frame ran the plugin bundle",
+        headlessNote:
+          "headless Chrome with --disable-gpu exercises software raster, not the GPU presentation path; its readings are a regression smoke test, never acceptance evidence",
         timeToUsableRule:
           "wall clock from dispatchEvent return to every label of the round being painted, " +
           "sampled with performance.now; frames counted as animation frames observed in the same wait. " +
@@ -1068,9 +1394,23 @@ function pageScript(config) {
 })();`;
 }
 
-export function pageHtml({ bundle, candidates, runs, warmup, label, verifyFresh = false }) {
-  const config = { candidates, runs, warmup, label, identityPath: "active", verifyFresh };
-  const inlined = bundle.replace(/<\/script/gi, "<\\/script");
+/** The bundle file name carried into the page for LoAF URL attribution. */
+export function bundleFileNameOf(url) {
+  const clean = String(url).split(/[?#]/)[0];
+  const slash = clean.lastIndexOf("/");
+  return slash === -1 ? clean : clean.slice(slash + 1);
+}
+
+export function pageHtml({ bundleUrl, candidates, runs, warmup, label, verifyFresh = false }) {
+  const config = {
+    candidates,
+    runs,
+    warmup,
+    label,
+    identityPath: "active",
+    verifyFresh,
+    pluginBundle: bundleFileNameOf(bundleUrl),
+  };
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1143,25 +1483,28 @@ export function pageHtml({ bundle, candidates, runs, warmup, label, verifyFresh 
 <div data-bench-pulse aria-hidden="true"></div>
 <div id="bench-status" data-bench-status>starting</div>
 <pre id="bench-output" data-bench-output></pre>
-<script>${inlined}</script>
+<script src="${bundleUrl}"></script>
 <script>${pageScript(config)}</script>
 </body>
 </html>
 `;
 }
 
-async function writeArtifacts({ bundle, html, out }) {
+async function writeArtifacts({ bundle, html, out, bundleName }) {
   await mkdir(OUTPUT_DIR, { recursive: true });
-  const bundlePath = join(OUTPUT_DIR, "dsh-jump-bench.bundle.js");
+  const htmlPath = out === null ? join(OUTPUT_DIR, "dsh-jump-bench.html") : resolve(process.cwd(), out);
+  await mkdir(dirname(htmlPath), { recursive: true });
+  // The bundle must stay an external same-directory script: LoAF only
+  // attributes scripts with a real source URL, never the inline document.
+  const bundlePath = join(dirname(htmlPath), bundleName);
   await writeFile(bundlePath, bundle, "utf8");
-  let htmlPath = join(OUTPUT_DIR, "dsh-jump-bench.html");
   await writeFile(htmlPath, html, "utf8");
-  if (out !== null) {
-    htmlPath = resolve(process.cwd(), out);
-    await mkdir(dirname(htmlPath), { recursive: true });
-    await writeFile(htmlPath, html, "utf8");
-  }
   return { bundlePath, htmlPath };
+}
+
+/** The bundle file that sits beside a generated page. */
+export function pageBundleName(htmlPath) {
+  return `${basename(htmlPath, extname(htmlPath))}.bundle.js`;
 }
 
 /**
@@ -1272,18 +1615,48 @@ async function openCdp(url) {
 }
 
 const RESULT_EXPRESSION =
-  "window.__BENCH_ERROR__ ? { error: window.__BENCH_ERROR__ } :" +
-  " (window.__BENCH_RESULT__ ? { result: window.__BENCH_RESULT__ } : null)";
+  "(() => {" +
+  " const request = window.__BENCH_TRUSTED_REQUEST__ || null;" +
+  " const error = window.__BENCH_ERROR__ || null;" +
+  " const result = window.__BENCH_RESULT__ || null;" +
+  " return { request: request, error: error, result: result };" +
+  "})()";
 
 async function evaluateValue(cdp, sessionId, expression) {
   const evaluation = await cdp.send("Runtime.evaluate", { expression, returnByValue: true }, sessionId);
   return evaluation?.result?.value;
 }
 
+/**
+ * Send the activation as a real input event.
+ *
+ * Event Timing ignores `dispatchEvent`, so the page cannot measure an
+ * activation it synthesizes itself. The page publishes a request; the driver
+ * answers with CDP key input, which Chrome treats as trusted. The id set
+ * prevents a second poll from double-pressing while the page is still handing
+ * the first event to its listener.
+ */
+async function sendTrustedActivation(cdp, sessionId, request, dispatched) {
+  if (request === null || request === undefined || dispatched.has(request.id)) return;
+  dispatched.add(request.id);
+  const key = typeof request.key === "string" && request.key !== "" ? request.key : "h";
+  const params = {
+    type: "keyDown",
+    key: key,
+    code: `Key${key.toUpperCase()}`,
+    modifiers: request.metaKey === true ? 4 : 0,
+    windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+    nativeVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+  };
+  await cdp.send("Input.dispatchKeyEvent", params, sessionId).catch(() => undefined);
+  await cdp.send("Input.dispatchKeyEvent", { ...params, type: "keyUp" }, sessionId).catch(() => undefined);
+}
+
 async function waitForPageResult(cdp, sessionId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  const dispatched = new Set();
   while (Date.now() < deadline) {
-    await sleep(250);
+    await sleep(100);
     let value;
     try {
       value = await evaluateValue(cdp, sessionId, RESULT_EXPRESSION);
@@ -1293,8 +1666,9 @@ async function waitForPageResult(cdp, sessionId, timeoutMs) {
       continue;
     }
     if (value === null || value === undefined) continue;
+    if (value.request) await sendTrustedActivation(cdp, sessionId, value.request, dispatched);
     if (value.error) throw new Error(`bench page failed: ${String(value.error)}`);
-    return value.result;
+    if (value.result) return value.result;
   }
   throw new Error(`bench page did not finish within ${String(Math.round(timeoutMs / 1000))}s`);
 }
@@ -1330,6 +1704,43 @@ function tierFreshnessFailures(result, live, token, verifyFresh) {
 }
 
 /**
+ * Serve the generated page over loopback HTTP.
+ *
+ * LoAF reports script attribution only for HTTP(S) scripts; a file:// bundle
+ * arrives with no source URL, which would make attributedPluginMs null on
+ * every automated run. The driver owns this server so the page and its bundle
+ * stay a two-file unit wherever the driver runs.
+ */
+async function startPageServer(pagePath, bundleName) {
+  const dir = dirname(pagePath);
+  const files = new Map([
+    [basename(pagePath), { body: await readFile(pagePath), type: "text/html; charset=utf-8" }],
+    [bundleName, { body: await readFile(join(dir, bundleName)), type: "text/javascript; charset=utf-8" }],
+  ]);
+  const server = createServer((request, response) => {
+    const path = (request.url ?? "/").split("?")[0];
+    const name = decodeURIComponent(path.replace(/^\/+/, ""));
+    const file = files.get(name);
+    if (file === undefined) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("not found");
+      return;
+    }
+    response.writeHead(200, { "content-type": file.type, "cache-control": "no-store" });
+    response.end(file.body);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  return {
+    origin: `http://127.0.0.1:${String(address.port)}`,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+/**
  * Drive one fresh Chrome browser context per tier.
  *
  * The defect this replaces was a single tab reused across tiers, where a
@@ -1338,7 +1749,7 @@ function tierFreshnessFailures(result, live, token, verifyFresh) {
  * state start clean, and the random query on every navigation makes a cached
  * document impossible to mistake for the new one.
  */
-async function runTiersInChrome({ chrome, pagePath, candidates, verifyFresh }) {
+async function runTiersInChrome({ chrome, pagePath, bundleName, candidates, verifyFresh }) {
   const profile = await mkdtemp(join(tmpdir(), "dsh-jump-bench-chrome-"));
   const child = spawn(
     chrome,
@@ -1359,7 +1770,9 @@ async function runTiersInChrome({ chrome, pagePath, candidates, verifyFresh }) {
     { stdio: "ignore" },
   );
   let cdp;
+  let pageServer;
   try {
+    pageServer = await startPageServer(pagePath, bundleName);
     const port = await readDevtoolsPort(profile);
     const version = await (await fetch(`http://127.0.0.1:${String(port)}/json/version`)).json();
     if (typeof version?.webSocketDebuggerUrl !== "string") {
@@ -1381,10 +1794,12 @@ async function runTiersInChrome({ chrome, pagePath, candidates, verifyFresh }) {
         sessionId = attached.sessionId;
         await cdp.send("Page.enable", {}, sessionId);
         await cdp.send("Runtime.enable", {}, sessionId);
+        await cdp.send("Page.bringToFront", {}, sessionId).catch(() => undefined);
 
         const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
         const url =
-          `${pathToFileURL(pagePath).href}?tier=${String(count)}&r=${encodeURIComponent(token)}`;
+          `${pageServer.origin}/${encodeURIComponent(basename(pagePath))}` +
+          `?tier=${String(count)}&r=${encodeURIComponent(token)}&drive=1`;
         await cdp.send("Page.navigate", { url }, sessionId);
         const result = await waitForPageResult(cdp, sessionId, 240000);
         if (!Array.isArray(result.runs) || result.runs.length !== 1 || result.runs[0]?.candidates !== count) {
@@ -1453,6 +1868,7 @@ async function runTiersInChrome({ chrome, pagePath, candidates, verifyFresh }) {
   } finally {
     cdp?.close();
     child.kill("SIGKILL");
+    await pageServer?.close();
     await rm(profile, { recursive: true, force: true }).catch(() => undefined);
   }
 }
@@ -1463,7 +1879,6 @@ const REQUIRED_HOOKS = [
   "data-bench-status",
   "data-bench-output",
   "data-bench-state",
-  GLOBAL_NAME,
   "requestAnimationFrame",
   "KeyboardEvent",
   "dispatchEvent",
@@ -1509,6 +1924,28 @@ const REQUIRED_HOOKS = [
   "worstLoaf",
   "loafSupported",
   "long-animation-frame",
+  "sourceURL",
+  "sourceFunctionName",
+  "forcedStyleAndLayoutDuration",
+  "pauseDuration",
+  "attributedPluginMs:",
+  "attributedForcedLayoutMs:",
+  "attributedFrames:",
+  "excludedLongFrames:",
+  "loafFrames:",
+  "activationEventDurationMs:",
+  "activationEventSamples:",
+  "eventTimingSupported:",
+  "trustedActivations:",
+  "durationThreshold: 0",
+  "__BENCH_TRUSTED_REQUEST__",
+  "pluginBundle",
+  "judgeable:",
+  "verdictAttributed:",
+  "verdictLegacyNote:",
+  "attributionRule",
+  "judgeableRule",
+  "headlessNote",
   "verifyFresh",
   "navigationType",
 ];
@@ -1614,6 +2051,179 @@ function assertIdleControlContract() {
     }
   }
   if (excessOverBudgetPct(0, 0, 0, 10) !== null) throw new Error("an empty active window must not produce a difference");
+}
+
+/**
+ * LoAF attribution contract.
+ *
+ * The gate asks what the plugin did inside a long frame, not how long the
+ * frame was. A fixed fixture pins the three traps: vendor scripts must not be
+ * summed, frames without any plugin script must be excluded rather than
+ * counted as zero-cost plugin work, and the per-frame total must add every
+ * plugin entry in that frame.
+ */
+function assertAttributionContract() {
+  const bundle = "dsh-jump-bench.bundle.js";
+  const entries = [
+    {
+      duration: 60,
+      scripts: [
+        {
+          invoker: "BUTTON#a.onclick",
+          sourceURL: "http://127.0.0.1:7810/dsh-jump-bench.bundle.js?cache=1",
+          sourceFunctionName: "onActivate",
+          duration: 12.5,
+          forcedStyleAndLayoutDuration: 3.5,
+          pauseDuration: 0,
+        },
+        {
+          invoker: "BUTTON#a.onclick",
+          sourceURL: "http://127.0.0.1:7810/vendor.js",
+          sourceFunctionName: "",
+          duration: 40,
+          forcedStyleAndLayoutDuration: 10,
+          pauseDuration: 0,
+        },
+      ],
+    },
+    {
+      duration: 80,
+      scripts: [
+        {
+          invoker: "FrameRequestCallback",
+          sourceURL: "http://127.0.0.1:7810/vendor.js",
+          sourceFunctionName: "",
+          duration: 70,
+          forcedStyleAndLayoutDuration: 20,
+          pauseDuration: 0,
+        },
+      ],
+    },
+    {
+      duration: 100,
+      scripts: [
+        {
+          invoker: "FrameRequestCallback",
+          sourceURL: "http://127.0.0.1:7810/dsh-jump-bench.bundle.js",
+          sourceFunctionName: "paint",
+          duration: 4,
+          forcedStyleAndLayoutDuration: 1,
+          pauseDuration: 2,
+        },
+        {
+          invoker: "FrameRequestCallback",
+          sourceURL: "http://127.0.0.1:7810/dsh-jump-bench.bundle.js",
+          sourceFunctionName: "paint",
+          duration: 2,
+          forcedStyleAndLayoutDuration: 0.5,
+          pauseDuration: 0,
+        },
+      ],
+    },
+    { duration: 55, scripts: [] },
+  ];
+  const summary = summarizeScriptAttribution(entries, bundle);
+  const expected = {
+    attributedPluginMs: { p50: 6, p99: 12.5, max: 12.5, min: 6 },
+    attributedForcedLayoutMs: { p50: 1.5, p99: 3.5, max: 3.5, min: 1.5 },
+    excludedLongFrames: 2,
+    attributedFrames: 2,
+    loafFrames: 4,
+  };
+  if (JSON.stringify(summary) !== JSON.stringify(expected)) {
+    throw new Error(
+      `LoAF attribution summary is ${JSON.stringify(summary)}, expected ${JSON.stringify(expected)}`,
+    );
+  }
+  const onlyBundle = pluginScriptEntries(entries[0], bundle);
+  if (onlyBundle.length !== 1 || onlyBundle[0].duration !== 12.5) {
+    throw new Error("pluginScriptEntries must keep exactly the plugin bundle entry");
+  }
+  const lookalike = summarizeScriptAttribution(
+    [
+      {
+        duration: 70,
+        scripts: [
+          { sourceURL: "http://127.0.0.1:7810/other.js?file=dsh-jump-bench.bundle.js", duration: 70 },
+        ],
+      },
+    ],
+    bundle,
+  );
+  if (lookalike.attributedFrames !== 0 || lookalike.excludedLongFrames !== 1) {
+    throw new Error("a query string carrying the bundle name must not attribute a foreign script");
+  }
+  const empty = summarizeScriptAttribution([], bundle);
+  if (empty.attributedPluginMs.p99 !== null || empty.attributedFrames !== 0 || empty.excludedLongFrames !== 0) {
+    throw new Error("an empty LoAF window must report nulls and zero frames");
+  }
+}
+
+/**
+ * Attributed verdict boundary.
+ *
+ * Both halves must gate: the plugin p99 at exactly half the frame budget
+ * passes and one hundredth over fails, and the activation p95 at exactly two
+ * frames passes and one hundredth over fails. A missing half is never a pass.
+ */
+function assertAttributedVerdictContract() {
+  const budget = 7;
+  const attribution = { p50: 1, p99: 3.5, max: 3.5 };
+  const activation = { p50: 8, p95: 14, max: 14 };
+  const verdict = (patch) =>
+    attributedVerdict({
+      judgeable: true,
+      frameBudgetMs: budget,
+      attributedPluginMs: attribution,
+      activationEventDurationMs: activation,
+      ...patch,
+    });
+  if (verdict({}) !== "pass") throw new Error("p99 at exactly half the budget and p95 at exactly two frames must pass");
+  if (verdict({ attributedPluginMs: { ...attribution, p99: 3.5001 } }) !== "fail") {
+    throw new Error("a plugin p99 just over half the budget must fail");
+  }
+  if (verdict({ activationEventDurationMs: { ...activation, p95: 14.0001 } }) !== "fail") {
+    throw new Error("an activation p95 just over two frames must fail");
+  }
+  if (verdict({ activationEventDurationMs: { p50: null, p95: null, max: null } }) !== "fail") {
+    throw new Error("a tier with no activation sample must not pass");
+  }
+  if (verdict({ judgeable: false }) !== "smoke-only") {
+    throw new Error("a non-judgeable tier must report smoke-only instead of pass or fail");
+  }
+}
+
+/**
+ * Judgeability contract.
+ *
+ * A headless browser has no GPU presentation path, so its numbers are a
+ * regression smoke test, not acceptance evidence. The same run also needs a
+ * measured display budget and at least one attributed frame; a page that
+ * produced no LoAF sample has no attribution to judge.
+ */
+function assertJudgeableContract() {
+  const headless = {
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36",
+    frameBudgetMs: 7,
+    attributedPluginMs: { p50: 1, p99: 2, max: 2 },
+  };
+  if (isJudgeable(headless) !== false) throw new Error("a HeadlessChrome UA must never be judgeable");
+  const headed = {
+    ...headless,
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+  };
+  if (isJudgeable(headed) !== true) throw new Error("a headed browser with samples and a budget must be judgeable");
+  if (isJudgeable({ ...headed, attributedPluginMs: { p50: null, p99: null, max: null } }) !== false) {
+    throw new Error("no attributed sample must not be judgeable");
+  }
+  if (isJudgeable({ ...headed, frameBudgetMs: null }) !== false) {
+    throw new Error("an unmeasured display budget must not be judgeable");
+  }
+  if (isJudgeable({ ...headed, frameBudgetMs: 0 }) !== false) {
+    throw new Error("a zero frame budget must not be judgeable");
+  }
 }
 
 /**
@@ -1838,24 +2448,35 @@ async function assertArchiveWrite() {
 
 function assertOfflineSource(source) {
   const specifiers = [...source.matchAll(/^\s*import\s[^;]*?from\s+"([^"]+)"/gm)].map((match) => match[1]);
-  const allowed = new Set(["esbuild", "node:child_process", "node:fs/promises", "node:os", "node:path", "node:url"]);
+  const allowed = new Set([
+    "esbuild",
+    "node:child_process",
+    "node:fs/promises",
+    "node:http",
+    "node:os",
+    "node:path",
+    "node:url",
+  ]);
   for (const specifier of specifiers) {
     if (!allowed.has(specifier)) throw new Error(`bench imports "${specifier}", which may reach the network`);
   }
   if (specifiers.length === 0) throw new Error("bench source exposes no imports; the offline assertion would pass vacuously");
 }
 
-function assertNoNetworkApis(text, label) {
+function assertNoNetworkApis(text, label, allowedScriptSrc = null) {
   const patterns = [
     { name: "fetch(", re: /\bfetch\s*\(/ },
     { name: "XMLHttpRequest", re: /\bXMLHttpRequest\b/ },
     { name: "WebSocket", re: /\bWebSocket\b/ },
     { name: "importScripts", re: /\bimportScripts\b/ },
-    { name: "external script src", re: /<script[^>]+\ssrc\s*=/i },
     { name: "http(s) URL", re: /https?:\/\//i },
   ];
   for (const pattern of patterns) {
     if (pattern.re.test(text)) throw new Error(`${label} depends on ${pattern.name}`);
+  }
+  for (const match of text.matchAll(/<script\b[^>]*\bsrc\s*=\s*"([^"]*)"/gi)) {
+    if (allowedScriptSrc !== null && match[1] === allowedScriptSrc) continue;
+    throw new Error(`${label} depends on an external script: ${match[1]}`);
   }
 }
 
@@ -1866,8 +2487,9 @@ export async function check() {
   console.log(`check bundle: ok (${bundle.length} bytes)`);
 
   const defaultWarmup = resolveWarmup(DEFAULT_RUNS, null);
+  const checkBundleUrl = "dsh-jump-bench.bundle.js";
   const html = pageHtml({
-    bundle,
+    bundleUrl: checkBundleUrl,
     candidates: DEFAULT_CANDIDATES,
     runs: DEFAULT_RUNS,
     warmup: defaultWarmup,
@@ -1883,15 +2505,17 @@ export async function check() {
     !html.includes('"label":null') ||
     !html.includes('"identityPath":"active"') ||
     !html.includes('"verifyFresh":false') ||
+    !html.includes(`"pluginBundle":"${checkBundleUrl}"`) ||
+    !html.includes(`<script src="${checkBundleUrl}"></script>`) ||
     !html.includes('"nearest-rank"') ||
-    !html.includes("active over-budget rate minus idle control rate") ||
+    !html.includes("legacy differential rule") ||
     !html.includes("background throttling, the frame count is the steadier relative quantity") ||
     !html.includes("idleOverBudgetFrames:")
   ) {
     throw new Error("generated page lost its candidate/run/warmup/label/protocol/idle-control configuration");
   }
   const freshHtml = pageHtml({
-    bundle,
+    bundleUrl: checkBundleUrl,
     candidates: DEFAULT_CANDIDATES,
     runs: DEFAULT_RUNS,
     warmup: defaultWarmup,
@@ -1911,6 +2535,15 @@ export async function check() {
 
   assertIdleControlContract();
   console.log("check idle control: ok (fixed inputs, excess percentage, 5-point band)");
+
+  assertAttributionContract();
+  console.log("check attribution: ok (bundle-only sums, excluded frames, empty window nulls)");
+
+  assertAttributedVerdictContract();
+  console.log("check attributed verdict: ok (half-budget p99 and two-frame p95 boundaries)");
+
+  assertJudgeableContract();
+  console.log("check judgeable: ok (headless, missing budget and missing samples rejected)");
 
   assertIdentityCalibrationContract();
   console.log("check identity calibration: ok (complete round passes, partial 96/300 rejected)");
@@ -1934,7 +2567,7 @@ export async function check() {
   await assertArchiveWrite();
   console.log("check archive: ok (label naming, directory creation, JSON round-trip)");
 
-  assertNoNetworkApis(html, "generated page");
+  assertNoNetworkApis(html, "generated page", checkBundleUrl);
   assertNoNetworkApis(bundle, "bundle");
   const source = await readFile(fileURLToPath(import.meta.url), "utf8");
   assertOfflineSource(source);
@@ -1968,12 +2601,15 @@ browser context, navigated to a uniquely tagged URL and verified before its
 reading is accepted. Without Chrome the page is only generated and printed, and
 the JSON is collected by opening it in a real browser foreground tab.
 
-A tier passes only when its over-budget rate exceeds the blank idle control
-window measured on the same tier by at most ${String(NOISE_BAND_PCT)} percentage points:
-frameBudgetMs is the median of 240 animation-frame gaps rounded up to 0.1ms,
-and maxFrameMs is the largest single gap in the measured window, not a
-percentile. The result always prints both active and idle counts so the
-difference can be recomputed by hand.`);
+Acceptance is the attributed rule: the plugin's long-animation-frame cost p99
+must stay within half of frameBudgetMs, and the activation keydown's Event
+Timing p95 within two frames. frameBudgetMs is the median of 240
+animation-frame gaps rounded up to 0.1ms. The legacy differential verdict
+(active over-budget rate minus the blank control) is still printed but is a
+trend only: a loaded machine misses frames with the plugin idle, so it fails
+with zero plugin work. Headless Chrome with --disable-gpu is a regression
+smoke test, never acceptance evidence; judgeable is false there and
+verdictAttributed is smoke-only.`);
 }
 
 async function main() {
@@ -1992,15 +2628,17 @@ async function main() {
 
   const warmup = resolveWarmup(options.runs, options.warmup);
   const bundle = await bundleApp();
+  const pagePath = options.out === null ? join(OUTPUT_DIR, "dsh-jump-bench.html") : resolve(process.cwd(), options.out);
+  const bundleName = pageBundleName(pagePath);
   const html = pageHtml({
-    bundle,
+    bundleUrl: bundleName,
     candidates: options.candidates,
     runs: options.runs,
     warmup,
     label: options.label,
     verifyFresh: options.verifyFresh,
   });
-  const paths = await writeArtifacts({ bundle, html, out: options.out });
+  const paths = await writeArtifacts({ bundle, html, out: options.out, bundleName });
   console.log(`bundle: ${paths.bundlePath}`);
   console.log(`page: ${paths.htmlPath}`);
 
@@ -2015,7 +2653,8 @@ async function main() {
         : "dsh-jump bench: 未检测到本机 Chrome，未采集读数。",
     );
     console.log(
-      "用真实浏览器打开上面的页面：页面会自动跑完每一档，把含 frameBudgetMs / maxFrameMs / overBudgetFrames / verdict 的 JSON 打在页面上。",
+      "用真实浏览器打开上面的页面：页面会自动跑完每一档，把含 attributedPluginMs / activationEventDurationMs / " +
+        "verdictAttributed / judgeable 的 JSON 打在页面上。",
     );
     if (options.verifyFresh) {
       console.log("--verify-fresh 的新鲜度自检由页面在每档结束时执行；没有脚本可驱动的浏览器时脚本以 0 退出。");
@@ -2026,19 +2665,25 @@ async function main() {
   const collected = await runTiersInChrome({
     chrome,
     pagePath: paths.htmlPath,
+    bundleName,
     candidates: options.candidates,
     verifyFresh: options.verifyFresh,
   });
   const result = collected.result;
-  console.log("driver: chrome-cdp (fresh browser context per tier)");
+  console.log("driver: chrome-cdp (headless, fresh browser context per tier)");
   for (const tier of result.runs) {
     console.log(
       `tier ${String(tier.candidates)}: frameBudgetMs ${String(tier.frameBudgetMs)}` +
-        ` maxFrameMs ${String(tier.maxFrameMs)}` +
-        ` overBudgetFrames ${String(tier.overBudgetFrames)}/${String(tier.frameCount)} (${String(tier.overBudgetPct)}%)` +
-        ` idle ${String(tier.idleOverBudgetFrames)}/${String(tier.idleFrameCount)} (${String(tier.idleOverBudgetPct)}%)` +
-        ` excess ${String(tier.excessOverBudgetPct)}pp` +
-        ` verdict ${String(tier.verdict)}`,
+        ` attributed p50/p99/max ${String(tier.attributedPluginMs.p50)}/${String(tier.attributedPluginMs.p99)}/${String(tier.attributedPluginMs.max)}ms` +
+        ` frames ${String(tier.attributedFrames)} excluded ${String(tier.excludedLongFrames)}` +
+        ` activation p50/p95/max ${String(tier.activationEventDurationMs.p50)}/${String(tier.activationEventDurationMs.p95)}/${String(tier.activationEventDurationMs.max)}ms` +
+        ` samples ${String(tier.activationEventSamples)}` +
+        ` judgeable ${String(tier.judgeable)} verdictAttributed ${String(tier.verdictAttributed)}`,
+    );
+    console.log(
+      `tier ${String(tier.candidates)}: legacy overBudget ${String(tier.overBudgetFrames)}/${String(tier.frameCount)}` +
+        ` idle ${String(tier.idleOverBudgetFrames)}/${String(tier.idleFrameCount)}` +
+        ` excess ${String(tier.excessOverBudgetPct)}pp verdict ${String(tier.verdict)} (trend only)`,
     );
   }
   if (options.archive !== null) {
