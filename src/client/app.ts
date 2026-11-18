@@ -16,11 +16,11 @@ import {
   type JumpBindings,
   type JumpPlatform,
 } from "./bindings.ts";
-import { collectHints, type Hint } from "./hints.ts";
+import { createHintScan, type Hint, type HintScan } from "./hints.ts";
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
-import { createOverlay, type FrameClock, type ProgressiveRender } from "./overlay.ts";
+import { createOverlay, type FrameClock } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 import { isUserReachable } from "./reach.ts";
 
@@ -81,6 +81,14 @@ export interface AppDeps {
    * synchronous limit never ask for a frame.
    */
   frameClock?: FrameClock;
+  /**
+   * Display frame budget in ms, injected by a bench or a test.
+   *
+   * A normal page leaves it unset and gets the value the embedding page
+   * publishes (the bench measures the display once and exposes it as
+   * `__DSH_JUMP_FRAME_BUDGET_MS__`), falling back to 60Hz.
+   */
+  frameBudgetMs?: number;
 }
 
 export interface JumpApp {
@@ -113,6 +121,54 @@ function defaultIsVisible(element: Element): boolean {
   // chain) is the stacked-background-card shape: a label there would send the
   // synthetic click to a button no user can see or hit.
   return rendered && isUserReachable(element);
+}
+
+/**
+ * The 60Hz fallback for a page that publishes no display budget.
+ *
+ * A hidden page, a host without requestAnimationFrame and a first activation
+ * before any measurement all land here; the collection chunk is still capped
+ * to a fraction of a frame, so a wrong guess only makes the walk slower, never
+ * longer than the budget.
+ */
+const FALLBACK_FRAME_BUDGET_MS = 16.7;
+
+/**
+ * Share of a display frame the collection walk may spend.
+ *
+ * The activation frame also has to paint the first badges and leave room for
+ * the host. At the measured 143Hz cadence this is about 0.8ms, at 60Hz the
+ * absolute cap keeps it at 1.5ms; both are inside the 1-2ms target.
+ */
+const COLLECT_BUDGET_SHARE = 0.12;
+const COLLECT_BUDGET_MAX_MS = 1.5;
+const COLLECT_BUDGET_MIN_MS = 0.4;
+
+/** The display cadence the bench publishes, or the 60Hz fallback. */
+function publishedFrameBudget(): number {
+  const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: unknown };
+  const value = host.__DSH_JUMP_FRAME_BUDGET_MS__;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : FALLBACK_FRAME_BUDGET_MS;
+}
+
+function collectBudgetMs(frameBudget: number): number {
+  return Math.min(Math.max(frameBudget * COLLECT_BUDGET_SHARE, COLLECT_BUDGET_MIN_MS), COLLECT_BUDGET_MAX_MS);
+}
+
+/** The browser's frame clock, or undefined where the host has no frames. */
+function defaultFrameClock(doc: Document): FrameClock | undefined {
+  const view = doc.defaultView;
+  if (view === null) return undefined;
+  const request = view.requestAnimationFrame?.bind(view);
+  const cancel = view.cancelAnimationFrame?.bind(view);
+  if (typeof request !== "function" || typeof cancel !== "function") return undefined;
+  return {
+    now: () => view.performance.now(),
+    request,
+    cancel,
+  };
 }
 
 /** Click-mode dispatch: the full pointer/mouse sequence a real user produces. */
@@ -198,6 +254,14 @@ function focusTextEntry(element: Element, doc: Document): void {
   selection.addRange(range);
 }
 
+/** One round's stage A walk, from activation to painted labels. */
+interface CollectorRound {
+  readonly scan: HintScan;
+  handle: number | undefined;
+  cancelled: boolean;
+  resolve: () => void;
+}
+
 /** The navigator's platform string, or "" where the host has none. */
 function navigatorPlatform(): string {
   return globalThis.navigator?.platform ?? "";
@@ -222,11 +286,11 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     clock: deps.frameClock,
   });
   /**
-   * The round whose batches may still be queued. `settled()` waits on it; the
-   * cancellation paths in the overlay resolve it, so a caller never hangs on a
-   * round that was torn down.
+   * The promise of the current collection round, resolved when its badges are
+   * painted or the round is cancelled. Kept outside `apply` so `settled()` can
+   * answer before the listener is installed.
    */
-  let currentRound: ProgressiveRender | undefined;
+  let roundSettled: Promise<void> = Promise.resolve();
 
   /**
    * Drop whatever currently holds focus before a round starts.
@@ -243,25 +307,9 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     active.blur();
   }
 
-  function collectRound(): Hint[] {
-    releaseFocus();
-    // Snapshot semantics: hints are computed once per activation, so DOM
-    // churn afterwards never moves labels under a half-typed prefix (v1).
-    const hints = collectHints(
-      () => Array.from(win.document.querySelectorAll(config.candidateSelector)),
-      { width: win.innerWidth, height: win.innerHeight },
-      { isVisible, memory },
-    );
-    // Labels are complete before this call and painting is synchronous for any
-    // realistic round, so a keystroke on the activation frame already reaches
-    // every label.
-    currentRound = overlay.renderProgressive(hints, "");
-    return hints;
-  }
-
   return {
     settled(): Promise<void> {
-      return currentRound?.done ?? Promise.resolve();
+      return roundSettled;
     },
     labels(): readonly string[] {
       return overlay.labels();
@@ -273,6 +321,113 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       const state = createKeyState();
       let hints: Hint[] = [];
       let roundOpen = false;
+      const collectClock = deps.frameClock ?? defaultFrameClock(win.document);
+      const injectedBudget = deps.frameBudgetMs;
+      const budgetMs = collectBudgetMs(
+        typeof injectedBudget === "number" && Number.isFinite(injectedBudget) && injectedBudget > 0
+          ? injectedBudget
+          : publishedFrameBudget(),
+      );
+      /** The stage A walk still in flight, if any. */
+      let collecting: CollectorRound | undefined;
+
+      /**
+       * Stop the in-flight stage A walk, if one exists.
+       *
+       * Every cancellation path goes through here: Esc, a completed label, the
+       * activation chord again, a hidden page and teardown. Resolving the
+       * round here is what keeps `settled()` from hanging on a walk that will
+       * never finish.
+       */
+      function cancelCollection(): void {
+        const round = collecting;
+        if (round === undefined) return;
+        collecting = undefined;
+        round.cancelled = true;
+        if (round.handle !== undefined) {
+          collectClock?.cancel(round.handle);
+          round.handle = undefined;
+        }
+        round.resolve();
+      }
+
+      /**
+       * Stage A is over: settle labels and paint them.
+       *
+       * `finish` is the one synchronous step of the round, but it works on the
+       * candidate array only, so its cost does not scale with DOM depth.
+       */
+      function commitCollection(round: CollectorRound): void {
+        if (round.cancelled) return;
+        const next = round.scan.finish();
+        hints = next;
+        const render = overlay.renderProgressive(next, "");
+        // A synchronous paint is the common case: resolve in this frame so a
+        // caller awaiting `settled()` after activation does not need a turn.
+        if (overlay.visibleLabels().length >= next.length) {
+          round.resolve();
+          return;
+        }
+        void render.done.then(() => round.resolve());
+      }
+
+      /** Queue the next stage A slice on the next frame. */
+      function scheduleCollection(round: CollectorRound): void {
+        const frameClock = collectClock;
+        if (frameClock === undefined) return;
+        round.handle = frameClock.request(() => {
+          round.handle = undefined;
+          if (round.cancelled || collecting !== round) return;
+          if (!round.scan.advance(budgetMs, () => frameClock.now())) {
+            scheduleCollection(round);
+            return;
+          }
+          collecting = undefined;
+          commitCollection(round);
+        });
+      }
+
+      /**
+       * Start collection for one activation.
+       *
+       * The first slice runs inside the activation frame; a small page finishes
+       * there and paints immediately. A large one returns an empty hint array
+       * and keeps walking on later frames, then paints the whole round at once:
+       * labels cannot be issued before the total count and visual order are
+       * known, so partial painting would only show labels that later change.
+       */
+      function collectRound(): Hint[] {
+        cancelCollection();
+        releaseFocus();
+        hints = [];
+        // Snapshot semantics: hints are computed once per activation, so DOM
+        // churn afterwards never moves labels under a half-typed prefix (v1).
+        const scan = createHintScan(
+          () => Array.from(win.document.querySelectorAll(config.candidateSelector)),
+          { width: win.innerWidth, height: win.innerHeight },
+          { isVisible, memory },
+        );
+        let resolve: () => void = () => undefined;
+        const promise = new Promise<void>((done) => {
+          resolve = done;
+        });
+        roundSettled = promise;
+        const round: CollectorRound = { scan, handle: undefined, cancelled: false, resolve };
+        collecting = round;
+        if (collectClock === undefined) {
+          scan.advance(Number.POSITIVE_INFINITY);
+          collecting = undefined;
+          commitCollection(round);
+          return hints;
+        }
+        if (scan.advance(budgetMs, () => collectClock.now())) {
+          collecting = undefined;
+          commitCollection(round);
+          return hints;
+        }
+        scheduleCollection(round);
+        return hints;
+      }
 
       const openRound = (): void => {
         if (roundOpen) return;
@@ -341,6 +496,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         }
         if (action.type === "exit") {
           hints = [];
+          cancelCollection();
           overlay.destroy();
           closeRound();
           return;
@@ -361,6 +517,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const typed = before + action.key;
         const hit = hints.find((hint) => hint.label === typed);
         hints = [];
+        cancelCollection();
         overlay.destroy();
         closeRound();
         const mode = state.mode;
@@ -399,6 +556,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       const onVisibility = (): void => {
         if (win.document.visibilityState !== "hidden") return;
         hints = [];
+        cancelCollection();
         overlay.destroy();
         state.mode = "idle";
         state.pending = "";
@@ -413,6 +571,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
         win.document.removeEventListener("visibilitychange", onVisibility);
         win.removeEventListener("pagehide", onPageHide);
+        cancelCollection();
         overlay.destroy();
         hints = [];
         closeRound();

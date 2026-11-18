@@ -133,65 +133,180 @@ function visualOrder<T extends { rect: HintRect }>(entries: readonly T[]): T[] {
   return rows.flatMap((row) => [...row].sort((a, b) => a.rect.x - b.rect.x));
 }
 
+/** A candidate that survived stage A, with its geometry and identity key. */
+export interface ScannedCandidate {
+  readonly element: Element;
+  readonly rect: HintRect;
+  /** Identity of the element for label recall; "" when no memory is in play. */
+  readonly key: string;
+}
+
 /**
- * Filter candidates to the visible viewport, keep only the deepest element on
- * any ancestor chain (clicking a button inside a button must hit the inner
- * one), and assign labels in visual order. Labels are decided only after the
- * final candidate array exists so the whole round shares one label length.
+ * Stage A of one round: a resumable walk of the candidate snapshot.
  *
- * A label already spent on a candidate last round is handed back to it first,
- * and the rest of the stream fills the gaps. The stream is walked in order and
- * a remembered label is skipped when it is already taken, so the labels left
- * over stay a prefix of the stream and no label is ever issued twice.
+ * The walk is split because the reader pays for it on the activation frame.
+ * Geometry is read first and the survivors are ordered by y then x, a cheap
+ * approximation of reading order that costs one array sort; the expensive
+ * reachability and identity walks then run in that order. Every call to
+ * `advance` stops on a time budget, so the caller decides how much of the page
+ * a frame may touch.
+ *
+ * Stage A never decides a label: total count and full visual order are only
+ * known once it is over, and `finish` is where that decision belongs.
  */
-export function collectHints(
+export interface HintScan {
+  /** Candidates the selector returned for this round. */
+  readonly total: number;
+  /** Elements whose geometry has been read so far. */
+  readonly scanned: number;
+  /** Stage A is over; `finish` may run. */
+  readonly ready: boolean;
+  /**
+   * Run stage A until `budgetMs` of measured time is spent or the walk ends.
+   * Returns true when the scan is ready for `finish`.
+   */
+  advance(budgetMs: number, now?: () => number): boolean;
+  /**
+   * Stage B: sort, decide the round's label length, recall and assign labels.
+   * Pure array work on the candidates stage A collected; it never reads layout
+   * or style, which is what keeps it out of the frame budget's way.
+   */
+  finish(): Hint[];
+}
+
+/** Wall clock used when a caller does not inject one (tests do). */
+function defaultNow(): number {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
+}
+
+export function createHintScan(
   selectCandidates: () => Element[],
   viewport: { width: number; height: number },
   deps: CollectDeps,
-): Hint[] {
-  const kept: { element: Element; rect: HintRect }[] = [];
-  for (const element of selectCandidates()) {
+): HintScan {
+  const elements = selectCandidates();
+  // The raw snapshot, not the kept set: an ancestor that is a candidate but
+  // was itself filtered out can still never be a wrapper of a kept element, so
+  // marking against the snapshot and intersecting at the end is the same set
+  // as comparing only kept candidates.
+  const raw = new Set(elements);
+  const measured: { element: Element; rect: HintRect }[] = [];
+  const kept: ScannedCandidate[] = [];
+  const wrappers = new Set<Element>();
+  const memory = deps.memory;
+  const identity = deps.identity ?? identityKey;
+  let measureIndex = 0;
+  let filterIndex = 0;
+  let ordered = false;
+  let ready = false;
+  let finished: Hint[] | undefined;
+
+  function measureOne(): void {
+    const element = elements[measureIndex] as Element;
+    measureIndex += 1;
     const rect = element.getBoundingClientRect();
     // Zero-area rects (display:none stubs, collapsed cells) never intersect
     // usefully, and the strict comparisons below drop them for free.
-    const visible =
+    if (
       rect.width > 0 &&
       rect.height > 0 &&
       rect.x < viewport.width &&
       rect.x + rect.width > 0 &&
       rect.y < viewport.height &&
-      rect.y + rect.height > 0;
-    if (visible && deps.isVisible(element)) {
-      kept.push({ element, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } });
+      rect.y + rect.height > 0
+    ) {
+      measured.push({ element, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } });
     }
   }
-  // A candidate that contains another candidate is a wrapper; the deepest
-  // target wins. Marking ancestors is the same set as comparing every pair —
-  // `contains` means exactly "is an ancestor of" — but it costs O(n · depth)
-  // instead of O(n²). That quadratric scan is what the reader feels as a pause
-  // before the labels appear: measured 47ms of main thread at 1200 visible
-  // candidates, against 0.4ms here, and the cost grows with the square of a
-  // busy page rather than with its depth.
-  const candidates = new Set(kept.map(({ element }) => element));
-  const wrappers = new Set<Element>();
-  for (const { element } of kept) {
-    for (let ancestor = element.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
-      if (candidates.has(ancestor)) wrappers.add(ancestor);
+
+  function filterOne(): void {
+    const entry = measured[filterIndex] as { element: Element; rect: HintRect };
+    filterIndex += 1;
+    if (!deps.isVisible(entry.element)) return;
+    // A candidate that contains another candidate is a wrapper; the deepest
+    // target wins. Marking ancestors is the same set as comparing every pair —
+    // `contains` means exactly "is an ancestor of" — but it costs O(n · depth)
+    // instead of O(n²). That quadratric scan is what the reader feels as a
+    // pause before the labels appear: measured 47ms of main thread at 1200
+    // visible candidates, against 0.4ms here, and the cost grows with the
+    // square of a busy page rather than with its depth.
+    for (let ancestor = entry.element.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+      if (raw.has(ancestor)) wrappers.add(ancestor);
     }
+    kept.push({
+      element: entry.element,
+      rect: entry.rect,
+      // Read here rather than in stage B: identity walks the ancestor chain and
+      // normalises text, the expensive half of collection, so it belongs inside
+      // the budgeted pass. Without a memory neither recall nor write-back reads
+      // a key, so the round pays nothing for one.
+      key: memory === undefined ? "" : identity(entry.element),
+    });
   }
+
+  return {
+    total: elements.length,
+    get scanned(): number {
+      return measureIndex;
+    },
+    get ready(): boolean {
+      return ready;
+    },
+    advance(budgetMs: number, now: () => number = defaultNow): boolean {
+      if (ready) return true;
+      const start = now();
+      let worked = false;
+      while (measureIndex < elements.length) {
+        // The check runs before the next unit, never after the last: spending
+        // the budget on one candidate is what guarantees forward progress even
+        // when the budget is zero.
+        if (worked && now() - start >= budgetMs) return false;
+        measureOne();
+        worked = true;
+      }
+      if (!ordered) {
+        measured.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+        ordered = true;
+      }
+      while (filterIndex < measured.length) {
+        if (worked && now() - start >= budgetMs) return false;
+        filterOne();
+        worked = true;
+      }
+      ready = true;
+      return true;
+    },
+    finish(): Hint[] {
+      if (finished !== undefined) return finished;
+      if (!ready) throw new Error("dsh-jump: hint scan is not ready");
+      finished = finalizeHints(kept, wrappers, deps);
+      return finished;
+    },
+  };
+}
+
+/**
+ * Stage B: settle the round's labels from stage A's candidates.
+ *
+ * Labels are decided only after the final candidate array and its visual order
+ * exist, so the whole round shares one label length. A label already spent on a
+ * candidate last round is handed back to it first, and the rest of the stream
+ * fills the gaps. The stream is walked in order and a remembered label is
+ * skipped when it is already taken, so the labels left over stay a prefix of the
+ * stream and no label is ever issued twice.
+ */
+function finalizeHints(
+  kept: readonly ScannedCandidate[],
+  wrappers: ReadonlySet<Element>,
+  deps: CollectDeps,
+): Hint[] {
   const deepest = kept.filter(({ element }) => !wrappers.has(element));
   const ordered = visualOrder(deepest);
   const keys = keysPerLabel(ordered.length);
   const memory = deps.memory;
-  const identity = deps.identity ?? identityKey;
-  // One key per candidate for the whole round: recall groups by it and the
-  // write-back needs the same value, while each computation walks the ancestor
-  // chain and normalises the text, which a page with a thousand candidates
-  // cannot afford to repeat. Without a memory neither path reads a key, so the
-  // round pays nothing for one.
   const identityKeys = new Map<Element, string>();
   if (memory !== undefined) {
-    for (const { element } of ordered) identityKeys.set(element, identity(element));
+    for (const entry of ordered) identityKeys.set(entry.element, entry.key);
   }
   const recalled = memory === undefined
     ? new Map<Element, string>()
@@ -213,4 +328,21 @@ export function collectHints(
     for (const hint of hints) memory.record(identityKeys.get(hint.element) ?? "", hint.label);
   }
   return hints;
+}
+
+/**
+ * One-shot collection: the whole page in a single call.
+ *
+ * Kept for callers that have no frame to spread the walk over (tests, small
+ * pages, hosts without requestAnimationFrame). The app uses `createHintScan`
+ * directly so the activation frame only pays for the first batch.
+ */
+export function collectHints(
+  selectCandidates: () => Element[],
+  viewport: { width: number; height: number },
+  deps: CollectDeps,
+): Hint[] {
+  const scan = createHintScan(selectCandidates, viewport, deps);
+  scan.advance(Number.POSITIVE_INFINITY);
+  return scan.finish();
 }

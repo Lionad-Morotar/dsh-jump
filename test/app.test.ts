@@ -9,6 +9,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpApp, type JumpWindow } from "../src/client/app.ts";
+import type { FrameClock } from "../src/client/overlay.ts";
 import { generateLabels } from "../src/client/hints.ts";
 import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 
@@ -1297,5 +1298,212 @@ describe("progressive cancellation surfaces", () => {
     teardown();
     expect(overlayRoot()).toBeNull();
     expect(app.labels()).toEqual([]);
+  });
+});
+
+/**
+ * 可控帧钟：每读一次 now 就走 0.1ms，模拟一枚候选的采集成本。
+ *
+ * 采集预算按真实时间判停，所以测试不再硬编码「每块多少枚」；`frame()` 只
+ * 推进调用方排队的那一帧，没有帧就什么都没发生。
+ */
+class StepClock implements FrameClock {
+  time = 0;
+  private seq = 0;
+  private callbacks = new Map<number, (time: number) => void>();
+
+  now(): number {
+    this.time += 0.1;
+    return this.time;
+  }
+
+  request(callback: (time: number) => void): number {
+    this.seq += 1;
+    this.callbacks.set(this.seq, callback);
+    return this.seq;
+  }
+
+  cancel(handle: number): void {
+    this.callbacks.delete(handle);
+  }
+
+  frame(): void {
+    const batch = [...this.callbacks.values()];
+    this.callbacks.clear();
+    for (const callback of batch) callback(this.time);
+  }
+
+  get pending(): number {
+    return this.callbacks.size;
+  }
+}
+
+/** 给每个候选的矩形读取装计数器，用来观察激活帧到底碰了多少个元素。 */
+function trackRects(els: readonly HTMLElement[]): { count: () => number } {
+  let reads = 0;
+  for (const el of els) {
+    const original = el.getBoundingClientRect.bind(el);
+    el.getBoundingClientRect = () => {
+      reads += 1;
+      return original();
+    };
+  }
+  return { count: () => reads };
+}
+
+/** 把排队中的采集帧全部跑完，再等浮层画完。 */
+async function drain(app: JumpApp, clock: StepClock): Promise<void> {
+  for (let i = 0; i < 5000 && clock.pending > 0; i += 1) clock.frame();
+  await app.settled();
+}
+
+describe("采集分块", () => {
+  it("激活帧只读第一批候选的矩形，后续帧补齐全部标签", async () => {
+    const els = gridButtons(500);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    const firstFrame = reads.count();
+    expect(firstFrame).toBeGreaterThan(0);
+    expect(firstFrame).toBeLessThan(200);
+    expect(clock.pending).toBeGreaterThan(0);
+
+    await drain(app, clock);
+    expect(app.labels()).toHaveLength(500);
+    teardown();
+  });
+
+  it("分块补齐后的标签序列与一次性采集完全一致", async () => {
+    const els = gridButtons(300);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+    await drain(app, clock);
+    const chunked = [...app.labels()];
+    teardown();
+
+    doc.body.replaceChildren();
+    gridButtons(300);
+    const syncApp = createApp({ window: win, isVisible: () => true });
+    const syncTeardown = syncApp.apply();
+    activate();
+    expect([...syncApp.labels()]).toEqual(chunked);
+    syncTeardown();
+  });
+
+  it("82 个候选跨过两键容量后整轮仍是三键", async () => {
+    gridButtons(82);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+    expect(clock.pending).toBeGreaterThan(0);
+    await drain(app, clock);
+
+    const labels = [...app.labels()];
+    expect(labels).toHaveLength(82);
+    expect(new Set(labels.map((label) => label.length))).toEqual(new Set([3]));
+    expect(new Set(labels).size).toBe(82);
+    teardown();
+  });
+
+  it("Esc 中断在途采集：后续帧不再读任何矩形，浮层移除", async () => {
+    const els = gridButtons(500);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    clock.frame();
+    expect(clock.pending).toBeGreaterThan(0);
+    const before = reads.count();
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    expect(overlayRoot()).toBeNull();
+    expect(clock.pending).toBe(0);
+
+    for (let i = 0; i < 10; i += 1) clock.frame();
+    expect(reads.count()).toBe(before);
+    expect(app.labels()).toEqual([]);
+    teardown();
+  });
+
+  it("页面隐藏与 dispose 都中断在途采集", async () => {
+    const els = gridButtons(500);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    clock.frame();
+    const beforeHidden = reads.count();
+    Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
+    try {
+      doc.dispatchEvent(new dom.window.Event("visibilitychange"));
+      expect(overlayRoot()).toBeNull();
+      expect(clock.pending).toBe(0);
+      for (let i = 0; i < 10; i += 1) clock.frame();
+      expect(reads.count()).toBe(beforeHidden);
+    } finally {
+      delete (doc as unknown as Record<string, unknown>)["visibilityState"];
+    }
+
+    activate();
+    clock.frame();
+    const beforeDispose = reads.count();
+    teardown();
+    expect(clock.pending).toBe(0);
+    for (let i = 0; i < 10; i += 1) clock.frame();
+    expect(reads.count()).toBe(beforeDispose);
+  });
+
+  it("重激活路径中断旧采集，并从新的一轮重新开始", () => {
+    const els = gridButtons(500);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    clock.frame();
+    expect(clock.pending).toBeGreaterThan(0);
+    const beforeExit = reads.count();
+
+    // 激活和弦再按一次：本轮退出，在途采集必须一起停。
+    win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+    expect(overlayRoot()).toBeNull();
+    expect(clock.pending).toBe(0);
+    for (let i = 0; i < 10; i += 1) clock.frame();
+    expect(reads.count()).toBe(beforeExit);
+
+    // 再激活是全新一轮，从第一个候选重新读。
+    activate();
+    expect(reads.count()).toBeGreaterThan(beforeExit);
+    expect(clock.pending).toBeGreaterThan(0);
+    teardown();
+  });
+
+  it("分块采集完成后仍能敲标签命中并收尾", async () => {
+    const els = gridButtons(300);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+    await drain(app, clock);
+
+    const label = [...generateLabels(3)][299] as string;
+    const target = els[299] as HTMLElement;
+    const hits: string[] = [];
+    target.addEventListener("click", () => hits.push("click"));
+    for (const key of label) win.dispatchEvent(keydown({ key }));
+    expect(hits).toEqual(["click"]);
+    expect(overlayRoot()).toBeNull();
+    teardown();
   });
 });

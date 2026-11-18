@@ -8,7 +8,7 @@
 import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { collectHints } from "../src/client/hints.ts";
+import { collectHints, createHintScan } from "../src/client/hints.ts";
 import { createLabelMemory } from "../src/client/identity.ts";
 import { CANDIDATE_SELECTOR, HOME_ROW_KEYS } from "../src/client/config.ts";
 
@@ -396,5 +396,87 @@ describe("nesting dedupe over a busy page", () => {
     }
     const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
     expect(hints).toHaveLength(600);
+  });
+});
+
+describe("分块采集", () => {
+  /** 一排按钮，按 DOM 顺序与视觉顺序相反摆放也能区分遍历顺序。 */
+  function grid(count: number): Element[] {
+    const els: Element[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const el = document.createElement("button");
+      place(el, (i % 30) * 12, Math.floor(i / 30) * 12);
+      document.body.append(el);
+      els.push(el);
+    }
+    return els;
+  }
+
+  /**
+   * 把一次扫描切到 `slices` 块跑完。
+   *
+   * `now` 每被读一次就走 1ms，预算因此按「时间」而不是按元素数停：块数不由
+   * 调用方硬编码，和真实调度器用同一套判据。
+   */
+  function chunkedLabels(els: Element[], slices: number): { labels: string[]; calls: number } {
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    let tick = 0;
+    let calls = 0;
+    const budget = slices === 1 ? Number.POSITIVE_INFINITY : (els.length * 2) / slices;
+    while (!scan.advance(budget, () => tick++)) calls += 1;
+    calls += 1;
+    return { labels: scan.finish().map((hint) => hint.label), calls };
+  }
+
+  it("分一块与分多块得到完全相同的标签序列", () => {
+    const els = grid(90);
+    const one = chunkedLabels(els, 1);
+    const five = chunkedLabels(els, 5);
+    expect(five.calls).toBeGreaterThan(2);
+    expect(five.labels).toEqual(one.labels);
+    expect(five.labels).toHaveLength(90);
+  });
+
+  it("82 个候选分块补齐后整轮仍是三键，不会停在两键", () => {
+    // 81 是两键容量的边界；分块中间态如果提前定长度，就会先发两键标签。
+    const els = grid(82);
+    const { labels } = chunkedLabels(els, 5);
+    expect(new Set(labels.map((label) => label.length))).toEqual(new Set([3]));
+    expect(new Set(labels).size).toBe(82);
+  });
+
+  it("阶段 A 的可见性遍历按视觉近似序（y 再 x），不是 DOM 序", () => {
+    // DOM 里先放右下、后放左上；廉价的 y/x 近似要先把左上送进可见性判定。
+    const bottom = document.createElement("button");
+    place(bottom, 200, 100);
+    const topRight = document.createElement("button");
+    place(topRight, 200, 0);
+    const topLeft = document.createElement("button");
+    place(topLeft, 0, 0);
+    document.body.append(bottom, topRight, topLeft);
+    const asked: Element[] = [];
+    const scan = createHintScan(select(bottom, topRight, topLeft), VIEWPORT, {
+      isVisible: (el) => {
+        asked.push(el);
+        return true;
+      },
+    });
+    scan.advance(Number.POSITIVE_INFINITY, () => 0);
+    expect(asked).toEqual([topLeft, topRight, bottom]);
+    expect(scan.finish().map((hint) => hint.element)).toEqual([topLeft, topRight, bottom]);
+  });
+
+  it("预算用尽时停在块边界，扫描进度可续", () => {
+    const els = grid(60);
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    let tick = 0;
+    const first = scan.advance(1, () => tick++);
+    expect(first).toBe(false);
+    expect(scan.scanned).toBeLessThan(els.length);
+    while (!scan.advance(1, () => tick++)) {
+      // 逐块推进直到阶段 A 完成。
+    }
+    expect(scan.scanned).toBe(els.length);
+    expect(scan.finish()).toHaveLength(60);
   });
 });
