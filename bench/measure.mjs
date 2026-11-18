@@ -13,10 +13,11 @@
  * no loader, no network. Opening the file is the whole setup.
  */
 import { build } from "esbuild";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = join(HERE, "..");
@@ -130,6 +131,7 @@ export function parseArgs(argv) {
     warmup: null,
     label: null,
     out: null,
+    archive: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -141,7 +143,14 @@ export function parseArgs(argv) {
       options.help = true;
       continue;
     }
-    if (flag === "--candidates" || flag === "--runs" || flag === "--warmup" || flag === "--label" || flag === "--out") {
+    if (
+      flag === "--candidates" ||
+      flag === "--runs" ||
+      flag === "--warmup" ||
+      flag === "--label" ||
+      flag === "--out" ||
+      flag === "--archive"
+    ) {
       const value = argv[index + 1];
       if (value === undefined || value === "") throw new Error(`${flag} needs a value`);
       index += 1;
@@ -149,6 +158,7 @@ export function parseArgs(argv) {
       else if (flag === "--runs") options.runs = parseRuns(value);
       else if (flag === "--warmup") options.warmup = parseWarmup(value);
       else if (flag === "--label") options.label = parseLabel(value);
+      else if (flag === "--archive") options.archive = value;
       else options.out = value;
       continue;
     }
@@ -158,17 +168,24 @@ export function parseArgs(argv) {
 }
 
 /**
- * Bundle `createApp` as a browser IIFE.
+ * Bundle the pieces the measurement page drives.
  *
  * `entry.ts` is deliberately not the entry: it expects the host ModuleLoader
  * and a seeded React, neither of which exists on the bench page. `app.ts` is
  * the whole DOM-facing surface and depends on no host module, so a virtual
- * entry around it produces an app that a bare page can call.
+ * entry around it produces an app that a bare page can call. `collectHints`,
+ * `createLabelMemory` and `identityKey` are exported for the identity
+ * calibration: the app owns its memory privately, so the page measures the
+ * same pure collection call directly instead of guessing at a count.
  */
 export async function bundleApp() {
   const result = await build({
     stdin: {
-      contents: 'export { createApp } from "./app.ts";',
+      contents:
+        'export { createApp } from "./app.ts";' +
+        'export { collectHints } from "./hints.ts";' +
+        'export { createLabelMemory, identityKey } from "./identity.ts";' +
+        'export { CANDIDATE_SELECTOR } from "./config.ts";',
       resolveDir: CLIENT_ROOT,
       loader: "ts",
       sourcefile: "bench-entry.ts",
@@ -243,10 +260,48 @@ function pageScript(config) {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.benchCandidate = String(index);
+      // The identity path keys on a slot boundary plus the accessible name;
+      // without both, every candidate reports an empty key and the memory
+      // recall and write-back never run on this page.
+      button.setAttribute("aria-label", "bench target " + String(index + 1));
       button.textContent = String(index + 1);
       fragment.append(button);
     }
     root.append(fragment);
+  }
+
+  /**
+   * Count the identity path on this tier's grid.
+   *
+   * The app keeps its label memory and identity oracle private, and widening
+   * createApp deps for a bench is out of scope. Running the same pure
+   * collectHints on the same grid with a counting oracle gives the exact number
+   * of identity calls one activation performs; the first measured activation
+   * checks that count against the labels the app actually paints, so a drifted
+   * fixture fails loudly instead of reporting a made-up number.
+   */
+  function measureIdentity() {
+    if (root.getAttribute("data-slot") !== "bench.grid") {
+      throw new Error("bench grid lost its data-slot boundary; identity keys would all be empty");
+    }
+    const bench = window.${GLOBAL_NAME};
+    const memory = bench.createLabelMemory();
+    let calls = 0;
+    const hints = bench.collectHints(
+      () => Array.from(document.querySelectorAll(bench.CANDIDATE_SELECTOR)),
+      { width: window.innerWidth, height: window.innerHeight },
+      {
+        // The grid only holds visible buttons, and the result is checked
+        // against the app's painted label count before it is reported.
+        isVisible: () => true,
+        memory: memory,
+        identity: (element) => {
+          calls += 1;
+          return bench.identityKey(element);
+        },
+      },
+    );
+    return { calls: calls, labels: hints.length, remembered: memory.size };
   }
 
   function badgeLabels() {
@@ -259,6 +314,8 @@ function pageScript(config) {
   }
 
   function roundMs(value) {
+    // An empty phase has no reading at all; rounding null would print 0ms.
+    if (value === null) return null;
     return Math.round(value * 1000) / 1000;
   }
 
@@ -307,12 +364,21 @@ function pageScript(config) {
     buildGrid(candidates);
     await settle(2);
 
+    const identity = measureIdentity();
+    // One activation per round; counted rather than derived so the identity
+    // total below multiplies a measured unit by an observed round count.
+    let rounds = 0;
+    const activateRound = async () => {
+      rounds += 1;
+      return stroke("h", { metaKey: true });
+    };
+
     // Every tier gets its own cold start: a new grid invalidates layout, the
     // first round pays JIT and the first label mint pays allocation. Those
     // cycles run the exact measured shape so the warm path is the same path.
     let warmed = 0;
     for (let index = 0; index < CONFIG.warmup; index += 1) {
-      await stroke("h", { metaKey: true });
+      await activateRound();
       const warmBadges = badgeLabels();
       const warmFirst = warmBadges[0];
       if (warmFirst === undefined || warmFirst === "") throw new Error("warmup activation produced no label");
@@ -324,42 +390,74 @@ function pageScript(config) {
 
     const activate = [];
     const firstStroke = [];
+    const secondStroke = [];
     let labels = 0;
     let overlays = 0;
 
     for (let index = 0; index < CONFIG.runs; index += 1) {
-      activate.push(await stroke("h", { metaKey: true }));
+      activate.push(await activateRound());
       const badges = badgeLabels();
       if (index === 0) {
         labels = badges.length;
         overlays = overlayCount();
+        // The calibration must describe the round the app really painted.
+        if (identity.calls !== labels || identity.labels !== labels) {
+          throw new Error(
+            "identity calibration drifted: " + String(identity.calls) + " calls, " +
+              String(identity.labels) + " hints, " + String(labels) + " painted labels",
+          );
+        }
       }
       const first = badges[0];
       if (first === undefined || first === "") throw new Error("activation produced no label");
       firstStroke.push(await stroke(first.slice(0, 1)));
+      // The second stroke is where the dimmed batch really does its work: on a
+      // three-key label it must stay untouched while the live prefix splits
+      // further. A single-key label has no second stroke.
+      const second = first.slice(1, 2);
+      if (second !== "") secondStroke.push(await stroke(second));
       // Resetting outside the timed window keeps one sample's teardown out of
       // the next sample's handler cost.
       exitRound();
       await settle(1);
     }
 
-    // The completion round's activation is setup for the one stroke being
-    // measured, so it stays out of the activation percentiles.
-    await stroke("h", { metaKey: true });
-    const labelsNow = badgeLabels();
-    const completeLabel = labelsNow[0];
-    if (completeLabel === undefined || completeLabel === "") throw new Error("activation produced no completion label");
-    for (const key of completeLabel.slice(0, -1)) window.dispatchEvent(keydown(key));
-    const complete = await stroke(completeLabel.slice(-1));
+    // One full label per sample, with a fresh activation each round, so the
+    // completion reading has the same sample count as every other phase.
+    const complete = [];
+    for (let index = 0; index < CONFIG.runs; index += 1) {
+      await activateRound();
+      const labelsNow = badgeLabels();
+      const completeLabel = labelsNow[0];
+      if (completeLabel === undefined || completeLabel === "") {
+        throw new Error("activation produced no completion label");
+      }
+      for (const key of completeLabel.slice(0, -1)) window.dispatchEvent(keydown(key));
+      complete.push(await stroke(completeLabel.slice(-1)));
+      await settle(1);
+    }
+
+    // Esc tears the whole round down, so the cost scales with the badge count
+    // the previous phases painted. One deliberate exit gets its own reading
+    // instead of hiding inside the untimed reset between samples.
+    await activateRound();
+    const closeNodes = badgeLabels().length;
+    const close = await stroke("Escape");
 
     return {
       candidates: candidates,
       labels: labels,
       overlayCount: overlays,
       warmup: warmed,
+      identityKeys: identity.calls * rounds,
+      identityKeysPerRound: identity.calls,
+      identityRounds: rounds,
+      identityPath: identity.calls > 0 && identity.remembered > 0 ? "active" : "inactive",
       activate: phase(activate),
       firstStroke: phase(firstStroke),
-      complete: phase([complete]),
+      secondStroke: phase(secondStroke),
+      complete: phase(complete),
+      close: { ...phase([close]), nodes: closeNodes },
     };
   }
 
@@ -405,7 +503,7 @@ function pageScript(config) {
 }
 
 export function pageHtml({ bundle, candidates, runs, warmup, label }) {
-  const config = { candidates, runs, warmup, label };
+  const config = { candidates, runs, warmup, label, identityPath: "active" };
   const inlined = bundle.replace(/<\/script/gi, "<\\/script");
   return `<!doctype html>
 <html lang="en">
@@ -458,7 +556,7 @@ export function pageHtml({ bundle, candidates, runs, warmup, label }) {
 </style>
 </head>
 <body>
-<div id="bench-root" data-bench-root></div>
+<div id="bench-root" data-bench-root data-slot="bench.grid"></div>
 <div id="bench-status" data-bench-status>starting</div>
 <pre id="bench-output" data-bench-output></pre>
 <script>${inlined}</script>
@@ -480,6 +578,163 @@ async function writeArtifacts({ bundle, html, out }) {
     await writeFile(htmlPath, html, "utf8");
   }
   return { bundlePath, htmlPath };
+}
+
+/**
+ * Deterministic archive name.
+ *
+ * The label is part of the file name so two sources measured under one protocol
+ * can be told apart without opening the JSON, and it is folded to a safe slug:
+ * `--label` is free text and must not escape the archive directory.
+ */
+export function archiveFileName(label, at = new Date()) {
+  const stamp = at.toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  const slug =
+    label === null || label === undefined
+      ? "unlabeled"
+      : label.replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "");
+  return `dsh-jump-bench-${slug === "" ? "unlabeled" : slug}-${stamp}.json`;
+}
+
+/** Write one archived result, creating the directory the reader named. */
+export async function writeArchive(dir, fileName, payload) {
+  const target = join(resolve(process.cwd(), dir), fileName);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return target;
+}
+
+/**
+ * Archive mode drives the page itself.
+ *
+ * The repo ships no browser driver and the page cannot write files, so the
+ * only way to archive real readings is to run the generated page from here.
+ * Playwright and Puppeteer are not dependencies, so this speaks the DevTools
+ * protocol to a local Chrome over its loopback port; Node's built-in WebSocket
+ * keeps the install surface untouched. Foreground runs stay the reference for
+ * comparable numbers, while two archive runs share this automated protocol.
+ */
+async function findChrome() {
+  const candidates = [
+    process.env.CHROME_PATH,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  ];
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === "") continue;
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // Keep looking.
+    }
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readDevtoolsPort(profile) {
+  const file = join(profile, "DevToolsActivePort");
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    try {
+      const [port] = (await readFile(file, "utf8")).trim().split("\n");
+      if (port !== undefined && port !== "") return Number(port);
+    } catch {
+      // Chrome is still writing the profile.
+    }
+    await sleep(100);
+  }
+  throw new Error("Chrome never published its DevTools port");
+}
+
+async function openCdp(url) {
+  const socket = new WebSocket(url);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener("error", () => reject(new Error("cannot open the DevTools socket")), { once: true });
+  });
+  let nextId = 1;
+  const pending = new Map();
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    const waiter = pending.get(message.id);
+    if (waiter === undefined) return;
+    pending.delete(message.id);
+    if (message.error) waiter.reject(new Error(message.error.message));
+    else waiter.resolve(message.result);
+  });
+  return {
+    send(method, params = {}) {
+      const id = nextId++;
+      socket.send(JSON.stringify({ id, method, params }));
+      return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    },
+    close() {
+      socket.close();
+    },
+  };
+}
+
+async function collectResult(pagePath) {
+  const chrome = await findChrome();
+  if (chrome === null) {
+    throw new Error("--archive needs a local Chrome; set CHROME_PATH to its executable");
+  }
+  const profile = await mkdtemp(join(tmpdir(), "dsh-jump-bench-chrome-"));
+  const child = spawn(
+    chrome,
+    [
+      "--headless=new",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--hide-scrollbars",
+      "--window-size=1440,900",
+      "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`,
+      "about:blank",
+    ],
+    { stdio: "ignore" },
+  );
+  let cdp;
+  try {
+    const port = await readDevtoolsPort(profile);
+    const targets = await (await fetch(`http://127.0.0.1:${String(port)}/json/list`)).json();
+    const target = Array.isArray(targets) ? targets.find((entry) => entry.type === "page") : undefined;
+    if (target === undefined) throw new Error("Chrome exposes no page target");
+    cdp = await openCdp(target.webSocketDebuggerUrl);
+    await cdp.send("Page.enable");
+    await cdp.send("Page.navigate", { url: pathToFileURL(pagePath).href });
+    const deadline = Date.now() + 240000;
+    while (Date.now() < deadline) {
+      await sleep(250);
+      const evaluation = await cdp.send("Runtime.evaluate", {
+        expression:
+          "window.__BENCH_ERROR__ ? { error: window.__BENCH_ERROR__ } :" +
+          " (window.__BENCH_RESULT__ ? { result: window.__BENCH_RESULT__ } : null)",
+        returnByValue: true,
+      });
+      const value = evaluation?.result?.value;
+      if (value === null || value === undefined) continue;
+      if (value.error) throw new Error(`bench page failed: ${String(value.error)}`);
+      return value.result;
+    }
+    throw new Error("bench page did not finish within 240s");
+  } finally {
+    cdp?.close();
+    child.kill("SIGKILL");
+    await rm(profile, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 /**
@@ -518,7 +773,16 @@ const REQUIRED_HOOKS = [
   "__BENCH_RESULT__",
   "nearestRankPercentile",
   "firstStroke",
-  "complete",
+  "secondStroke: phase(",
+  "complete: phase(",
+  "close: {",
+  "identityKeys:",
+  "identityKeysPerRound:",
+  "identityRounds:",
+  "identityPath:",
+  "data-slot=\"bench.grid\"",
+  "bench target ",
+  "aria-label",
   "warmup",
   "protocol",
   "percentileMethod",
@@ -574,9 +838,48 @@ function assertRunsBoundary() {
   if (parseArgs([]).label !== null) throw new Error("label should default to null");
 }
 
+/**
+ * Archive naming and writing, exercised without a browser.
+ *
+ * `--label` is free text from the command line and becomes part of a file name,
+ * so separators are folded to a dash instead of being trusted; an unlabelled
+ * run still gets a name that sorts beside the labelled ones.
+ */
+function assertArchiveContract() {
+  const at = new Date("2026-01-02T03:04:05.000Z");
+  const named = archiveFileName("smoke", at);
+  if (named !== "dsh-jump-bench-smoke-20260102-030405.json") {
+    throw new Error(`archive name for --label smoke is "${named}"`);
+  }
+  if (archiveFileName(null, at) !== "dsh-jump-bench-unlabeled-20260102-030405.json") {
+    throw new Error("an unlabelled run must still produce a filename");
+  }
+  const hostile = archiveFileName("a/b c", at);
+  if (hostile.includes("/") || hostile.includes(" ")) {
+    throw new Error(`--label text leaked a path separator into the archive name: "${hostile}"`);
+  }
+  const parsed = parseArgs(["--archive", "temp/bench-archive"]);
+  if (parsed.archive !== "temp/bench-archive") throw new Error("--archive should reach the output options");
+}
+
+async function assertArchiveWrite() {
+  const dir = await mkdtemp(join(tmpdir(), "dsh-jump-archive-"));
+  try {
+    const payload = { label: "smoke", runs: [{ candidates: 80, identityKeys: 80, identityPath: "active" }] };
+    const target = await writeArchive(dir, archiveFileName("smoke", new Date("2026-01-02T03:04:05.000Z")), payload);
+    const written = JSON.parse(await readFile(target, "utf8"));
+    if (written.label !== "smoke" || written.runs?.[0]?.identityKeys !== 80) {
+      throw new Error("archived JSON did not round-trip");
+    }
+    if (dirname(target) !== dir) throw new Error("archive file was not written inside --archive");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 function assertOfflineSource(source) {
   const specifiers = [...source.matchAll(/^\s*import\s[^;]*?from\s+"([^"]+)"/gm)].map((match) => match[1]);
-  const allowed = new Set(["esbuild", "node:fs/promises", "node:os", "node:path", "node:url"]);
+  const allowed = new Set(["esbuild", "node:child_process", "node:fs/promises", "node:os", "node:path", "node:url"]);
   for (const specifier of specifiers) {
     if (!allowed.has(specifier)) throw new Error(`bench imports "${specifier}", which may reach the network`);
   }
@@ -619,6 +922,7 @@ export async function check() {
     !html.includes(`"runs":${DEFAULT_RUNS}`) ||
     !html.includes(`"warmup":${defaultWarmup}`) ||
     !html.includes('"label":null') ||
+    !html.includes('"identityPath":"active"') ||
     !html.includes('"nearest-rank"')
   ) {
     throw new Error("generated page lost its candidate/run/warmup/label/protocol configuration");
@@ -630,6 +934,10 @@ export async function check() {
 
   assertRunsBoundary();
   console.log("check runs boundary: ok (--runs 1 accepted, p95 warned below the floor)");
+
+  assertArchiveContract();
+  await assertArchiveWrite();
+  console.log("check archive: ok (label naming, directory creation, JSON round-trip)");
 
   assertNoNetworkApis(html, "generated page");
   assertNoNetworkApis(bundle, "bundle");
@@ -648,13 +956,16 @@ function printHelp() {
   node bench/measure.mjs --candidates 80,300,600,1200
   node bench/measure.mjs --runs 60 --warmup 10 --label before
   node bench/measure.mjs --out temp/bench.html
+  node bench/measure.mjs --label before --archive temp/bench-runs
 
 Every tier discards min(10, runs) warmup cycles before sampling; --warmup
 overrides that count. --label is copied into the JSON so two sources measured
 under one protocol can be told apart.
 
 Measurements are taken by opening the generated page in a real browser; the
-page prints its JSON into window.__BENCH_RESULT__ and into the page itself.`);
+page prints its JSON into window.__BENCH_RESULT__ and into the page itself.
+--archive additionally runs that page in headless Chrome and writes the JSON
+it produced to <dir>/dsh-jump-bench-<label>-<stamp>.json.`);
 }
 
 async function main() {
@@ -681,19 +992,26 @@ async function main() {
     label: options.label,
   });
   const paths = await writeArtifacts({ bundle, html, out: options.out });
+  console.log(`bundle: ${paths.bundlePath}`);
+  console.log(`page: ${paths.htmlPath}`);
+
+  if (options.archive !== null) {
+    // The page is the only producer of readings, so archive mode runs it and
+    // stores the JSON it publishes instead of inventing a result here.
+    const result = await collectResult(paths.htmlPath);
+    const archived = await writeArchive(options.archive, archiveFileName(options.label), result);
+    console.log(`archive: ${archived}`);
+    console.log("dsh-jump bench: archived the JSON the page produced in headless Chrome.");
+    return;
+  }
 
   const driver = await detectBrowserDriver();
   if (driver === null) {
-    console.log("dsh-jump bench: no browser driver detected (playwright / puppeteer absent), no readings were taken.");
-    console.log(`bundle: ${paths.bundlePath}`);
-    console.log(`page: ${paths.htmlPath}`);
-    console.log("用真实浏览器打开该文件采集读数：页面会自动跑完每一档并把 JSON 打在页面上。");
+    console.log("dsh-jump bench: no playwright or puppeteer installed, so no readings were taken.");
   } else {
-    console.log(`dsh-jump bench: ${driver} is installed but automatic collection is not wired in this slice.`);
-    console.log(`bundle: ${paths.bundlePath}`);
-    console.log(`page: ${paths.htmlPath}`);
-    console.log("用真实浏览器打开该文件采集读数：页面会自动跑完每一档并把 JSON 打在页面上。");
+    console.log(`dsh-jump bench: ${driver} is installed; --archive still uses the local Chrome driver.`);
   }
+  console.log("用真实浏览器打开该文件采集读数：页面会自动跑完每一档并把 JSON 打在页面上。");
 }
 
 const invokedDirectly = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

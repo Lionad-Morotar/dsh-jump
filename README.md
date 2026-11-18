@@ -253,9 +253,10 @@ stroke of a three-key label. Neither is on the critical path now:
   to 8ms.
 - Badges are keyed by label and updated in place. The lit/dim split is a
   function of the typed prefix alone, so a badge whose prefix did not change is
-  not touched at all; only the badges the prefix rules out get an opacity
-  write, and only the few it still reaches are re-segmented. 5.4ms to 0.1ms per
-  stroke.
+  not touched at all; the badges a stroke rules out only get an opacity write
+  and keep their existing child nodes, because a dim badge and an untyped one
+  both read as one whole-label run. Only the few badges the prefix still
+  reaches are re-segmented. 5.4ms to 0.1ms per stroke.
 - Badges share one containing block. They are `position:absolute` inside a
   container that is `fixed; inset:0` rather than fixed themselves: the viewport
   coordinate system is the same, and the browser tracks one containing block
@@ -281,6 +282,7 @@ node bench/measure.mjs                              # or: pnpm bench
 node bench/measure.mjs --candidates 80,300,600,1200 --runs 60
 node bench/measure.mjs --runs 60 --warmup 10 --label before
 node bench/measure.mjs --out temp/bench.html        # keep the page somewhere
+node bench/measure.mjs --label before --archive temp/bench-runs  # save raw JSON
 node bench/measure.mjs --check                      # CI-safe self-check, no browser
 ```
 
@@ -288,14 +290,29 @@ Open the printed page in a real browser and leave it in the foreground. For
 each candidate tier it lays out a viewport-filling grid of visible buttons,
 then runs `min(10, runs)` full activate → first stroke → Esc cycles and
 discards their readings before timing `runs` activations, `runs` first label
-strokes and one label completion. Warmup is required: without it the first
-tier pays JIT compilation, first layout and GC warmup and reports a cold start
-as a tier cost, so `--warmup <n>` only tunes the count. The JSON is printed at
-the bottom of the page and kept on `window.__BENCH_RESULT__`; copy it from
-there. `--label <name>` fills the top-level `label`, and the result carries a
+strokes, `runs` second label strokes, `runs` complete labels (each on a fresh
+activation) and one Esc exit. The second stroke is the phase where the dimmed
+batch matters: on a three-key label it must stay untouched while the live
+prefix splits further (on a two-key tier it is the completing stroke). The close reading reports the badge count it tore down
+as `nodes`. Warmup is required: without it the first tier pays JIT
+compilation, first layout and GC warmup and reports a cold start as a tier
+cost, so `--warmup <n>` only tunes the count. The JSON is printed at the
+bottom of the page and kept on `window.__BENCH_RESULT__`; copy it from there.
+`--label <name>` fills the top-level `label`, and the result carries a
 top-level `protocol` with `runs`, `warmup`,
 `percentileMethod: "nearest-rank"` and a note that readings are sensitive to
 system load.
+
+Every button on the measurement grid lives under `data-slot="bench.grid"` and
+carries an `aria-label`, so `identityKey` produces non-empty keys and the label
+memory recall and write-back run for real. Each tier reports `identityKeys`
+(identity-oracle calls over all activation rounds of that tier),
+`identityKeysPerRound` (the measured unit: one activation, through
+`collectHints`'s injectable `identity` dependency), `identityRounds` (the
+activations actually dispatched) and `identityPath` (`active` only when those
+calls produced keys the memory recorded). The per-round count is checked
+against the labels the app actually paints, so a drifted fixture fails the tier
+instead of reporting a number nobody measured.
 
 Treat p95 from fewer than 50 samples as a reference only: at 19 or fewer
 samples nearest-rank p95 is literally the maximum, and the bench prints a
@@ -304,20 +321,33 @@ period, alternating between the two sources, because machine load between page
 loads is part of the reading.
 
 A tier reports `candidates`, `labels` (badges actually painted), `warmup`
-(cycles discarded before sampling) and `overlayCount`, which must stay `1`; a
-second runtime would show up as a second overlay and its cost would contaminate
-the reading. Each phase carries both metrics as nearest-rank `p50`/`p95`:
-`handlerMs` is the synchronous `dispatchEvent` cost, `nextFrameMs` is the gap
-from dispatch return to the second animation frame so style and layout land
-before the reading. The phase-level `p50`/`p95` mirror `handlerMs`. Percentiles
-use the nearest rank, not interpolation, so any reading can be recomputed from
-the samples by hand.
+(cycles discarded before sampling), `overlayCount`, which must stay `1`, and
+the identity pair above; a second runtime would show up as a second overlay and
+its cost would contaminate the reading. Each phase carries both metrics as
+nearest-rank `p50`/`p95`: `handlerMs` is the synchronous `dispatchEvent` cost,
+`nextFrameMs` is the gap from dispatch return to the second animation frame so
+style and layout land before the reading. The phase-level `p50`/`p95` mirror
+`handlerMs`. Percentiles use the nearest rank, not interpolation, so any
+reading can be recomputed from the samples by hand.
+
+`--archive <dir>` runs the generated page in headless Chrome through the
+DevTools protocol and writes the JSON it produced to
+`<dir>/dsh-jump-bench-<label>-<stamp>.json` (stamp in UTC), creating the directory if needed.
+The file name carries the label, and an unlabelled run is archived as
+`unlabeled`. Foreground runs remain the reference for cross-machine comparisons;
+two archive runs share one automated protocol, which is what makes them
+comparable to each other. Archive mode needs a local Chrome (`CHROME_PATH`
+overrides the usual install paths) because the page itself cannot write files
+and the repo ships no browser driver.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
-still carries every measurement hook and the warmup/label/protocol
-configuration, exercises the same percentile implementation with fixed inputs,
-checks that `--runs 1` is accepted while its p95 is warned as an invalid
-sample, and fails if the page or the script can reach the network.
+still carries every measurement hook (including `secondStroke`, `close`,
+`identityKeys` and `identityPath`) and the warmup/label/protocol configuration,
+exercises the same percentile implementation with fixed inputs, checks that
+`--runs 1` is accepted while its p95 is warned as an invalid sample, verifies
+archive file naming and a JSON round-trip into a fresh directory, and fails if
+the page or the script imports anything outside the local toolchain allowlist
+(`node:child_process` is there only for the local Chrome archive driver).
 
 ## v1 boundaries
 
