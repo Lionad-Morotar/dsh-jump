@@ -317,6 +317,80 @@ function frameClock(start = 0): FrameClock & { step(ms: number): void; requests(
   };
 }
 
+/**
+ * 帧周期与批成本分开的两个可调量。
+ *
+ * `step` 只推进 rAF 时间戳（帧周期），`spend` 只推进 performance.now（批成本）。
+ * 旧实现用 `step` 同时扮演两者，所以看不到「帧间隔 7ms、批成本 0.5ms」时批量
+ * 不增长这个 bug。真实浏览器里两个量本来就是独立的：帧起点由 vsync 决定，
+ * 批成本由这一批 DOM 写入加样式布局决定。
+ */
+function costClock(start = 0): FrameClock & {
+  step(ms: number): void;
+  spend(ms: number): void;
+  requests(): number;
+} {
+  let frameTime = start;
+  let wallTime = start;
+  let nextHandle = 1;
+  let requests = 0;
+  const queued = new Map<number, (time: number) => void>();
+  return {
+    now: () => wallTime,
+    request: (callback) => {
+      requests += 1;
+      const handle = nextHandle++;
+      queued.set(handle, callback);
+      return handle;
+    },
+    requests: () => requests,
+    cancel: (handle) => {
+      queued.delete(handle);
+    },
+    spend: (ms) => {
+      wallTime += ms;
+    },
+    step: (ms) => {
+      frameTime += ms;
+      wallTime += ms;
+      const due = [...queued.values()];
+      queued.clear();
+      for (const callback of due) callback(frameTime);
+    },
+  };
+}
+
+/**
+ * 让一次整批 append 花掉给定毫秒。
+ *
+ * jsdom 的 DOM 写入本身不耗时，这里把「插入成本」注入到 overlay 容器的
+ * append 上；overlay 在插入前后读 now()，读到的差值就是这批的成本。
+ */
+function chargeBatchAppend(clock: { spend(ms: number): void }, ms: number): () => void {
+  const proto = dom.window.Element.prototype as unknown as {
+    append: (...nodes: (Node | string)[]) => void;
+  };
+  const original = proto.append;
+  proto.append = function (this: Element, ...nodes: (Node | string)[]): void {
+    if (this.hasAttribute("data-dsh-jump-overlay")) clock.spend(ms);
+    original.apply(this, nodes);
+  };
+  return () => {
+    proto.append = original;
+  };
+}
+
+/** 每一帧实际插入的徽章数，首帧也算一格。 */
+function batchDeltas(clock: { step(ms: number): void }, steps: readonly number[]): number[] {
+  const deltas = [badges().length];
+  for (const ms of steps) {
+    const before = badges().length;
+    clock.step(ms);
+    deltas.push(badges().length - before);
+  }
+  return deltas;
+}
+
 function progressiveHints(count: number): Hint[] {
   // Distinct positions inside the viewport: a label handed to another target
   // would also change the badge's clamped left/top, so the comparison below can
@@ -329,6 +403,29 @@ function progressiveHints(count: number): Hint[] {
 }
 
 describe("progressive badge insertion", () => {
+  it("reports when the round is fully inserted", async () => {
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    const round = overlay.renderProgressive(progressiveHints(300), "", {
+      frameBudgetMs: 100,
+      initialBatch: 32,
+    });
+    let settled = false;
+    void round.done.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    // 首批之后还有队列，done 不能提前完成。
+    expect(settled).toBe(false);
+    expect(badges()).toHaveLength(32);
+
+    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
+    await round.done;
+    expect(settled).toBe(true);
+    expect(badges()).toHaveLength(300);
+    overlay.destroy();
+  });
+
   it("inserts the first batch in the activation frame and the rest across later frames", () => {
     const clock = frameClock();
     const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
@@ -446,6 +543,115 @@ describe("progressive badge insertion", () => {
   });
 });
 
+describe("adaptive batch sizing", () => {
+  it("grows the batch when the measured insertion cost is far under budget", () => {
+    // 帧周期 7ms、批成本 0.5ms：增长必须来自批成本，不能来自 vsync 间隔。
+    const clock = costClock();
+    const restore = chargeBatchAppend(clock, 0.5);
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    try {
+      overlay.renderProgressive(progressiveHints(2000), "", {
+        frameBudgetMs: 7,
+        initialBatch: 16,
+        minBatch: 4,
+        maxBatch: 256,
+      });
+      const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7]);
+
+      expect(deltas[0]).toBe(16);
+      expect(deltas[1]).toBeGreaterThan(deltas[0] as number);
+      for (let index = 2; index < deltas.length; index += 1) {
+        expect(deltas[index]).toBeGreaterThan(deltas[index - 1] as number);
+      }
+    } finally {
+      restore();
+      overlay.destroy();
+    }
+  });
+
+  it("shrinks the batch when the measured insertion cost exceeds budget", () => {
+    // 帧周期仍是 7ms（没有错过 vsync），但每批插入花 9ms，必须收缩。
+    const clock = costClock();
+    const restore = chargeBatchAppend(clock, 9);
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    try {
+      overlay.renderProgressive(progressiveHints(2000), "", {
+        frameBudgetMs: 7,
+        initialBatch: 128,
+        minBatch: 4,
+        maxBatch: 256,
+      });
+      const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7, 7]);
+
+      expect(deltas[0]).toBe(128);
+      expect(deltas[1]).toBeLessThan(128);
+      for (let index = 2; index < deltas.length; index += 1) {
+        expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1] as number);
+      }
+      expect(Math.min(...deltas)).toBe(4);
+    } finally {
+      restore();
+      overlay.destroy();
+    }
+  });
+
+  it("does not let frame jitter interrupt growth while the batch cost stays low", () => {
+    // 周期 7±0.5ms 只是测量抖动，不是错过 vsync；批成本稳定 0.5ms。
+    const clock = costClock();
+    const restore = chargeBatchAppend(clock, 0.5);
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    try {
+      overlay.renderProgressive(progressiveHints(4500), "", {
+        frameBudgetMs: 7,
+        initialBatch: 16,
+        minBatch: 4,
+        maxBatch: 256,
+      });
+      const steps = Array.from({ length: 20 }, (_, index) => (index % 2 === 0 ? 6.5 : 7.5));
+      const deltas = batchDeltas(clock, steps);
+
+      for (let index = 1; index < deltas.length; index += 1) {
+        expect(deltas[index]).toBeGreaterThanOrEqual(deltas[index - 1] as number);
+      }
+      expect(deltas[deltas.length - 1]).toBeGreaterThan(deltas[0] as number);
+    } finally {
+      restore();
+      overlay.destroy();
+    }
+  });
+
+  it("stays conservative until the display budget has been measured", async () => {
+    // 采样还没回来时预算只是 60Hz fallback。143Hz 的 7ms 帧会让增长条件
+    // 恒真，所以这里必须从下限的两倍起步，并且只许缩不许涨。
+    const restoreHidden = setDocumentHidden(false);
+    const clock = costClock();
+    const restoreAppend = chargeBatchAppend(clock, 0.5);
+    const overlay = createOverlay({
+      doc: document,
+      viewport: () => VIEWPORT,
+      clock,
+      frameBudgetSampler: () => new Promise(() => undefined),
+    });
+    try {
+      for (let round = 0; round < 3; round += 1) {
+        overlay.renderProgressive(progressiveHints(2000), "", {
+          initialBatch: 128,
+          minBatch: 8,
+          maxBatch: 256,
+        });
+        expect(badges()).toHaveLength(16);
+        const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7, 7, 7]);
+        expect(Math.max(...deltas)).toBeLessThanOrEqual(16);
+      }
+    } finally {
+      restoreAppend();
+      overlay.destroy();
+      restoreHidden();
+    }
+  });
+});
+
+
 /** jsdom 默认按 prerender 报 hidden，测量用例先把它掰成真实前台页面。 */
 function setDocumentHidden(value: boolean): () => void {
   const descriptor = Object.getOwnPropertyDescriptor(document, "hidden");
@@ -515,7 +721,8 @@ describe("frame budget measurement", () => {
       expect(clock.requests()).toBe(0);
 
       overlay.renderProgressive(progressiveHints(300));
-      expect(badges()).toHaveLength(32);
+      // 预算没测完时是保守模式：从下限的两倍（8 × 2）起步，而不是 32。
+      expect(badges()).toHaveLength(16);
     } finally {
       overlay.destroy();
       restore();

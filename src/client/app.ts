@@ -20,7 +20,7 @@ import { collectHints, type Hint } from "./hints.ts";
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
-import { createOverlay, type FrameClock } from "./overlay.ts";
+import { createOverlay, type FrameClock, type ProgressiveRender } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 import { isUserReachable } from "./reach.ts";
 
@@ -94,6 +94,14 @@ export interface AppDeps {
 export interface JumpApp {
   /** Mount the window listener. Returns the symmetric teardown. */
   apply(): () => void;
+  /**
+   * Resolves when every badge of the current round is in the DOM.
+   *
+   * A bench or a host that wants to measure a complete round must wait for
+   * this instead of guessing a frame count: batching is adaptive, so the
+   * number of frames is not a property of the candidate count.
+   */
+  settled(): Promise<void>;
 }
 
 function defaultIsVisible(element: Element): boolean {
@@ -217,6 +225,12 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
     clock: deps.frameClock,
   });
+  /**
+   * The round whose batches may still be queued. `settled()` waits on it; the
+   * cancellation paths in the overlay resolve it, so a caller never hangs on a
+   * round that was torn down.
+   */
+  let currentRound: ProgressiveRender | undefined;
 
   /**
    * Drop whatever currently holds focus before a round starts.
@@ -245,11 +259,14 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     // Labels are complete before this call; progressive only decides when each
     // badge joins the DOM, so a keystroke can already reach a label whose badge
     // is still queued.
-    overlay.renderProgressive(hints, "", { frameBudgetMs: deps.frameBudgetMs });
+    currentRound = overlay.renderProgressive(hints, "", { frameBudgetMs: deps.frameBudgetMs });
     return hints;
   }
 
   return {
+    settled(): Promise<void> {
+      return currentRound?.done ?? Promise.resolve();
+    },
     apply(): () => void {
       const state = createKeyState();
       let hints: Hint[] = [];

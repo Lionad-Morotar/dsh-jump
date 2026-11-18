@@ -31,8 +31,9 @@ export interface OverlayViewport {
  * Frame scheduling seam.
  *
  * Browsers supply requestAnimationFrame; tests supply a stepper so a batch is
- * only inserted when the test says a frame happened. `now` is on the clock so a
- * batch can measure how long the frame it started in really took.
+ * only inserted when the test says a frame happened. `now` and the callback
+ * timestamp are two different clocks: `now` measures work inside a batch,
+ * while the timestamp says when the frame started.
  */
 export interface FrameClock {
   now(): number;
@@ -52,6 +53,12 @@ export interface ProgressiveOptions {
 /** Cancellation seam: clearing a round never lets a queued frame repaint it. */
 export interface ProgressiveRender {
   cancel(): void;
+  /**
+   * Resolves when every badge of the round is in the DOM, or when the round is
+   * cancelled. Callers that must read or measure a complete round wait here
+   * instead of guessing a frame count.
+   */
+  done: Promise<void>;
 }
 
 export interface Overlay {
@@ -109,8 +116,20 @@ const MIN_BATCH_FLOOR = 4;
 const MAX_BATCH_CEILING = 256;
 /** Below this share of the budget the next batch may grow. */
 const GROW_UNDER_BUDGET = 0.5;
+/**
+ * A frame gap this many times the measured cadence is a missed vsync, not
+ * clock jitter: on a 7ms display the next real slot is about 14ms, so half a
+ * millisecond of noise must not push the controller into shrinking forever.
+ */
+const MISSED_VSYNC_FACTOR = 1.5;
 const GROWTH_FACTOR = 1.5;
 const SHRINK_DIVISOR = 2;
+/**
+ * Frames between layout probes once the batch size has settled. Forced layout
+ * is real work, so a stable size is only re-probed occasionally; a size change
+ * is always probed because the cost of that size is unknown.
+ */
+const PROBE_INTERVAL = 8;
 
 interface Badge {
   element: HTMLElement;
@@ -150,12 +169,23 @@ interface ProgressiveRound {
   readonly budgetMs: number;
   readonly minBatch: number;
   readonly maxBatch: number;
+  /** False while the budget is the unmeasured 60Hz fallback. */
+  readonly growAllowed: boolean;
   pending: string;
   nextIndex: number;
   batchSize: number;
-  lastInsertAt: number;
+  /** Timestamp of the previous animation frame, for the missed-vsync signal. */
+  lastFrameAt: number;
+  /** Cost of the last probed batch, measured inside its own frame. */
+  batchCostMs: number;
+  /** Size of the batch `batchCostMs` describes; -1 before the first probe. */
+  probedBatchSize: number;
+  /** Inserted frames since the last layout probe. */
+  framesSinceProbe: number;
   handle: number | undefined;
   done: boolean;
+  settle: () => void;
+  settled: boolean;
 }
 
 /** The browser's frame clock, or undefined where the host has no frames. */
@@ -481,8 +511,10 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
    *
    * Precedence: the caller's explicit value, the overlay's fixed value, the
    * embedding page's published measurement, the cached display sample, then
-   * 60Hz. The sample runs once per overlay; later activations reuse the cached
-   * value.
+   * 60Hz. `measured` is false only for that last case: the batch controller
+   * must stay conservative until a real cadence exists, because a 143Hz page
+   * running on the 60Hz fallback would otherwise read every frame as far under
+   * budget and grow the batch until the ceiling.
    *
    * Cache invalidation: a successful sample survives visibility changes because
    * the panel did not change, only whether its page is frontmost; re-measuring
@@ -491,22 +523,25 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
    * change the refresh rate under the same window. The old value still serves
    * the round that starts now; the fresh sample lands for the next one.
    */
-  function budgetForActivation(override: number | undefined): number {
-    if (isUsableBudget(override)) return override;
-    if (isUsableBudget(fixedBudgetMs)) return fixedBudgetMs;
+  function budgetForActivation(override: number | undefined): {
+    budgetMs: number;
+    measured: boolean;
+  } {
+    if (isUsableBudget(override)) return { budgetMs: override, measured: true };
+    if (isUsableBudget(fixedBudgetMs)) return { budgetMs: fixedBudgetMs, measured: true };
     const published = environmentFrameBudget();
-    if (published !== undefined) return published;
-    if (doc.hidden) return DEFAULT_FRAME_BUDGET_MS;
+    if (published !== undefined) return { budgetMs: published, measured: true };
+    if (doc.hidden) return { budgetMs: DEFAULT_FRAME_BUDGET_MS, measured: false };
     const current = viewport();
     if (measuredBudgetMs !== undefined) {
       if (measuredViewport === undefined || sameViewport(measuredViewport, current)) {
-        return measuredBudgetMs;
+        return { budgetMs: measuredBudgetMs, measured: true };
       }
       startBudgetSampling();
-      return measuredBudgetMs;
+      return { budgetMs: measuredBudgetMs, measured: true };
     }
     startBudgetSampling();
-    return DEFAULT_FRAME_BUDGET_MS;
+    return { budgetMs: DEFAULT_FRAME_BUDGET_MS, measured: false };
   }
 
   function removeContainer(): void {
@@ -536,31 +571,50 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     if (round === undefined) return;
     progressive = undefined;
     if (round.handle !== undefined) round.clock?.cancel(round.handle);
+    if (!round.settled) {
+      round.settled = true;
+      round.settle();
+    }
   }
 
   /**
-   * Batch size for the next frame from the gap the previous batch took.
+   * Batch size for the next frame from two independent signals.
    *
-   * The gap is the only signal a page gets for how much style and layout work a
-   * batch really caused. Growth stays multiplicative and bounded: a fast frame
-   * grows the next batch until the ceiling, a missed budget halves it until the
-   * floor, and the min keeps a slow page from degenerating to one badge per
-   * frame.
+   * `batchCostMs` is the work this round's last probed batch really did inside
+   * its own frame (DOM write plus forced layout), so growth answers the cost
+   * that has to fit in a frame. `elapsed` is the gap between animation-frame
+   * timestamps, which answers a different question: did the page miss a vsync?
+   * A miss shrinks even when the measured batch looked cheap, because paint
+   * work is not inside the measurement. Once the batch size settles, probes
+   * are periodic rather than every frame: forced layout is real work, and
+   * paying it on every stable frame would change the profile being measured.
    */
   function nextBatchSize(round: ProgressiveRound, elapsed: number): number {
     let next = round.batchSize;
-    if (elapsed < round.budgetMs * GROW_UNDER_BUDGET) next = Math.ceil(round.batchSize * GROWTH_FACTOR);
-    else if (elapsed > round.budgetMs) next = Math.floor(round.batchSize / SHRINK_DIVISOR);
+    const missedFrame = elapsed > round.budgetMs * MISSED_VSYNC_FACTOR;
+    const overCost = round.batchCostMs > round.budgetMs;
+    if (missedFrame || overCost) {
+      next = Math.floor(round.batchSize / SHRINK_DIVISOR);
+    } else if (round.growAllowed && round.batchCostMs < round.budgetMs * GROW_UNDER_BUDGET) {
+      next = Math.ceil(round.batchSize * GROWTH_FACTOR);
+    }
     return clampBatch(next, round.minBatch, round.maxBatch);
   }
 
-  /** Append the next slice of the round in one DOM write. */
-  function insertBatch(round: ProgressiveRound, count: number): void {
+  /**
+   * Append the next slice of the round in one DOM write.
+   *
+   * The cost is timed around this batch's own DOM work, never against the next
+   * frame timestamp: rAF timestamps are frame starts, so their difference is
+   * the vsync period and says nothing about how long this batch took. A probe
+   * batch also reads one inserted badge's `offsetHeight` before stopping the
+   * clock, which forces the style and layout that would otherwise be paid at
+   * paint time. Without that flush the controller would only see node creation
+   * and would keep growing a batch whose real cost is layout.
+   */
+  function insertBatch(round: ProgressiveRound, count: number, probe: boolean): void {
     const root = ensureContainer();
-    // Read the clock before the DOM write: next frame timestamp minus this
-    // start is the frame the batch occupied. Reading it after the write would
-    // leave only the idle tail, which shrinks exactly when the work grows.
-    round.lastInsertAt = round.clock?.now() ?? 0;
+    const startedAt = round.clock?.now() ?? 0;
     const end = Math.min(round.nextIndex + count, round.hints.length);
     const nodes: HTMLElement[] = [];
     for (let index = round.nextIndex; index < end; index += 1) {
@@ -572,7 +626,20 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     }
     round.nextIndex = end;
     if (nodes.length > 0) root.append(...nodes);
+    if (probe && round.clock !== undefined) {
+      const last = nodes[nodes.length - 1];
+      if (last !== undefined) void last.offsetHeight;
+      round.batchCostMs = Math.max(0, round.clock.now() - startedAt);
+      round.probedBatchSize = nodes.length;
+      round.framesSinceProbe = 0;
+    } else {
+      round.framesSinceProbe += 1;
+    }
     round.done = round.nextIndex >= round.hints.length;
+    if (round.done && !round.settled) {
+      round.settled = true;
+      round.settle();
+    }
   }
 
   function scheduleBatch(round: ProgressiveRound): void {
@@ -581,12 +648,16 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     round.handle = frameClock.request((time) => {
       round.handle = undefined;
       if (progressive !== round) return;
-      // A frame timestamp that predates the batch start means the clock ran
+      // A frame timestamp that predates the previous one means the clock ran
       // backwards; reading that as a negative gap would grow the next batch
       // exactly when the page is behind, so treat it as a miss.
-      const elapsed = time >= round.lastInsertAt ? time - round.lastInsertAt : Number.POSITIVE_INFINITY;
-      round.batchSize = nextBatchSize(round, elapsed);
-      insertBatch(round, round.batchSize);
+      const elapsed = time >= round.lastFrameAt ? time - round.lastFrameAt : Number.POSITIVE_INFINITY;
+      round.lastFrameAt = time;
+      const next = nextBatchSize(round, elapsed);
+      const probe =
+        next !== round.probedBatchSize || round.framesSinceProbe >= PROBE_INTERVAL;
+      round.batchSize = next;
+      insertBatch(round, next, probe);
       if (!round.done) scheduleBatch(round);
     });
   }
@@ -600,7 +671,8 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     const root = ensureContainer();
     root.replaceChildren();
     badges = new Map();
-    const budgetMs = budgetForActivation(options.frameBudgetMs);
+    const activationBudget = budgetForActivation(options.frameBudgetMs);
+    const budgetMs = activationBudget.budgetMs;
     // One batch is sized from its 60Hz baseline by budget / 16.7. Explicit
     // options stay literal; the floor and ceiling are absolute so neither a
     // 240Hz panel nor a very slow one degenerates the batching.
@@ -615,16 +687,26 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
             minBatch,
             scaleBatch(BASE_MAX_BATCH, budgetMs, MIN_BATCH_FLOOR, MAX_BATCH_CEILING),
           );
-    // An explicit first batch is taken literally: the caller is describing a
-    // fixed shape, not asking for the display-scaled default.
-    const initial =
-      options.initialBatch !== undefined
+    // Before the display is measured the 60Hz fallback cannot describe a
+    // 143Hz page: every real frame looks far under budget and growth runs to
+    // the ceiling in the first activation, which is exactly the common
+    // "load the page, press Cmd+H immediately" case. Start at twice the floor
+    // and only allow shrinking until a real cadence exists. An explicit initial
+    // batch is ignored here for the same reason: the caller is describing a
+    // budget it knows, and this branch is the one where no budget is known yet.
+    const initial = activationBudget.measured
+      ? options.initialBatch !== undefined
         ? clampBatch(options.initialBatch, 1, maxBatch)
         : clampBatch(
             scaleBatch(BASE_INITIAL_BATCH, budgetMs, MIN_BATCH_FLOOR, BASE_MAX_BATCH),
             minBatch,
             maxBatch,
-          );
+          )
+      : clampBatch(minBatch * 2, minBatch, maxBatch);
+    let settle: () => void = () => undefined;
+    const done = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
     const round: ProgressiveRound = {
       hints,
       bounds: viewport(),
@@ -632,12 +714,18 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       budgetMs,
       minBatch,
       maxBatch,
+      growAllowed: activationBudget.measured,
       pending,
       nextIndex: 0,
       batchSize: initial,
-      lastInsertAt: 0,
+      lastFrameAt: clock?.now() ?? 0,
+      batchCostMs: 0,
+      probedBatchSize: -1,
+      framesSinceProbe: 0,
       handle: undefined,
       done: hints.length === 0,
+      settle,
+      settled: false,
     };
     progressive = round;
     if (hints.length > 0) {
@@ -645,13 +733,17 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
         // No frame scheduler (jsdom, an exotic host): correctness outranks
         // pacing, so the whole round lands in this frame like the synchronous
         // path. A real browser always has requestAnimationFrame.
-        insertBatch(round, hints.length);
+        insertBatch(round, hints.length, false);
       } else {
-        insertBatch(round, Math.min(initial, hints.length));
+        insertBatch(round, Math.min(initial, hints.length), true);
         if (!round.done) scheduleBatch(round);
       }
+    } else {
+      round.settled = true;
+      settle();
     }
     return {
+      done,
       cancel: () => {
         if (progressive !== round) return;
         cancelProgressive();

@@ -1257,11 +1257,38 @@ function badgeCount(): number {
 }
 
 describe("progressive activation", () => {
+  it("settles only after every badge of the current round is in the DOM", async () => {
+    gridButtons(300);
+    const clock = frameClock();
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+    });
+    const teardown = app.apply();
+
+    activate();
+    expect(badgeCount()).toBe(32);
+    let settled = false;
+    void app.settled().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    for (let frame = 0; frame < 20 && badgeCount() < 300; frame += 1) clock.step(1);
+    await app.settled();
+    expect(settled).toBe(true);
+    expect(badgeCount()).toBe(300);
+    teardown();
+  });
+
   it("accepts a label whose badge has not been inserted yet", () => {
     // 300 个候选升到三键，首批 32 枚之后还有大量标签没画出来。
     const els = gridButtons(300);
     const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
 
     activate();
     expect(badgeCount()).toBe(32);
@@ -1293,7 +1320,7 @@ describe("progressive activation", () => {
   it("Esc cancels the pending batches and leaves no badge behind", () => {
     gridButtons(300);
     const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
 
     activate();
     clock.step(1);
@@ -1311,7 +1338,7 @@ describe("progressive activation", () => {
   it("starts a fresh round from the initial batch after a cancelled one", () => {
     gridButtons(300);
     const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
 
     activate();
     clock.step(1);
@@ -1329,7 +1356,7 @@ describe("progressive cancellation surfaces", () => {
   it("visibilitychange cancels the pending batches", () => {
     gridButtons(300);
     const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
     activate();
     clock.step(1);
     expect(badgeCount()).toBeGreaterThan(32);
@@ -1349,7 +1376,7 @@ describe("progressive cancellation surfaces", () => {
   it("dispose cancels the pending batches", () => {
     gridButtons(300);
     const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
     activate();
     clock.step(1);
     expect(badgeCount()).toBeGreaterThan(32);
