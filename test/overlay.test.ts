@@ -35,10 +35,20 @@ function overlayCanvas(): HTMLCanvasElement | null {
 
 /** 一次绘制调用的快照；状态取调用发生的那一刻。 */
 interface DrawOp {
-  readonly kind: "clearRect" | "fillText" | "setTransform" | "roundRect" | "rect" | "fill" | "beginPath";
+  readonly kind:
+    | "clearRect"
+    | "fillText"
+    | "setTransform"
+    | "roundRect"
+    | "rect"
+    | "fill"
+    | "beginPath"
+    | "stroke";
   readonly args: readonly unknown[];
   readonly font: string;
   readonly alpha: number;
+  readonly stroke: string;
+  readonly lineWidth: number;
 }
 
 interface RecordedText {
@@ -47,10 +57,39 @@ interface RecordedText {
   readonly alpha: number;
 }
 
+/** 一次描边的快照：颜色、线宽，以及这条路径上攒下的矩形。 */
+interface RecordedOutline {
+  readonly stroke: string;
+  readonly lineWidth: number;
+  readonly rects: readonly { readonly x: number; readonly y: number; readonly w: number; readonly h: number }[];
+}
+
+/** `rgba(...)` 的透明度；`#rrggbb` 这类不透明写法算 1。 */
+function alphaOf(color: string): number {
+  const parts = color.match(/^rgba?\(([^)]+)\)$/);
+  if (parts === null) return 1;
+  const fields = (parts[1] ?? "").split(",").map((field) => field.trim());
+  return fields.length < 4 ? 1 : Number(fields[3]);
+}
+
+/** 描边是否圈住了元素本体：不要求逐像素相等，只要求覆盖它的盒子。 */
+function covers(
+  outline: { x: number; y: number; w: number; h: number },
+  rect: { x: number; y: number; w: number; h: number },
+): boolean {
+  return (
+    outline.x <= rect.x &&
+    outline.y <= rect.y &&
+    outline.x + outline.w >= rect.x + rect.w &&
+    outline.y + outline.h >= rect.y + rect.h
+  );
+}
+
 interface Recorder {
   readonly context: CanvasRenderingContext2D;
   readonly ops: DrawOp[];
   texts(): RecordedText[];
+  outlines(): RecordedOutline[];
   clears(): number;
 }
 
@@ -65,9 +104,11 @@ function recorder(): Recorder {
   const ops: DrawOp[] = [];
   let font = "10px sans-serif";
   let alpha = 1;
+  let strokeStyle = "#000";
+  let lineWidth = 1;
   const stack: { font: string; alpha: number }[] = [];
   const push = (kind: DrawOp["kind"], args: readonly unknown[] = []): void => {
-    ops.push({ kind, args, font, alpha });
+    ops.push({ kind, args, font, alpha, stroke: strokeStyle, lineWidth });
   };
   const context = {
     get font(): string {
@@ -81,6 +122,18 @@ function recorder(): Recorder {
     },
     get fillStyle(): string {
       return "#000";
+    },
+    get strokeStyle(): string {
+      return strokeStyle;
+    },
+    set strokeStyle(value: string) {
+      strokeStyle = value;
+    },
+    get lineWidth(): number {
+      return lineWidth;
+    },
+    set lineWidth(value: number) {
+      lineWidth = value;
     },
     get globalAlpha(): number {
       return alpha;
@@ -116,6 +169,9 @@ function recorder(): Recorder {
     fill(): void {
       push("fill");
     },
+    stroke(): void {
+      push("stroke");
+    },
     fillText(text: string, x: number, y: number): void {
       push("fillText", [text, x, y]);
     },
@@ -134,6 +190,26 @@ function recorder(): Recorder {
           weight: op.font.split(" ")[0] ?? "",
           alpha: op.alpha,
         })),
+    outlines: () => {
+      const found: RecordedOutline[] = [];
+      let path: { x: number; y: number; w: number; h: number }[] = [];
+      for (const op of ops) {
+        if (op.kind === "beginPath") {
+          path = [];
+          continue;
+        }
+        if (op.kind === "rect") {
+          const [x, y, w, h] = op.args as number[];
+          path.push({ x: x ?? 0, y: y ?? 0, w: w ?? 0, h: h ?? 0 });
+          continue;
+        }
+        if (op.kind === "stroke") {
+          found.push({ stroke: op.stroke, lineWidth: op.lineWidth, rects: path });
+          path = [];
+        }
+      }
+      return found;
+    },
     clears: () => ops.filter((op) => op.kind === "clearRect").length,
   };
 }
@@ -629,5 +705,140 @@ describe("appending a later batch", () => {
     overlay.append([]);
     expect(overlayCanvas()).toBeNull();
     expect(recorded.texts()).toEqual([]);
+  });
+});
+
+/**
+ * 目标本体描边。
+ *
+ * 徽章只说明「有个标签」，不说明标签属于哪个元素：一屏 155 枚徽章时，用户得靠
+ * 位置猜。描边把「这个元素能被跳到」直接画在元素身上，并随前缀分成淡/重两档。
+ * 断言落在绘制调用上（画在哪、多粗、什么透明度），因为 jsdom 没有像素。
+ */
+describe("target outline", () => {
+  /**
+   * 一次绘制里每个元素拿到的描边。
+   *
+   * 按矩形归并而不是按 stroke 调用归并：一次 stroke 画几个矩形是绘制层的实现
+   * 自由，用户看到的只是「这个元素上有一圈线」。
+   */
+  function ringsOf(recorded: Recorder, hints: readonly Hint[]): Map<Hint, RecordedOutline> {
+    const rings = new Map<Hint, RecordedOutline>();
+    for (const outline of recorded.outlines()) {
+      for (const hint of hints) {
+        if (rings.has(hint)) continue;
+        if (outline.rects.some((rect) => covers(rect, hint.rect))) rings.set(hint, outline);
+      }
+    }
+    return rings;
+  }
+
+  function ringOf(recorded: Recorder, hint: Hint): RecordedOutline | undefined {
+    return ringsOf(recorded, [hint]).get(hint);
+  }
+
+  it("rings every candidate at its own rect on activation", () => {
+    const { overlay, recorder: recorded } = mount();
+    const hints = hintsOf(["as", "sd", "fj"]);
+    overlay.render(hints);
+
+    const rings = ringsOf(recorded, hints);
+    // 没有前缀时全部候选都是淡描边，没有一个算「当前匹配」。
+    expect(rings.size).toBe(hints.length);
+    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
+  });
+
+  it("draws the ring on the element, not on the badge", () => {
+    const { overlay, recorder: recorded } = mount();
+    // 元素在 (400,300) 且远大于徽章；描边必须跟着元素走。
+    const hint: Hint = {
+      element: document.createElement("button"),
+      label: "as",
+      rect: { x: 400, y: 300, w: 120, h: 40 },
+    };
+    overlay.render([hint]);
+
+    const ring = ringOf(recorded, hint);
+    expect(ring).toBeDefined();
+    const rect = ring!.rects.find((candidate) => covers(candidate, hint.rect));
+    expect(rect).toBeDefined();
+    // 24x16 的徽章盒子盖不住 120x40 的元素，所以这条断言能区分描边与徽章。
+    expect(rect!.w).toBeGreaterThanOrEqual(hint.rect.w);
+    expect(rect!.h).toBeGreaterThanOrEqual(hint.rect.h);
+  });
+
+  it("thickens the matching rings and drops the rest back to faint", () => {
+    const { overlay, recorder: recorded } = mount();
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    const faint = ringOf(recorded, hints[0]!);
+    expect(faint).toBeDefined();
+    const mark = recorded.outlines().length;
+
+    overlay.render(hints, "a");
+
+    // 只看这一笔新画的描边：as 还匹配，sd 被前缀排除。
+    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
+    const matching = ringOf(stroke, hints[0]!);
+    const excluded = ringOf(stroke, hints[1]!);
+    expect(matching).toBeDefined();
+    expect(excluded).toBeDefined();
+    expect(alphaOf(matching!.stroke)).toBeGreaterThan(alphaOf(excluded!.stroke));
+    expect(matching!.lineWidth).toBeGreaterThan(excluded!.lineWidth);
+    expect(matching!.lineWidth).toBeGreaterThan(faint!.lineWidth);
+  });
+
+  it("returns an excluded ring to faint when the prefix is cleared", () => {
+    const { overlay, recorder: recorded } = mount();
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints, "a");
+    const mark = recorded.outlines().length;
+
+    overlay.render(hints, "");
+
+    // 死键回退：两枚都回到淡描边，没有一枚还留在重档。
+    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
+    const rings = ringsOf(stroke, hints);
+    expect(rings.size).toBe(hints.length);
+    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
+  });
+
+  it("paints the ring for a batch appended mid-round", () => {
+    const { overlay, recorder: recorded } = mount();
+    overlay.append(hintsOf(["a", "s"]));
+    const mark = recorded.outlines().length;
+    const batch = hintsOf(["d", "f"]);
+    overlay.append(batch);
+
+    // 慢路径只补画新增的一批，但新增的那几个同样要带上描边。
+    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
+    const rings = ringsOf(stroke, batch);
+    expect(rings.size).toBe(batch.length);
+    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
+  });
+
+  it("leaves no ring behind after destroy", () => {
+    const { overlay } = mount();
+    overlay.render(hintsOf(["as"]));
+    overlay.destroy();
+    // 描边与徽章同在一张 canvas 上，canvas 走了描边就跟着走。
+    expect(overlayCanvas()).toBeNull();
+  });
+
+  it("does not touch the host element's class or style", () => {
+    const { overlay } = mount();
+    const element = document.createElement("button");
+    element.className = "host-button primary";
+    element.setAttribute("style", "color: red; margin: 4px");
+    const hint: Hint = { element, label: "as", rect: { x: 10, y: 10, w: 80, h: 24 } };
+
+    const before = { className: element.className, style: element.getAttribute("style") };
+    overlay.render([hint]);
+    overlay.render([hint], "a");
+    overlay.destroy();
+
+    // 描边画在 canvas 上，宿主元素必须一个字节都没动。
+    expect(element.className).toBe(before.className);
+    expect(element.getAttribute("style")).toBe(before.style);
   });
 });

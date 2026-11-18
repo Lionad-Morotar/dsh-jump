@@ -110,6 +110,7 @@ function installCanvasProbe(): void {
     roundRect() {},
     rect() {},
     fill() {},
+    stroke() {},
     fillText() {
       paintedLabels += 1;
     },

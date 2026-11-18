@@ -57,7 +57,7 @@ interface CanvasText {
 }
 
 let canvasOps: {
-  readonly kind: "clearRect" | "fillText" | "setTransform" | "roundRect" | "rect" | "fill" | "beginPath";
+  readonly kind: "clearRect" | "fillText" | "setTransform" | "roundRect" | "rect" | "fill" | "beginPath" | "stroke";
   readonly args: readonly unknown[];
   readonly font: string;
   readonly alpha: number;
@@ -116,6 +116,9 @@ function recordingContext(): CanvasRenderingContext2D {
     },
     fill(): void {
       push("fill");
+    },
+    stroke(): void {
+      push("stroke");
     },
     fillText(text: string, x: number, y: number): void {
       push("fillText", [text, x, y]);
