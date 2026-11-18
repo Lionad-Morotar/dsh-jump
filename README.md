@@ -371,8 +371,10 @@ paint, and both arrays carry one entry per observed frame, so index i of each
 belongs to the same frame and the two values can be added. A frame that runs
 only one stage contributes 0 to the other array. `frames` counts every observed
 frame while the arrays keep the latest 512, dropping the oldest first. The
-probe costs two `performance.now()` reads per stage, allocates nothing per
-frame in steady state, never logs or serializes, and is on by default. A host
+measured window starts at the warmup boundary, so cold-start paints and JIT
+cycles stay out of the acceptance reading. The probe costs two
+`performance.now()` reads per stage, allocates nothing per frame in steady
+state, never logs or serializes, and is on by default. A host
 can turn it off with `deps.perfProbe: false`; `perfStats()` then reports empty
 samples and the bench cannot judge that tier.
 

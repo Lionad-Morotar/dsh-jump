@@ -244,6 +244,37 @@ export function summarizePluginFrame(perfStats, limit = PERF_SAMPLE_LIMIT) {
   };
 }
 
+/**
+ * The probe frames observed after `before`.
+ *
+ * Warmup runs the measured shape on purpose, but its readings are discarded
+ * like every other phase; this delta is how the probe's cumulative window is
+ * cut down to the measured window. The probe keeps a bounded tail, so the tail
+ * of the final arrays is exactly the frames since `before` as long as that
+ * many are still retained. A window longer than the ring can only report its
+ * newest `limit` frames; `frames` still says how many were observed, so the
+ * truncation stays visible.
+ */
+export function perfWindowBetween(before, after, limit = PERF_SAMPLE_LIMIT) {
+  if (after === null || after === undefined) return null;
+  const beforeFrames = before === null || before === undefined ? 0 : before.frames;
+  const observed = Math.max(0, (after.frames ?? 0) - beforeFrames);
+  const keep = Math.min(observed, limit);
+  const tail = (values) => {
+    const list = Array.isArray(values) ? values : [];
+    return list.slice(Math.max(0, list.length - keep));
+  };
+  return {
+    frameBudgetMs: after.frameBudgetMs ?? null,
+    budgetSource: after.budgetSource ?? "fallback",
+    frames: observed,
+    samples: {
+      collect: tail(after.samples?.collect),
+      paint: tail(after.samples?.paint),
+    },
+  };
+}
+
 /** Why the coarse observers cannot decide a 7ms budget. */
 export const LOAF_EVIDENCE_NOTE =
   "coarse corroboration only: long-animation-frame entries exist only for frames over 50ms, " +
@@ -669,6 +700,7 @@ function pageScript(config) {
   const PERF_SAMPLE_LIMIT = ${PERF_SAMPLE_LIMIT};
   const boundedSamples = ${boundedSamples.toString()};
   const summarizeSeries = ${summarizeSeries.toString()};
+  const perfWindowBetween = ${perfWindowBetween.toString()};
   const summarizePluginFrame = ${summarizePluginFrame.toString()};
   const isJudgeable = ${isJudgeable.toString()};
   const attributedVerdict = ${attributedVerdict.toString()};
@@ -1190,8 +1222,11 @@ function pageScript(config) {
     }
 
     // Warmup trusted activations must not enter the interaction sample; they
-    // exist to warm the path, not to describe it.
+    // exist to warm the path, not to describe it. The probe's cumulative
+    // window is cut at the same boundary so cold-start paints stay out of the
+    // plugin occupancy reading as well.
     trustedActivations = 0;
+    const perfAtWarmupEnd = typeof app.perfStats === "function" ? app.perfStats() : null;
     const frameSampler = startFrameSampler();
     const loaf = startLoafObserver();
     const eventTiming = startEventObserver();
@@ -1259,7 +1294,8 @@ function pageScript(config) {
     await new Promise((resolve) => setTimeout(resolve, 120));
     loaf.stop();
     eventTiming.stop();
-    const perf = app.perfStats ? app.perfStats() : null;
+    const perfAfter = app.perfStats ? app.perfStats() : null;
+    const perf = perfWindowBetween(perfAtWarmupEnd, perfAfter);
     const plugin = summarizePluginFrame(perf);
     // The app was handed this tier's own measurement, so both numbers answer
     // the same display; prefer the app's copy so the source travels with it.
@@ -1998,6 +2034,7 @@ const REQUIRED_HOOKS = [
   "pluginPaintMs:",
   "budgetSource:",
   "PERF_SAMPLE_LIMIT",
+  "perfWindowBetween",
   "summarizePluginFrame",
   "loafEvidence",
   "eventTimingEvidence",
@@ -2287,6 +2324,41 @@ function assertPerfProbeContract() {
   const misaligned = summarizePluginFrame({ samples: { collect: [1, 2], paint: [1] } });
   if (misaligned.pluginFrameMs.aligned !== false || misaligned.pluginFrameMs.p99 !== null) {
     throw new Error("mismatched arrays are not frame-aligned and must not be added");
+  }
+
+  const windowed = perfWindowBetween(
+    { frames: 10 },
+    {
+      frames: 13,
+      frameBudgetMs: 7,
+      budgetSource: "injected",
+      samples: {
+        collect: Array.from({ length: 13 }, (_, index) => index),
+        paint: Array.from({ length: 13 }, (_, index) => 100 + index),
+      },
+    },
+  );
+  if (
+    windowed.frames !== 3 ||
+    JSON.stringify(windowed.samples.collect) !== JSON.stringify([10, 11, 12]) ||
+    JSON.stringify(windowed.samples.paint) !== JSON.stringify([110, 111, 112])
+  ) {
+    throw new Error("the measured window must start at the warmup boundary");
+  }
+  const truncated = perfWindowBetween(
+    { frames: 10 },
+    {
+      frames: 600,
+      frameBudgetMs: 7,
+      budgetSource: "injected",
+      samples: {
+        collect: Array.from({ length: 600 }, (_, index) => index),
+        paint: Array.from({ length: 600 }, (_, index) => index),
+      },
+    },
+  );
+  if (truncated.frames !== 590 || truncated.samples.collect.length !== PERF_SAMPLE_LIMIT) {
+    throw new Error("a measured window past the ring must keep its newest frames and report the observed count");
   }
 }
 
@@ -2662,7 +2734,7 @@ export async function check() {
   console.log("check attribution: ok (bundle-only sums, excluded frames, empty window nulls)");
 
   assertPerfProbeContract();
-  console.log("check perf probe: ok (paired p50/p99/max, 600 frames keep 512, empty and unaligned windows null)");
+  console.log("check perf probe: ok (paired p50/p99/max, 600 frames keep 512, warmup cut, empty and unaligned windows null)");
 
   assertAttributedVerdictContract();
   console.log("check attributed verdict: ok (half-budget p99 boundary, missing sample fails)");
