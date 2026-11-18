@@ -20,7 +20,7 @@ import { createHintScan, keysPerLabel, type Hint, type HintScan } from "./hints.
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, HOME_ROW_KEYS, type JumpConfig } from "./config.ts";
-import { createOverlay, type FrameClock } from "./overlay.ts";
+import { createOverlay, type ConfirmTimers, type FrameClock } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 import { isUserReachable } from "./reach.ts";
 
@@ -116,6 +116,13 @@ export interface AppDeps {
    * bench then has no plugin-side samples and cannot judge acceptance.
    */
   perfProbe?: false;
+  /**
+   * Timer seam for the hit confirmation.
+   *
+   * The confirmation outlives the round, so its 300ms cannot ride on the frame
+   * clock. Tests inject a stepper and drive the disappearance themselves.
+   */
+  confirmTimers?: ConfirmTimers;
 }
 
 /** Where the frame budget reported by `perfStats()` came from. */
@@ -1033,6 +1040,9 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       const openRound = (): void => {
         if (roundOpen) return;
         roundOpen = true;
+        // A round starting inside the confirmation window replaces the receipt:
+        // two boxes on screen would point at two different targets.
+        overlay.clearConfirm();
         onRound("begin");
       };
       const closeRound = (): void => {
@@ -1071,6 +1081,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // the click sequence nor the focus path may run for it.
         if (mode === "reference") {
           deps.onReference?.(hit.element);
+          overlay.confirm(hit.rect, { timers: deps.confirmTimers });
           return;
         }
         const activation = activationOf(hit.element);
@@ -1083,6 +1094,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           // A widget with no focus method (a leaf div) simply no-ops.
           if (typeof el.focus === "function") el.focus();
         }
+        // Strictly after the action: the confirmation is a receipt, and a
+        // reader's click must never wait on a visual. Every branch above has
+        // already dispatched by the time this line runs.
+        overlay.confirm(hit.rect, { timers: deps.confirmTimers });
       }
 
       /**
@@ -1177,6 +1192,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           event.stopPropagation();
         }
         if (action.type === "ignore") {
+          // Esc in idle mode reaches here: matchKey only reports `exit` while a
+          // mode is live, so a confirmation still on screen has to be dropped
+          // here or it would outlive the round it belongs to.
+          if (event.key === "Escape") overlay.clearConfirm();
           if (state.pending !== before) overlay.render(hints, state.pending);
           return;
         }

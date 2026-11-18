@@ -2142,3 +2142,153 @@ describe("条件回退：快路径、慢路径与硬上限", () => {
     teardown();
   });
 });
+
+/**
+ * 命中确认：动作先派发，确认后出现。
+ *
+ * 用户敲完标签后浮层整轮消失，看不到刚才打中了哪个元素。确认框补上这个回执，
+ * 但它绝不能挡在动作前面：先点，再报。这里用调用顺序断言，不用时间戳，因为
+ * 顺序是契约，耗时只是实现。
+ */
+describe("hit confirmation", () => {
+  const CONFIRM = "[data-dsh-jump-confirm]";
+
+  function confirmOf(): Element | null {
+    return doc.querySelector(CONFIRM);
+  }
+
+  /** 手动推进的定时器，让 300ms 只在测试说走时走。 */
+  function fakeTimers(): {
+    setTimeout: (run: () => void, ms: number) => number;
+    clearTimeout: (handle: number) => void;
+    advance(ms: number): void;
+  } {
+    let nextHandle = 1;
+    const queued = new Map<number, { run: () => void; at: number }>();
+    let now = 0;
+    return {
+      setTimeout: (run, ms) => {
+        const handle = nextHandle++;
+        queued.set(handle, { run, at: now + ms });
+        return handle;
+      },
+      clearTimeout: (handle) => {
+        queued.delete(handle);
+      },
+      advance: (ms) => {
+        now += ms;
+        for (const [handle, entry] of [...queued]) {
+          if (entry.at > now) continue;
+          queued.delete(handle);
+          entry.run();
+        }
+      },
+    };
+  }
+
+  it("dispatches the click before the confirmation exists", () => {
+    const els = buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+
+    // 命中那一刻，确认框是否已经存在，从 click 监听器里读。
+    let confirmAtClick: boolean | null = null;
+    const target = els[1] as HTMLElement; // 两键轮第二个候选的 label 是 ad
+    target.addEventListener("click", () => {
+      confirmAtClick = confirmOf() !== null;
+    });
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    // 动作已经派发过，而它派发时确认框还没出现：先点，再报。
+    expect(confirmAtClick).toBe(false);
+    expect(confirmOf()).not.toBeNull();
+    teardown();
+  });
+
+  it("places the box on the target that was hit", () => {
+    const els = buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    // buttons(12) 里第二个按钮在 (40,10)，尺寸 10x10。
+    const target = els[1] as HTMLElement;
+    const rect = target.getBoundingClientRect();
+    const box = confirmOf() as HTMLElement | null;
+    expect(box?.style.left).toBe(String(rect.left) + "px");
+    expect(box?.style.top).toBe(String(rect.top) + "px");
+    teardown();
+  });
+
+  it("removes the box after the duration", () => {
+    buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect(confirmOf()).not.toBeNull();
+
+    timers.advance(300);
+    expect(confirmOf()).toBeNull();
+    teardown();
+  });
+
+  it("keeps only one box when a new round starts inside the window", () => {
+    buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect(confirmOf()).not.toBeNull();
+
+    // 300ms 内重新激活：旧确认立刻清掉，不能叠成两个。
+    activate();
+    expect(doc.querySelectorAll(CONFIRM)).toHaveLength(0);
+    teardown();
+  });
+
+  it("clears the box on Esc", () => {
+    buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect(confirmOf()).not.toBeNull();
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    expect(confirmOf()).toBeNull();
+    teardown();
+  });
+
+  it("leaves no box behind on teardown", () => {
+    buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect(confirmOf()).not.toBeNull();
+
+    teardown();
+    expect(confirmOf()).toBeNull();
+  });
+
+  it("does not intercept pointer events", () => {
+    buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect((confirmOf() as HTMLElement).style.pointerEvents).toBe("none");
+    teardown();
+  });
+});

@@ -12,7 +12,7 @@
  * This module owns orchestration and the public API; badge geometry, text
  * segmentation and the draw calls live in overlay-canvas.ts.
  */
-import type { Hint } from "./hints.ts";
+import type { Hint, HintRect } from "./hints.ts";
 import {
   createCanvasSurface,
   type CanvasContextFactory,
@@ -40,6 +40,21 @@ export interface ProgressiveRender {
   /** Resolves when every badge of the round is painted, or the round is cancelled. */
   done: Promise<void>;
 }
+
+/**
+ * Timer seam for the hit confirmation.
+ *
+ * The confirmation outlives the round that produced it, so its 300ms cannot ride
+ * on the frame clock: a frame callback would be cancelled with the round. Tests
+ * supply a stepper so the box only disappears when the test says so.
+ */
+export interface ConfirmTimers {
+  setTimeout(run: () => void, ms: number): number;
+  clearTimeout(handle: number): void;
+}
+
+/** How long the confirmation box stays on screen. */
+export const CONFIRM_MS = 300;
 
 export interface Overlay {
   /** Repaint the round; a pending prefix keeps its badges lit and dims the rest. */
@@ -69,6 +84,16 @@ export interface Overlay {
    * frame fallback it grows until the round is complete.
    */
   visibleLabels(): readonly string[];
+  /**
+   * Flash a box over the target that was just hit.
+   *
+   * Called after the action has been dispatched, never before: the reader's
+   * click must not wait on a visual. A confirmation is a receipt, so it lives
+   * outside the round and survives `destroy`.
+   */
+  confirm(rect: HintRect, options?: { timers?: ConfirmTimers }): void;
+  /** Drop the live confirmation, for Esc and for a round that starts over it. */
+  clearConfirm(): void;
   destroy(): void;
 }
 
@@ -99,6 +124,11 @@ export const SYNC_PAINT_LIMIT = 2000;
 
 /** First slice of the fallback path, painted in the activation frame. */
 const FALLBACK_FIRST_BATCH = 1000;
+
+/** The confirmation ring reuses the badge yellow, so it reads as the same UI. */
+const CONFIRM_COLOR = "#ffd60a";
+/** Fade-out only; the box appears instantly so the receipt is never delayed. */
+const CONFIRM_FADE_MS = 120;
 
 interface Round {
   /** Painted hints; `append` extends this array in place. */
@@ -175,6 +205,53 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
         })();
   let surface: CanvasSurface | undefined;
   let round: Round | undefined;
+  let confirmation: { element: HTMLElement; handle: number } | undefined;
+  /** Timers of the live confirmation; the caller's seam wins over the host's. */
+  let confirmTimers: ConfirmTimers | undefined;
+
+  /**
+   * The host's timers, or a no-op pair where the document has no window.
+   *
+   * A detached document (jsdom without a window, a torn-down iframe) has no
+   * `setTimeout`; the confirmation then simply never schedules its own removal
+   * instead of throwing on the way out of a successful hit.
+   */
+  function hostTimers(): ConfirmTimers {
+    const view = doc.defaultView;
+    if (view === null || typeof view.setTimeout !== "function") {
+      return { setTimeout: () => 0, clearTimeout: () => undefined };
+    }
+    return {
+      setTimeout: (run, ms) => view.setTimeout(run, ms) as unknown as number,
+      clearTimeout: (handle) => view.clearTimeout(handle),
+    };
+  }
+
+  /**
+   * Whether the reader asked the system to cut animation.
+   *
+   * A confirmation that fades is decoration; under `prefers-reduced-motion` the
+   * box still has to appear and disappear, just without the fade. Read per call
+   * because the preference can change while a page stays open.
+   */
+  function motionAllowed(): boolean {
+    const view = doc.defaultView;
+    if (view === null || typeof view.matchMedia !== "function") return true;
+    try {
+      return !view.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Take the live confirmation off the page and cancel its removal. */
+  function dropConfirmation(): void {
+    if (confirmation === undefined) return;
+    const { element, handle } = confirmation;
+    confirmation = undefined;
+    (confirmTimers ?? hostTimers()).clearTimeout(handle);
+    element.remove();
+  }
 
   /** The one canvas this overlay ever attaches; rounds reuse it. */
   function ensureSurface(): CanvasSurface {
@@ -366,7 +443,48 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
         ? []
         : round.hints.slice(0, round.drawn).map((hint) => hint.label);
     },
+    confirm(rect, options): void {
+      // One box at a time: a second hit inside the window replaces the first
+      // rather than stacking two receipts on top of each other.
+      dropConfirmation();
+      confirmTimers = options?.timers;
+      const timers = confirmTimers ?? hostTimers();
+      const element = doc.createElement("div");
+      element.dataset.dshJumpConfirm = "";
+      // The box is a visual receipt for something that already happened; a
+      // screen reader announcing it would replay the action it confirms.
+      element.setAttribute("aria-hidden", "true");
+      const fade = motionAllowed();
+      element.style.cssText =
+        "position:fixed;box-sizing:border-box;pointer-events:none;" +
+        "z-index:2147483647;border:2px solid " +
+        CONFIRM_COLOR +
+        ";border-radius:3px;" +
+        (fade ? "transition:opacity " + String(CONFIRM_FADE_MS) + "ms ease-out;" : "") +
+        "left:" +
+        String(rect.x) +
+        "px;top:" +
+        String(rect.y) +
+        "px;width:" +
+        String(rect.w) +
+        "px;height:" +
+        String(rect.h) +
+        "px";
+      doc.documentElement.append(element);
+      const handle = timers.setTimeout(() => {
+        // Only the live box may remove itself: a replaced confirmation must not
+        // be torn down early by the timer of the one it replaced.
+        if (confirmation?.element !== element) return;
+        confirmation = undefined;
+        element.remove();
+      }, CONFIRM_MS);
+      confirmation = { element, handle };
+    },
+    clearConfirm(): void {
+      dropConfirmation();
+    },
     destroy(): void {
+      dropConfirmation();
       if (round !== undefined) {
         abandon(round);
         round = undefined;

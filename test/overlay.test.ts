@@ -842,3 +842,147 @@ describe("target outline", () => {
     expect(element.getAttribute("style")).toBe(before.style);
   });
 });
+
+/**
+ * 命中确认框。
+ *
+ * 敲完标签后浮层整轮消失，用户看不到刚才打中了哪个元素。确认框在动作派发之后
+ * 才出现，只负责「刚才那一下落在哪」，所以它必须是独立元素而不是画在 canvas 上：
+ * 画布随轮销毁，而确认要活过这一轮。
+ *
+ * 断言落在 DOM 形态与几何上：位置、不吃事件、到点消失、不叠。
+ */
+describe("hit confirmation", () => {
+  const CONFIRM = "[data-dsh-jump-confirm]";
+
+  /** 手动推进的定时器：jsdom 里没有真实时钟，300ms 只在测试说走时走。 */
+  function fakeTimers(): { setTimeout: (run: () => void, ms: number) => number; clearTimeout: (handle: number) => void; advance(ms: number): void; pending(): number } {
+    let nextHandle = 1;
+    const queued = new Map<number, { run: () => void; at: number }>();
+    let now = 0;
+    return {
+      setTimeout: (run, ms) => {
+        const handle = nextHandle++;
+        queued.set(handle, { run, at: now + ms });
+        return handle;
+      },
+      clearTimeout: (handle) => {
+        queued.delete(handle);
+      },
+      advance: (ms) => {
+        now += ms;
+        for (const [handle, entry] of [...queued]) {
+          if (entry.at > now) continue;
+          queued.delete(handle);
+          entry.run();
+        }
+      },
+      pending: () => queued.size,
+    };
+  }
+
+  function confirmOf(): HTMLElement | null {
+    return document.querySelector<HTMLElement>(CONFIRM);
+  }
+
+  it("shows a box over the target and removes it after the duration", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    const rect = { x: 120, y: 80, w: 60, h: 24 };
+
+    overlay.confirm(rect, { timers });
+    const box = confirmOf();
+    expect(box).not.toBeNull();
+    // 框要落在目标上，而不是页角。
+    expect(box?.style.left).toBe(String(rect.x) + "px");
+    expect(box?.style.top).toBe(String(rect.y) + "px");
+    expect(box?.style.width).toBe(String(rect.w) + "px");
+    expect(box?.style.height).toBe(String(rect.h) + "px");
+
+    // 300ms 前还在，到点就没了。
+    timers.advance(299);
+    expect(confirmOf()).not.toBeNull();
+    timers.advance(1);
+    expect(confirmOf()).toBeNull();
+  });
+
+  it("survives the round teardown that follows a hit", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.render(hintsOf(["as"]));
+    // 命中后浮层整轮销毁，确认框必须活下来，否则用户什么都看不到。
+    overlay.destroy();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+    expect(confirmOf()).not.toBeNull();
+    expect(overlayCanvas()).toBeNull();
+  });
+
+  it("does not intercept pointer events", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+    // 确认框只是事后回执，绝不能挡住用户紧接着要点的东西。
+    expect(confirmOf()?.style.pointerEvents).toBe("none");
+  });
+
+  it("replaces the previous confirmation instead of stacking", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+    overlay.confirm({ x: 40, y: 40, w: 20, h: 20 }, { timers });
+
+    expect(document.querySelectorAll(CONFIRM)).toHaveLength(1);
+    expect(confirmOf()?.style.left).toBe("40px");
+    // 旧的那条定时器不能把新框提前收走。
+    timers.advance(300);
+    expect(confirmOf()).toBeNull();
+  });
+
+  it("clears on demand, for Esc and for a new round", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+    overlay.clearConfirm();
+    expect(confirmOf()).toBeNull();
+    // 清掉之后排队的那一枪不能再打一次。
+    timers.advance(300);
+    expect(confirmOf()).toBeNull();
+  });
+
+  it("drops the transition when the reader asked for reduced motion", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    const original = dom.window.matchMedia;
+    (dom.window as unknown as Record<string, unknown>)["matchMedia"] = (query: string) => ({
+      matches: query.includes("prefers-reduced-motion"),
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    });
+    try {
+      overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+      // 减少动态偏好下不做过渡：框直接出现，到点直接消失。
+      expect(confirmOf()?.style.transition).toBe("");
+    } finally {
+      (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
+    }
+  });
+
+  it("keeps the transition when motion is allowed", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    const original = dom.window.matchMedia;
+    (dom.window as unknown as Record<string, unknown>)["matchMedia"] = (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    });
+    try {
+      overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+      expect(confirmOf()?.style.transition).toContain("opacity");
+    } finally {
+      (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
+    }
+  });
+});
