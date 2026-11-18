@@ -69,6 +69,14 @@ export interface OverlayDeps {
   clock?: FrameClock;
   /** Test seam: jsdom has no 2D context, so tests record draw calls instead. */
   canvasContext?: CanvasContextFactory;
+  /**
+   * Told the wall clock of every `paint` call.
+   *
+   * The app owns the per-frame probe and the frame boundary; this hook is the
+   * only way the paint stage can report into the same frame as the collection
+   * slice that triggered it. Absent when the host disabled the probe.
+   */
+  onPaint?: (durationMs: number) => void;
 }
 
 /**
@@ -140,6 +148,21 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   const viewport =
     deps.viewport ?? (() => ({ width: globalThis.innerWidth, height: globalThis.innerHeight }));
   const clock = deps.clock ?? defaultClock(doc);
+  /**
+   * Paint clock, only resolved when a probe is listening.
+   *
+   * `clock` is a frame scheduler and may be a test stepper; paint duration is
+   * wall clock and must come from the page realm, not from that seam.
+   */
+  const paintNow =
+    deps.onPaint === undefined
+      ? undefined
+      : (() => {
+          const perf = doc.defaultView?.performance;
+          return perf !== undefined && typeof perf.now === "function"
+            ? () => perf.now()
+            : () => Date.now();
+        })();
   let surface: CanvasSurface | undefined;
   let round: Round | undefined;
 
@@ -186,9 +209,14 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
    * round state, so `visibleLabels()` can answer without reading pixels.
    */
   function paint(target: Round, count: number): void {
-    const canvas = ensureSurface();
     const next = Math.min(Math.max(count, 0), target.hints.length);
-    canvas.paint(target.hints, target.bounds, target.pending, next);
+    const started = paintNow === undefined ? 0 : paintNow();
+    try {
+      const canvas = ensureSurface();
+      canvas.paint(target.hints, target.bounds, target.pending, next);
+    } finally {
+      if (paintNow !== undefined) deps.onPaint?.(paintNow() - started);
+    }
     target.drawn = next;
     if (next >= target.hints.length) settle(target);
   }

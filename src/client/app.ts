@@ -97,6 +97,34 @@ export interface AppDeps {
    * tests inject a queue so the sample only begins when they release it.
    */
   idleScheduler?: (run: () => void) => void;
+  /**
+   * Turns the per-frame occupancy probe off.
+   *
+   * The probe costs two `performance.now()` reads per stage and keeps a bounded
+   * ring of numbers, so it is on by default. A host that would rather not hold
+   * the memory (production telemetry off, a long-lived tab) can say so; the
+   * bench then has no plugin-side samples and cannot judge acceptance.
+   */
+  perfProbe?: false;
+}
+
+/** Where the frame budget reported by `perfStats()` came from. */
+export type PerfBudgetSource = "injected" | "published" | "measured" | "fallback";
+
+/**
+ * The plugin's own per-frame occupancy, read without touching plugin state.
+ *
+ * `samples` are frame-aligned: one entry per observed frame in each array, and
+ * a stage that did not run in that frame contributes 0. The arrays keep the
+ * most recent {@link PERF_SAMPLE_LIMIT} frames; `frames` counts every observed
+ * frame, including the ones already evicted. Frame alignment is what lets a
+ * bench add the two stages into one frame cost.
+ */
+export interface PerfStats {
+  readonly frameBudgetMs: number | null;
+  readonly budgetSource: PerfBudgetSource;
+  readonly samples: { readonly collect: readonly number[]; readonly paint: readonly number[] };
+  readonly frames: number;
 }
 
 export interface JumpApp {
@@ -114,6 +142,13 @@ export interface JumpApp {
   labels(): readonly string[];
   /** Labels already painted; equal to `labels()` once the round settles. */
   visibleLabels(): readonly string[];
+  /**
+   * The plugin's own per-frame occupancy, read-only.
+   *
+   * Empty before `apply()` and while the probe is disabled; the arrays are
+   * copies, so a caller cannot move the probe's window by mutating them.
+   */
+  perfStats(): PerfStats;
 }
 
 function defaultIsVisible(element: Element): boolean {
@@ -188,12 +223,127 @@ const COLLECT_BUDGET_MIN_MS = 0.4;
  * ones aimed at the labels about to appear.
  */
 const BUFFERED_KEY_LIMIT = 4;
+/**
+ * Frames of probe history kept per stage.
+ *
+ * The bench reads p99, which needs a real tail; 512 frames is several tiers of
+ * 10 activations, and a fixed ring keeps the probe from growing on a tab that
+ * runs for hours. Older frames fall off first.
+ */
+const PERF_SAMPLE_LIMIT = 512;
 
 /** The display cadence the embedding page publishes, or undefined. */
 function publishedFrameBudget(): number | undefined {
   const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: unknown };
   const value = host.__DSH_JUMP_FRAME_BUDGET_MS__;
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** A valid injected budget, or undefined. */
+function injectedFrameBudget(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+interface BudgetState {
+  readonly frameBudgetMs: number | null;
+  readonly budgetSource: PerfBudgetSource;
+}
+
+/** The budget a fresh app reports before any sample or activation. */
+function initialBudgetState(injected: number | undefined): BudgetState {
+  if (injected !== undefined) return { frameBudgetMs: injected, budgetSource: "injected" };
+  const published = publishedFrameBudget();
+  if (published !== undefined) return { frameBudgetMs: published, budgetSource: "published" };
+  return { frameBudgetMs: null, budgetSource: "fallback" };
+}
+
+/** The performance clock of the page realm, or a wall clock where it is absent. */
+function frameNow(doc: Document): () => number {
+  const perf = doc.defaultView?.performance;
+  if (perf !== undefined && typeof perf.now === "function") return () => perf.now();
+  return () => Date.now();
+}
+
+/**
+ * Frame-aligned occupancy rings for the two synchronous stages.
+ *
+ * A frame is opened by the app around one stage A slice; a paint triggered
+ * inside that slice lands in the same frame, so collect and paint can be added
+ * per index. A paint triggered on its own (a prefix repaint) opens and closes a
+ * paint-only frame. Typed arrays keep the steady state allocation-free; the
+ * arrays `snapshot` returns are built only when a reader asks.
+ */
+interface PerfProbe {
+  beginFrame(): void;
+  endFrame(): void;
+  recordCollect(durationMs: number): void;
+  recordPaint(durationMs: number): void;
+  snapshot(): { collect: number[]; paint: number[]; frames: number };
+}
+
+function createPerfProbe(limit = PERF_SAMPLE_LIMIT): PerfProbe {
+  const collectRing = new Float64Array(limit);
+  const paintRing = new Float64Array(limit);
+  let head = 0;
+  let kept = 0;
+  let frames = 0;
+  let open = false;
+  let collectMsInFrame = 0;
+  let paintMsInFrame = 0;
+
+  function flush(): void {
+    collectRing[head] = collectMsInFrame;
+    paintRing[head] = paintMsInFrame;
+    head = (head + 1) % limit;
+    if (kept < limit) kept += 1;
+    frames += 1;
+    collectMsInFrame = 0;
+    paintMsInFrame = 0;
+  }
+
+  function read(ring: Float64Array): number[] {
+    const values: number[] = [];
+    const start = kept === limit ? head : 0;
+    for (let index = 0; index < kept; index += 1) {
+      values.push(ring[(start + index) % limit] as number);
+    }
+    return values;
+  }
+
+  return {
+    beginFrame(): void {
+      if (open) return;
+      open = true;
+      collectMsInFrame = 0;
+      paintMsInFrame = 0;
+    },
+    endFrame(): void {
+      if (!open) return;
+      open = false;
+      flush();
+    },
+    recordCollect(durationMs: number): void {
+      if (!open) {
+        open = true;
+        collectMsInFrame = 0;
+        paintMsInFrame = 0;
+      }
+      collectMsInFrame += durationMs;
+    },
+    recordPaint(durationMs: number): void {
+      if (open) {
+        paintMsInFrame += durationMs;
+        return;
+      }
+      open = true;
+      paintMsInFrame = durationMs;
+      open = false;
+      flush();
+    },
+    snapshot() {
+      return { collect: read(collectRing), paint: read(paintRing), frames };
+    },
+  };
 }
 
 function collectBudgetMs(frameBudget: number): number {
@@ -442,11 +592,18 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   // across activations, and it dies with the module instance, so a reload
   // starts clean.
   const memory = createLabelMemory();
+  // The probe is created once and shared by both stages: the app owns the
+  // frame boundary, the overlay reports paint durations into the open frame.
+  const probe = deps.perfProbe === false ? undefined : createPerfProbe();
+  const measureNow = frameNow(win.document);
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
     clock: deps.frameClock,
+    onPaint: probe === undefined ? undefined : (durationMs) => probe.recordPaint(durationMs),
   });
+  /** The last budget the app used or measured; also the probe's budget. */
+  let budgetState: BudgetState = initialBudgetState(injectedFrameBudget(deps.frameBudgetMs));
   /**
    * The promise of the current collection round, resolved when its badges are
    * painted or the round is cancelled. Kept outside `apply` so `settled()` can
@@ -479,18 +636,27 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     visibleLabels(): readonly string[] {
       return overlay.visibleLabels();
     },
+    perfStats(): PerfStats {
+      const samples = probe === undefined ? { collect: [], paint: [], frames: 0 } : probe.snapshot();
+      return {
+        frameBudgetMs: budgetState.frameBudgetMs,
+        budgetSource: budgetState.budgetSource,
+        samples: { collect: samples.collect, paint: samples.paint },
+        frames: samples.frames,
+      };
+    },
     apply(): () => void {
       const state = createKeyState();
       let hints: Hint[] = [];
       let roundOpen = false;
       const collectClock = deps.frameClock ?? defaultFrameClock(win.document);
-      const injectedBudget =
-        typeof deps.frameBudgetMs === "number" &&
-        Number.isFinite(deps.frameBudgetMs) &&
-        deps.frameBudgetMs > 0
-          ? deps.frameBudgetMs
-          : undefined;
+      const injectedBudget = injectedFrameBudget(deps.frameBudgetMs);
       const publishedBudget = publishedFrameBudget();
+      if (injectedBudget !== undefined) {
+        budgetState = { frameBudgetMs: injectedBudget, budgetSource: "injected" };
+      } else if (publishedBudget !== undefined) {
+        budgetState = { frameBudgetMs: publishedBudget, budgetSource: "published" };
+      }
       const scheduleIdle = deps.idleScheduler ?? runWhenIdle;
       /** The stage A walk still in flight, if any. */
       let collecting: CollectorRound | undefined;
@@ -512,13 +678,34 @@ export function createApp(deps: AppDeps = {}): JumpApp {
        * background where its gaps are throttled.
        */
       function currentFrameBudget(): number {
-        if (injectedBudget !== undefined) return injectedBudget;
-        if (publishedBudget !== undefined) return publishedBudget;
-        if (win.document.hidden) return FALLBACK_FRAME_BUDGET_MS;
+        const state = currentBudget();
+        budgetState = state;
+        return state.frameBudgetMs;
+      }
+
+      /**
+       * The budget and its provenance for an activation starting now.
+       *
+       * Precedence: the caller's value, the embedding page's published value,
+       * a completed sample, then the conservative budget while the sample is
+       * still in flight. A hidden page answers the 60Hz fallback: nothing can
+       * be painted there, and the sample is not allowed to run in the
+       * background where its gaps are throttled.
+       */
+      function currentBudget(): { frameBudgetMs: number; budgetSource: PerfBudgetSource } {
+        if (injectedBudget !== undefined) {
+          return { frameBudgetMs: injectedBudget, budgetSource: "injected" };
+        }
+        if (publishedBudget !== undefined) {
+          return { frameBudgetMs: publishedBudget, budgetSource: "published" };
+        }
+        if (win.document.hidden) {
+          return { frameBudgetMs: FALLBACK_FRAME_BUDGET_MS, budgetSource: "fallback" };
+        }
         const current = { width: win.innerWidth, height: win.innerHeight };
         if (measuredBudgetMs !== undefined) {
           if (measuredViewport === undefined || sameViewport(measuredViewport, current)) {
-            return measuredBudgetMs;
+            return { frameBudgetMs: measuredBudgetMs, budgetSource: "measured" };
           }
           // The display may have changed under the same window (external
           // monitor, refresh-rate switch); the old value still serves this
@@ -526,10 +713,12 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           const stale = measuredBudgetMs;
           resetSample();
           sampleDisplay();
-          return stale;
+          return { frameBudgetMs: stale, budgetSource: "measured" };
         }
-        if (collectClock === undefined) return FALLBACK_FRAME_BUDGET_MS;
-        return CONSERVATIVE_FRAME_BUDGET_MS;
+        if (collectClock === undefined) {
+          return { frameBudgetMs: FALLBACK_FRAME_BUDGET_MS, budgetSource: "fallback" };
+        }
+        return { frameBudgetMs: CONSERVATIVE_FRAME_BUDGET_MS, budgetSource: "fallback" };
       }
 
       function sameViewport(a: { width: number; height: number }, b: { width: number; height: number }): boolean {
@@ -570,6 +759,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
             if (budgetMs === undefined) return;
             measuredBudgetMs = budgetMs;
             measuredViewport = { width: win.innerWidth, height: win.innerHeight };
+            budgetState = { frameBudgetMs: budgetMs, budgetSource: "measured" };
           });
         });
       }
@@ -625,6 +815,42 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         void render.done.then(() => round.resolve());
       }
 
+      /**
+       * Run one stage A slice, and commit inside the same probe frame.
+       *
+       * A slice that finishes triggers the paint, and the two costs belong to
+       * one animation frame; closing the probe frame between them would report
+       * them as two frames and hide the commit frame's real occupancy.
+       */
+      function runCollectSlice(round: CollectorRound, budgetMs: number, now: () => number): boolean {
+        const frameProbe = probe;
+        if (frameProbe === undefined) {
+          const done = round.scan.advance(budgetMs, now);
+          if (done) {
+            collecting = undefined;
+            commitCollection(round);
+          }
+          return done;
+        }
+        let done = false;
+        frameProbe.beginFrame();
+        try {
+          const started = measureNow();
+          try {
+            done = round.scan.advance(budgetMs, now);
+          } finally {
+            frameProbe.recordCollect(measureNow() - started);
+          }
+          if (done) {
+            collecting = undefined;
+            commitCollection(round);
+          }
+        } finally {
+          frameProbe.endFrame();
+        }
+        return done;
+      }
+
       /** Queue the next stage A slice on the next frame. */
       function scheduleCollection(round: CollectorRound): void {
         const frameClock = collectClock;
@@ -632,12 +858,9 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         round.handle = frameClock.request(() => {
           round.handle = undefined;
           if (round.cancelled || collecting !== round) return;
-          if (!round.scan.advance(collectBudgetMs(currentFrameBudget()), () => frameClock.now())) {
+          if (!runCollectSlice(round, collectBudgetMs(currentFrameBudget()), () => frameClock.now())) {
             scheduleCollection(round);
-            return;
           }
-          collecting = undefined;
-          commitCollection(round);
         });
       }
 
@@ -669,14 +892,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const round: CollectorRound = { scan, handle: undefined, cancelled: false, resolve };
         collecting = round;
         if (collectClock === undefined) {
-          scan.advance(Number.POSITIVE_INFINITY);
-          collecting = undefined;
-          commitCollection(round);
+          runCollectSlice(round, Number.POSITIVE_INFINITY, measureNow);
           return hints;
         }
-        if (scan.advance(collectBudgetMs(currentFrameBudget()), () => collectClock.now())) {
-          collecting = undefined;
-          commitCollection(round);
+        if (runCollectSlice(round, collectBudgetMs(currentFrameBudget()), () => collectClock.now())) {
           return hints;
         }
         scheduleCollection(round);

@@ -327,6 +327,86 @@ describe("createApp wiring", () => {
   });
 });
 
+describe("per-frame occupancy probe", () => {
+  it("reports paint samples after a 300-candidate activation", () => {
+    buttons(300);
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
+
+    activate();
+
+    const stats = app.perfStats();
+    expect(stats.samples.paint.length).toBeGreaterThan(0);
+    for (const value of stats.samples.paint) {
+      expect(Number.isFinite(value)).toBe(true);
+      expect(value).toBeGreaterThan(0);
+    }
+    expect(stats.frames).toBe(stats.samples.paint.length);
+    teardown();
+  });
+
+  it("returns empty samples before the app is mounted", () => {
+    const app = createApp({ window: win, isVisible: () => true });
+
+    const stats = app.perfStats();
+    expect(stats.samples).toEqual({ collect: [], paint: [] });
+    expect(stats.frames).toBe(0);
+    expect(stats.frameBudgetMs).toBeNull();
+    expect(stats.budgetSource).toBe("fallback");
+  });
+
+  it("keeps at most 512 samples when 600 frames are painted", () => {
+    buttons(4);
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
+
+    for (let index = 0; index < 600; index += 1) {
+      activate();
+      win.dispatchEvent(keydown({ key: "Escape" }));
+    }
+
+    const stats = app.perfStats();
+    expect(stats.frames).toBe(600);
+    expect(stats.samples.paint.length).toBe(512);
+    expect(stats.samples.collect.length).toBe(512);
+    teardown();
+  });
+
+  it("can be turned off without changing labels or drawing", () => {
+    buttons(12);
+    const appOn = createApp({ window: win, isVisible: () => true });
+    const teardownOn = appOn.apply();
+    activate();
+    const labelsOn = appOn.labels();
+    const drawOn = canvasOps.map((op) => ({ ...op, args: [...op.args] }));
+    expect(appOn.perfStats().samples.paint.length).toBeGreaterThan(0);
+    teardownOn();
+
+    canvasOps = [];
+    const appOff = createApp({ window: win, isVisible: () => true, perfProbe: false });
+    const teardownOff = appOff.apply();
+    activate();
+
+    expect(appOff.labels()).toEqual(labelsOn);
+    expect(canvasOps.map((op) => ({ ...op, args: [...op.args] }))).toEqual(drawOn);
+    expect(appOff.perfStats().samples).toEqual({ collect: [], paint: [] });
+    expect(appOff.perfStats().frames).toBe(0);
+    teardownOff();
+  });
+
+  it("reports the injected display budget and its source", () => {
+    buttons(2);
+    const app = createApp({ window: win, isVisible: () => true, frameBudgetMs: 7 });
+    const teardown = app.apply();
+
+    activate();
+
+    expect(app.perfStats().frameBudgetMs).toBe(7);
+    expect(app.perfStats().budgetSource).toBe("injected");
+    teardown();
+  });
+});
+
 describe("badge segments in a multi-key round", () => {
   // 断言先失败时也要摘掉监听器，否则漏掉的 app 会接管后续用例的按键。
   let stop: (() => void) | undefined;

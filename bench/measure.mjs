@@ -184,9 +184,6 @@ export function frameVerdict(excessPct) {
 /** Share of the frame the plugin may own; the rest belongs to the host. */
 export const ATTRIBUTION_BUDGET_SHARE = 0.5;
 
-/** Activation latency may span two frames; double-rAF is not a single frame. */
-export const ACTIVATION_BUDGET_FRAMES = 2;
-
 /** Why the differential verdict remains in the JSON without deciding acceptance. */
 export const VERDICT_LEGACY_NOTE =
   "legacy differential verdict: pass when the active over-budget rate minus the idle control rate is at most " +
@@ -199,6 +196,61 @@ export function roundMillis(value) {
   if (value === null || value === undefined || !Number.isFinite(value)) return null;
   return Math.round(value * 1000) / 1000;
 }
+
+/** Frames of plugin probe history the bench reads; the plugin keeps the same window. */
+export const PERF_SAMPLE_LIMIT = 512;
+
+/**
+ * The most recent `limit` samples, in order.
+ *
+ * The plugin already bounds its own rings; repeating the cap here keeps the
+ * aggregation bounded if a host hands over a longer array, and lets `--check`
+ * prove the 512-frame window without a browser.
+ */
+export function boundedSamples(values, limit = PERF_SAMPLE_LIMIT) {
+  if (!Array.isArray(values)) return [];
+  const finite = values.filter((value) => typeof value === "number" && Number.isFinite(value));
+  return finite.length <= limit ? finite : finite.slice(finite.length - limit);
+}
+
+function summarizeSeries(values) {
+  return {
+    p50: roundMillis(nearestRankPercentile(values, 50)),
+    p99: roundMillis(nearestRankPercentile(values, 99)),
+    max: roundMillis(maxFrameIntervalMs(values)),
+  };
+}
+
+/**
+ * The plugin's own per-frame occupancy, from `app.perfStats()`.
+ *
+ * `samples.collect` and `samples.paint` are frame-aligned: the probe flushes
+ * one pair per observed frame, with 0 where that stage did not run. Index i of
+ * both arrays therefore describes one frame and the two values can be added.
+ * If a host reports different lengths (an older build, a future probe), the
+ * arrays are not frame-aligned; the combined series stays null instead of
+ * pairing by index and inventing frames neither stage observed, and only the
+ * separate collect and paint readings stand.
+ */
+export function summarizePluginFrame(perfStats, limit = PERF_SAMPLE_LIMIT) {
+  const collect = boundedSamples(perfStats?.samples?.collect, limit);
+  const paint = boundedSamples(perfStats?.samples?.paint, limit);
+  const aligned = collect.length === paint.length;
+  const frames = aligned ? collect.map((value, index) => value + paint[index]) : [];
+  return {
+    pluginFrameMs: { ...summarizeSeries(frames), samples: frames.length, aligned: aligned },
+    pluginCollectMs: { ...summarizeSeries(collect), samples: collect.length },
+    pluginPaintMs: { ...summarizeSeries(paint), samples: paint.length },
+  };
+}
+
+/** Why the coarse observers cannot decide a 7ms budget. */
+export const LOAF_EVIDENCE_NOTE =
+  "coarse corroboration only: long-animation-frame entries exist only for frames over 50ms, " +
+  "so a 2ms plugin handler on a 7ms display produces no attribution at all; used to explain slow frames, never to decide the verdict.";
+export const EVENT_TIMING_EVIDENCE_NOTE =
+  "coarse corroboration only: Event Timing floors observation at 16ms even with durationThreshold 0, " +
+  "so a fast activation leaves no entry; used to describe interaction latency, never to decide the verdict.";
 
 /**
  * The plugin bundle's scripts inside one long-animation-frame entry.
@@ -295,42 +347,32 @@ export function summarizeEventDurations(durations) {
 /**
  * Whether a tier's numbers can decide acceptance.
  *
- * Headless Chrome has no GPU presentation path, and the canvas cost sits
- * exactly in the part software raster distorts. Such a run is a regression
- * smoke test. A headed run also needs a measured display budget and at least
- * one long frame that actually ran the plugin; without an attributed frame the
- * bench has no plugin cost to judge.
+ * The plugin probes its own synchronous work, so a real sample exists even
+ * when no frame was long enough for LoAF and no keydown cleared Event Timing's
+ * 16ms floor. Sample count is the whole test: a measured display budget plus
+ * at least one frame of `pluginFrameMs`. LoAF and Event Timing are structural
+ * corroboration now, not judgeability gates.
  */
-export function isJudgeable({ userAgent, frameBudgetMs, attributedPluginMs }) {
-  const agent = typeof userAgent === "string" ? userAgent : "";
-  if (agent.includes("Headless")) return false;
+export function isJudgeable({ frameBudgetMs, pluginFrameMs }) {
   if (!Number.isFinite(frameBudgetMs) || frameBudgetMs <= 0) return false;
-  if (attributedPluginMs === null || attributedPluginMs === undefined) return false;
-  return Number.isFinite(attributedPluginMs.p99);
+  if (pluginFrameMs === null || pluginFrameMs === undefined) return false;
+  return Number.isFinite(pluginFrameMs.p99);
 }
 
 /**
  * The attributed acceptance rule.
  *
- * The plugin owns at most half a frame at p99, and a real activation may span
- * two frames end to end. Both conditions must hold; a missing activation
- * sample cannot prove the second half and therefore fails instead of passing
- * by default. A non-judgeable environment is reported as `smoke-only`, never
- * as a pass.
+ * The plugin's own frame occupancy at p99 must stay within half a frame. That
+ * one condition decides: Event Timing is floored at 16ms, so letting it veto a
+ * fast plugin would bring back the bug this rule replaces. A non-judgeable
+ * environment is `smoke-only`, never a pass.
  */
-export function attributedVerdict({ judgeable, frameBudgetMs, attributedPluginMs, activationEventDurationMs }) {
+export function attributedVerdict({ judgeable, frameBudgetMs, pluginFrameMs }) {
   if (!judgeable) return "smoke-only";
   if (!Number.isFinite(frameBudgetMs) || frameBudgetMs <= 0) return "fail";
-  const pluginP99 = attributedPluginMs === null || attributedPluginMs === undefined ? null : attributedPluginMs.p99;
-  const activationP95 =
-    activationEventDurationMs === null || activationEventDurationMs === undefined
-      ? null
-      : activationEventDurationMs.p95;
-  if (!Number.isFinite(pluginP99) || !Number.isFinite(activationP95)) return "fail";
-  return pluginP99 <= frameBudgetMs * ATTRIBUTION_BUDGET_SHARE &&
-    activationP95 <= frameBudgetMs * ACTIVATION_BUDGET_FRAMES
-    ? "pass"
-    : "fail";
+  const pluginP99 = pluginFrameMs === null || pluginFrameMs === undefined ? null : pluginFrameMs.p99;
+  if (!Number.isFinite(pluginP99)) return "fail";
+  return pluginP99 <= frameBudgetMs * ATTRIBUTION_BUDGET_SHARE ? "pass" : "fail";
 }
 
 /**
@@ -624,10 +666,15 @@ function pageScript(config) {
   const pluginScriptEntries = ${pluginScriptEntries.toString()};
   const summarizeScriptAttribution = ${summarizeScriptAttribution.toString()};
   const summarizeEventDurations = ${summarizeEventDurations.toString()};
+  const PERF_SAMPLE_LIMIT = ${PERF_SAMPLE_LIMIT};
+  const boundedSamples = ${boundedSamples.toString()};
+  const summarizeSeries = ${summarizeSeries.toString()};
+  const summarizePluginFrame = ${summarizePluginFrame.toString()};
   const isJudgeable = ${isJudgeable.toString()};
   const attributedVerdict = ${attributedVerdict.toString()};
   const ATTRIBUTION_BUDGET_SHARE = ${ATTRIBUTION_BUDGET_SHARE};
-  const ACTIVATION_BUDGET_FRAMES = ${ACTIVATION_BUDGET_FRAMES};
+  const LOAF_EVIDENCE_NOTE = ${JSON.stringify(LOAF_EVIDENCE_NOTE)};
+  const EVENT_TIMING_EVIDENCE_NOTE = ${JSON.stringify(EVENT_TIMING_EVIDENCE_NOTE)};
   const VERDICT_LEGACY_NOTE = ${JSON.stringify(VERDICT_LEGACY_NOTE)};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
@@ -1212,13 +1259,34 @@ function pageScript(config) {
     await new Promise((resolve) => setTimeout(resolve, 120));
     loaf.stop();
     eventTiming.stop();
+    const perf = app.perfStats ? app.perfStats() : null;
+    const plugin = summarizePluginFrame(perf);
+    // The app was handed this tier's own measurement, so both numbers answer
+    // the same display; prefer the app's copy so the source travels with it.
+    const perfFrameBudgetMs = Number.isFinite(perf?.frameBudgetMs) ? perf.frameBudgetMs : frameBudgetMs;
+    const budgetSource = typeof perf?.budgetSource === "string" ? perf.budgetSource : null;
     const attribution = summarizeScriptAttribution(loaf.entries, CONFIG.pluginBundle);
     const activationEventDurationMs = summarizeEventDurations(eventTiming.durations);
     const judgeable = isJudgeable({
-      userAgent: navigator.userAgent,
-      frameBudgetMs: frameBudgetMs,
-      attributedPluginMs: attribution.attributedPluginMs,
+      frameBudgetMs: perfFrameBudgetMs,
+      pluginFrameMs: plugin.pluginFrameMs,
     });
+    const loafEvidence = {
+      note: LOAF_EVIDENCE_NOTE,
+      supported: loaf.supported,
+      longFrames: attribution.loafFrames,
+      attributedPluginMs: attribution.attributedPluginMs,
+      attributedForcedLayoutMs: attribution.attributedForcedLayoutMs,
+      attributedFrames: attribution.attributedFrames,
+      excludedLongFrames: attribution.excludedLongFrames,
+      worst: worstLoafOf(loaf.entries),
+    };
+    const eventTimingEvidence = {
+      note: EVENT_TIMING_EVIDENCE_NOTE,
+      supported: eventTiming.supported,
+      samples: eventTiming.durations.length,
+      durationMs: activationEventDurationMs,
+    };
     const maxFrameMs = roundMs(maxFrameIntervalMs(frameIntervals));
     const overBudgetFrames =
       frameIntervals.length === 0 ? null : frameIntervals.filter((gap) => gap > frameBudgetMs).length;
@@ -1246,9 +1314,8 @@ function pageScript(config) {
         ? "stale"
         : attributedVerdict({
             judgeable: judgeable,
-            frameBudgetMs: frameBudgetMs,
-            attributedPluginMs: attribution.attributedPluginMs,
-            activationEventDurationMs: activationEventDurationMs,
+            frameBudgetMs: perfFrameBudgetMs,
+            pluginFrameMs: plugin.pluginFrameMs,
           });
 
     return {
@@ -1260,7 +1327,12 @@ function pageScript(config) {
       identityKeysPerRound: identity.calls,
       identityRounds: rounds,
       identityPath: identity.calls > 0 && identity.remembered > 0 ? "active" : "inactive",
-      frameBudgetMs: frameBudgetMs,
+      frameBudgetMs: perfFrameBudgetMs,
+      budgetSource: budgetSource,
+      perfFrames: perf === null ? 0 : perf.frames,
+      pluginFrameMs: plugin.pluginFrameMs,
+      pluginCollectMs: plugin.pluginCollectMs,
+      pluginPaintMs: plugin.pluginPaintMs,
       maxFrameMs: maxFrameMs,
       overBudgetFrames: overBudgetFrames,
       overBudgetPct: activeOverBudgetPct,
@@ -1276,18 +1348,10 @@ function pageScript(config) {
       verdictLegacyNote: VERDICT_LEGACY_NOTE,
       verdictAttributed: verdictAttributed,
       judgeable: judgeable,
-      attributedPluginMs: attribution.attributedPluginMs,
-      attributedForcedLayoutMs: attribution.attributedForcedLayoutMs,
-      attributedFrames: attribution.attributedFrames,
-      excludedLongFrames: attribution.excludedLongFrames,
-      loafFrames: attribution.loafFrames,
-      activationEventDurationMs: activationEventDurationMs,
-      activationEventSamples: eventTiming.durations.length,
-      eventTimingSupported: eventTiming.supported,
+      loafEvidence: loafEvidence,
+      eventTimingEvidence: eventTimingEvidence,
       trustedActivations: trustedActivations,
       staleReasons: staleReasons,
-      loafSupported: loaf.supported,
-      worstLoaf: worstLoafOf(loaf.entries),
       finishedAtMs: finishedAtMs,
       activate: phase(activate),
       firstStroke: phase(firstStroke),
@@ -1346,14 +1410,21 @@ function pageScript(config) {
           String(NOISE_BAND_PCT) +
           " percentage points",
         attributionRule:
-          "attributedPluginMs.p99 <= frameBudgetMs * " +
+          "pluginFrameMs.p99 <= frameBudgetMs * " +
           String(ATTRIBUTION_BUDGET_SHARE) +
-          " and activationEventDurationMs.p95 <= frameBudgetMs * " +
-          String(ACTIVATION_BUDGET_FRAMES),
+          ", where pluginFrameMs adds the plugin's collect and paint samples of the same frame",
         judgeableRule:
-          "judgeable only when the user agent is not Headless, the display budget was measured, and at least one long frame ran the plugin bundle",
+          "judgeable when the display budget is finite and app.perfStats() produced at least one frame sample; " +
+          "LoAF and Event Timing are coarse corroboration only",
+        pluginProbeRule:
+          "the plugin times each stage A collect slice and each paint with performance.now, flushes one pair per observed frame " +
+          "and keeps the latest " +
+          String(PERF_SAMPLE_LIMIT) +
+          " frames",
+        evidenceNote: LOAF_EVIDENCE_NOTE + " " + EVENT_TIMING_EVIDENCE_NOTE,
         headlessNote:
-          "headless Chrome with --disable-gpu exercises software raster, not the GPU presentation path; its readings are a regression smoke test, never acceptance evidence",
+          "headless Chrome with --disable-gpu exercises software raster, not the GPU presentation path; " +
+          "the probe still measures the plugin's own synchronous work, but treat headless numbers as a regression smoke test",
         timeToUsableRule:
           "wall clock from dispatchEvent return to every label of the round being painted, " +
           "sampled with performance.now; frames counted as animation frames observed in the same wait. " +
@@ -1921,8 +1992,15 @@ const REQUIRED_HOOKS = [
   "timeToUsableRule",
   "identityCalibrationDrift",
   "staleReasons",
-  "worstLoaf",
-  "loafSupported",
+  "perfStats",
+  "pluginFrameMs:",
+  "pluginCollectMs:",
+  "pluginPaintMs:",
+  "budgetSource:",
+  "PERF_SAMPLE_LIMIT",
+  "summarizePluginFrame",
+  "loafEvidence",
+  "eventTimingEvidence",
   "long-animation-frame",
   "sourceURL",
   "sourceFunctionName",
@@ -1932,10 +2010,6 @@ const REQUIRED_HOOKS = [
   "attributedForcedLayoutMs:",
   "attributedFrames:",
   "excludedLongFrames:",
-  "loafFrames:",
-  "activationEventDurationMs:",
-  "activationEventSamples:",
-  "eventTimingSupported:",
   "trustedActivations:",
   "durationThreshold: 0",
   "__BENCH_TRUSTED_REQUEST__",
@@ -1945,6 +2019,8 @@ const REQUIRED_HOOKS = [
   "verdictLegacyNote:",
   "attributionRule",
   "judgeableRule",
+  "pluginProbeRule",
+  "evidenceNote",
   "headlessNote",
   "verifyFresh",
   "navigationType",
@@ -2160,33 +2236,84 @@ function assertAttributionContract() {
 }
 
 /**
+ * Plugin occupancy contract.
+ *
+ * The probe flushes one pair per observed frame, so a fixed series pins the
+ * aggregation: p50/p99/max are nearest-rank over the paired sums, and the
+ * 600-frame fixture proves the 512-frame window keeps the newest samples. A
+ * host that reports mismatched array lengths is not frame-aligned; the
+ * combined series must stay null instead of pairing invented frames.
+ */
+function assertPerfProbeContract() {
+  const fixed = summarizePluginFrame({
+    samples: { collect: [0, 1, 2, 3], paint: [3, 4, 5, 6] },
+    frames: 4,
+  });
+  const expected = JSON.stringify({
+    pluginFrameMs: { p50: 5, p99: 9, max: 9, samples: 4, aligned: true },
+    pluginCollectMs: { p50: 1, p99: 3, max: 3, samples: 4 },
+    pluginPaintMs: { p50: 4, p99: 6, max: 6, samples: 4 },
+  });
+  if (JSON.stringify(fixed) !== expected) {
+    throw new Error(`plugin occupancy summary is ${JSON.stringify(fixed)}, expected ${expected}`);
+  }
+
+  const long = {
+    samples: {
+      collect: Array.from({ length: 600 }, (_, index) => index),
+      paint: Array.from({ length: 600 }, (_, index) => index),
+    },
+  };
+  const capped = summarizePluginFrame(long);
+  if (capped.pluginFrameMs.samples !== PERF_SAMPLE_LIMIT) {
+    throw new Error(`600 frames must keep ${PERF_SAMPLE_LIMIT} samples, got ${String(capped.pluginFrameMs.samples)}`);
+  }
+  if (capped.pluginFrameMs.max !== 1198) {
+    throw new Error(`the 600-frame window must keep the newest frame pair, got max ${String(capped.pluginFrameMs.max)}`);
+  }
+  const kept = boundedSamples(long.samples.collect);
+  if (kept.length !== PERF_SAMPLE_LIMIT || kept[0] !== 88 || kept[kept.length - 1] !== 599) {
+    throw new Error("the bounded window must drop the oldest samples first");
+  }
+
+  const empty = summarizePluginFrame({ samples: { collect: [], paint: [] } });
+  if (empty.pluginFrameMs.p99 !== null || empty.pluginFrameMs.samples !== 0) {
+    throw new Error("an empty perfStats window must report nulls, not zeros");
+  }
+  if (summarizePluginFrame(null).pluginFrameMs.p99 !== null) {
+    throw new Error("a host without perfStats must not fabricate a plugin frame reading");
+  }
+
+  const misaligned = summarizePluginFrame({ samples: { collect: [1, 2], paint: [1] } });
+  if (misaligned.pluginFrameMs.aligned !== false || misaligned.pluginFrameMs.p99 !== null) {
+    throw new Error("mismatched arrays are not frame-aligned and must not be added");
+  }
+}
+
+/**
  * Attributed verdict boundary.
  *
- * Both halves must gate: the plugin p99 at exactly half the frame budget
- * passes and one hundredth over fails, and the activation p95 at exactly two
- * frames passes and one hundredth over fails. A missing half is never a pass.
+ * The plugin p99 at exactly half the frame budget passes and one hundredth
+ * over fails. Event Timing is not an input, so a tier with a fast plugin
+ * cannot fail on a coarse interaction sample; a missing plugin sample is never
+ * a pass.
  */
 function assertAttributedVerdictContract() {
   const budget = 7;
-  const attribution = { p50: 1, p99: 3.5, max: 3.5 };
-  const activation = { p50: 8, p95: 14, max: 14 };
+  const plugin = { p50: 1, p99: 3.5, max: 3.5, samples: 20, aligned: true };
   const verdict = (patch) =>
     attributedVerdict({
       judgeable: true,
       frameBudgetMs: budget,
-      attributedPluginMs: attribution,
-      activationEventDurationMs: activation,
+      pluginFrameMs: plugin,
       ...patch,
     });
-  if (verdict({}) !== "pass") throw new Error("p99 at exactly half the budget and p95 at exactly two frames must pass");
-  if (verdict({ attributedPluginMs: { ...attribution, p99: 3.5001 } }) !== "fail") {
+  if (verdict({}) !== "pass") throw new Error("p99 at exactly half the budget must pass");
+  if (verdict({ pluginFrameMs: { ...plugin, p99: 3.5001 } }) !== "fail") {
     throw new Error("a plugin p99 just over half the budget must fail");
   }
-  if (verdict({ activationEventDurationMs: { ...activation, p95: 14.0001 } }) !== "fail") {
-    throw new Error("an activation p95 just over two frames must fail");
-  }
-  if (verdict({ activationEventDurationMs: { p50: null, p95: null, max: null } }) !== "fail") {
-    throw new Error("a tier with no activation sample must not pass");
+  if (verdict({ pluginFrameMs: null }) !== "fail") {
+    throw new Error("a tier with no plugin frame sample must not pass");
   }
   if (verdict({ judgeable: false }) !== "smoke-only") {
     throw new Error("a non-judgeable tier must report smoke-only instead of pass or fail");
@@ -2196,32 +2323,25 @@ function assertAttributedVerdictContract() {
 /**
  * Judgeability contract.
  *
- * A headless browser has no GPU presentation path, so its numbers are a
- * regression smoke test, not acceptance evidence. The same run also needs a
- * measured display budget and at least one attributed frame; a page that
- * produced no LoAF sample has no attribution to judge.
+ * The plugin's own probe is the only input beyond the display budget: LoAF
+ * reporting nothing and Event Timing flooring at 16ms are exactly the defect
+ * this layer exists to fix, so neither may make a tier non-judgeable.
  */
 function assertJudgeableContract() {
-  const headless = {
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36",
-    frameBudgetMs: 7,
-    attributedPluginMs: { p50: 1, p99: 2, max: 2 },
-  };
-  if (isJudgeable(headless) !== false) throw new Error("a HeadlessChrome UA must never be judgeable");
-  const headed = {
-    ...headless,
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
-  };
-  if (isJudgeable(headed) !== true) throw new Error("a headed browser with samples and a budget must be judgeable");
-  if (isJudgeable({ ...headed, attributedPluginMs: { p50: null, p99: null, max: null } }) !== false) {
-    throw new Error("no attributed sample must not be judgeable");
+  const plugin = { p50: 1, p99: 2, max: 2, samples: 20, aligned: true };
+  if (isJudgeable({ frameBudgetMs: 7, pluginFrameMs: plugin }) !== true) {
+    throw new Error("a measured budget and one plugin frame sample must be judgeable");
   }
-  if (isJudgeable({ ...headed, frameBudgetMs: null }) !== false) {
+  if (isJudgeable({ frameBudgetMs: 7, pluginFrameMs: null }) !== false) {
+    throw new Error("no plugin frame sample must not be judgeable");
+  }
+  if (isJudgeable({ frameBudgetMs: 7, pluginFrameMs: { p50: null, p99: null, max: null, samples: 0 } }) !== false) {
+    throw new Error("an empty plugin sample must not be judgeable");
+  }
+  if (isJudgeable({ frameBudgetMs: null, pluginFrameMs: plugin }) !== false) {
     throw new Error("an unmeasured display budget must not be judgeable");
   }
-  if (isJudgeable({ ...headed, frameBudgetMs: 0 }) !== false) {
+  if (isJudgeable({ frameBudgetMs: 0, pluginFrameMs: plugin }) !== false) {
     throw new Error("a zero frame budget must not be judgeable");
   }
 }
@@ -2509,6 +2629,8 @@ export async function check() {
     !html.includes(`<script src="${checkBundleUrl}"></script>`) ||
     !html.includes('"nearest-rank"') ||
     !html.includes("legacy differential rule") ||
+    !html.includes("pluginFrameMs.p99 <= frameBudgetMs *") ||
+    !html.includes("app.perfStats() produced at least one frame sample") ||
     !html.includes("background throttling, the frame count is the steadier relative quantity") ||
     !html.includes("idleOverBudgetFrames:")
   ) {
@@ -2539,11 +2661,14 @@ export async function check() {
   assertAttributionContract();
   console.log("check attribution: ok (bundle-only sums, excluded frames, empty window nulls)");
 
+  assertPerfProbeContract();
+  console.log("check perf probe: ok (paired p50/p99/max, 600 frames keep 512, empty and unaligned windows null)");
+
   assertAttributedVerdictContract();
-  console.log("check attributed verdict: ok (half-budget p99 and two-frame p95 boundaries)");
+  console.log("check attributed verdict: ok (half-budget p99 boundary, missing sample fails)");
 
   assertJudgeableContract();
-  console.log("check judgeable: ok (headless, missing budget and missing samples rejected)");
+  console.log("check judgeable: ok (plugin samples decide, missing budget and missing samples rejected)");
 
   assertIdentityCalibrationContract();
   console.log("check identity calibration: ok (complete round passes, partial 96/300 rejected)");
@@ -2601,15 +2726,15 @@ browser context, navigated to a uniquely tagged URL and verified before its
 reading is accepted. Without Chrome the page is only generated and printed, and
 the JSON is collected by opening it in a real browser foreground tab.
 
-Acceptance is the attributed rule: the plugin's long-animation-frame cost p99
-must stay within half of frameBudgetMs, and the activation keydown's Event
-Timing p95 within two frames. frameBudgetMs is the median of 240
-animation-frame gaps rounded up to 0.1ms. The legacy differential verdict
-(active over-budget rate minus the blank control) is still printed but is a
-trend only: a loaded machine misses frames with the plugin idle, so it fails
-with zero plugin work. Headless Chrome with --disable-gpu is a regression
-smoke test, never acceptance evidence; judgeable is false there and
-verdictAttributed is smoke-only.`);
+Acceptance is the plugin's own frame occupancy: app.perfStats() pairs the
+collect slice and the paint of each observed frame, and pluginFrameMs.p99 must
+stay within half of frameBudgetMs. frameBudgetMs is the median of 240
+animation-frame gaps rounded up to 0.1ms. LoAF and Event Timing are printed as
+coarse corroboration only: LoAF reports only frames over 50ms and Event Timing
+floors at 16ms, so neither can resolve a 2ms plugin handler on a 7ms display.
+The legacy differential verdict is still printed but is a trend only. Headless
+Chrome with --disable-gpu draws through software raster; treat its numbers as a
+regression smoke test even when judgeable is true.`);
 }
 
 async function main() {
@@ -2653,8 +2778,8 @@ async function main() {
         : "dsh-jump bench: 未检测到本机 Chrome，未采集读数。",
     );
     console.log(
-      "用真实浏览器打开上面的页面：页面会自动跑完每一档，把含 attributedPluginMs / activationEventDurationMs / " +
-        "verdictAttributed / judgeable 的 JSON 打在页面上。",
+      "用真实浏览器打开上面的页面：页面会自动跑完每一档，把含 pluginFrameMs / collect / paint / " +
+        "budgetSource / verdictAttributed / judgeable 的 JSON 打在页面上。",
     );
     if (options.verifyFresh) {
       console.log("--verify-fresh 的新鲜度自检由页面在每档结束时执行；没有脚本可驱动的浏览器时脚本以 0 退出。");
@@ -2672,13 +2797,23 @@ async function main() {
   const result = collected.result;
   console.log("driver: chrome-cdp (headless, fresh browser context per tier)");
   for (const tier of result.runs) {
+    const plugin = tier.pluginFrameMs;
     console.log(
       `tier ${String(tier.candidates)}: frameBudgetMs ${String(tier.frameBudgetMs)}` +
-        ` attributed p50/p99/max ${String(tier.attributedPluginMs.p50)}/${String(tier.attributedPluginMs.p99)}/${String(tier.attributedPluginMs.max)}ms` +
-        ` frames ${String(tier.attributedFrames)} excluded ${String(tier.excludedLongFrames)}` +
-        ` activation p50/p95/max ${String(tier.activationEventDurationMs.p50)}/${String(tier.activationEventDurationMs.p95)}/${String(tier.activationEventDurationMs.max)}ms` +
-        ` samples ${String(tier.activationEventSamples)}` +
+        ` budgetSource ${String(tier.budgetSource)}` +
+        ` pluginFrameMs p50/p99/max ${String(plugin.p50)}/${String(plugin.p99)}/${String(plugin.max)}ms` +
+        ` samples ${String(plugin.samples)} aligned ${String(plugin.aligned)}` +
+        ` collect p50/p99/max ${String(tier.pluginCollectMs.p50)}/${String(tier.pluginCollectMs.p99)}/${String(tier.pluginCollectMs.max)}ms` +
+        ` paint p50/p99/max ${String(tier.pluginPaintMs.p50)}/${String(tier.pluginPaintMs.p99)}/${String(tier.pluginPaintMs.max)}ms` +
         ` judgeable ${String(tier.judgeable)} verdictAttributed ${String(tier.verdictAttributed)}`,
+    );
+    const loaf = tier.loafEvidence;
+    const events = tier.eventTimingEvidence;
+    console.log(
+      `tier ${String(tier.candidates)}: loafEvidence longFrames ${String(loaf.longFrames)}` +
+        ` attributed p50/p99/max ${String(loaf.attributedPluginMs.p50)}/${String(loaf.attributedPluginMs.p99)}/${String(loaf.attributedPluginMs.max)}ms` +
+        ` samples ${String(events.samples)}` +
+        ` (coarse corroboration only)`,
     );
     console.log(
       `tier ${String(tier.candidates)}: legacy overBudget ${String(tier.overBudgetFrames)}/${String(tier.frameCount)}` +

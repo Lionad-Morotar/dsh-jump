@@ -271,14 +271,18 @@ critical path of a stroke:
   the DOM round. There is no per-badge node, no containing-block bookkeeping
   and no style invalidation for the host page.
 
-The quantity that answers "when can I start typing" is the activation
-keydown's Event Timing `duration`, which the bench reads from input to next
-paint; the gate allows two frames. `timeToUsable` remains a diagnostic: the
-wall clock from the activation dispatch returning to every label of the round
-being painted, plus the animation frames observed in that wait. A background
-tab throttles animation frames and inflates the wall clock, so the frame count
-is the steadier relative number; `activate.handlerMs` adds the synchronous
-dispatch cost when the full keypress-to-typing span is wanted.
+The quantity that answers "how much of a frame does the plugin take" is the
+plugin's own probe: every stage A collect slice and every paint is timed with
+two `performance.now()` reads and flushed as one frame-aligned pair. That is
+the acceptance input. Event Timing and LoAF are retained as coarse
+corroboration only: Event Timing floors observation at 16ms, and LoAF reports
+only frames over 50ms, so neither can see a 2ms handler on a 7ms display.
+`timeToUsable` remains a diagnostic: the wall clock from the activation
+dispatch returning to every label of the round being painted, plus the
+animation frames observed in that wait. A background tab throttles animation
+frames and inflates the wall clock, so the frame count is the steadier relative
+number; `activate.handlerMs` adds the synchronous dispatch cost when the full
+keypress-to-typing span is wanted.
 
 Labels are fixed for the whole round: label, target and rect are snapshotted
 when the round opens, so only the prefix can change inside a round. A new round
@@ -287,11 +291,14 @@ has moved since.
 
 ## Frame budget bench
 
-`bench/measure.mjs` produces two acceptance readings in one run: the plugin's
-own cost inside long frames, and the latency of a real activation keydown. It
-bundles `src/client/app.ts` with the repo's own esbuild into one browser IIFE,
-writes the measurement page and its external bundle side by side, and prints
-both paths:
+`bench/measure.mjs` produces the plugin's own per-frame occupancy, plus two
+coarse corroboration readings: long frames attributed to the plugin bundle and
+the latency of a real activation keydown. The plugin probe is the acceptance
+input because only the plugin can see its 1-2ms synchronous work: LoAF has a
+50ms floor and Event Timing a 16ms floor, both far above a 7ms frame budget.
+The bench bundles `src/client/app.ts` with the repo's own esbuild into one
+browser IIFE, writes the measurement page and its external bundle side by
+side, and prints both paths:
 
 ```sh
 node bench/measure.mjs                              # or: pnpm bench
@@ -304,9 +311,9 @@ node bench/measure.mjs --no-browser                 # generate the page only
 node bench/measure.mjs --check                      # CI-safe self-check, no browser
 ```
 
-The bundle is a separate `<script src>` next to the page, never inlined. Long
-Animation Frame attribution only reports a `sourceURL` for an external script;
-an inline bundle would make every plugin cost invisible to the gate.
+The bundle is a separate `<script src>` next to the page, never inlined. LoAF
+attribution only reports a `sourceURL` for an external script; an inline bundle
+would make the corroboration reading empty.
 
 When a local Chrome is found, the script drives it over the DevTools protocol
 and gives every candidate tier a brand-new browser context: a new target, new
@@ -324,15 +331,16 @@ that page over HTTP and open it in a foreground tab; the page clears
 `window.__BENCH_RESULT__` on load, so a second run in the same tab cannot read
 the first one's JSON.
 
-Headless Chrome with `--disable-gpu` is a regression smoke test, never
-acceptance evidence. It reports its own compositor cadence, and it draws the
-canvas through software raster, which is exactly the part whose cost differs
-from a GPU-composited page. Each tier therefore stamps `judgeable`: false when
-the user agent contains `Headless`, when no display budget was measured, or
-when no long frame actually ran the plugin bundle. A non-judgeable tier reports
-`verdictAttributed: "smoke-only"` instead of `pass` or `fail`. Open the same
-generated page in a real foreground tab, and drive it through the built-in
-Chrome path or a real browser session, when the question is acceptance.
+Headless Chrome with `--disable-gpu` draws the canvas through software raster,
+which is exactly the part whose cost differs from a GPU-composited page. The
+probe still measures the plugin's own synchronous work, so it gives a usable
+regression signal; treat headless numbers as a smoke test rather than GPU
+acceptance evidence. Each tier stamps `judgeable`: true when the display budget
+is finite and `app.perfStats()` produced at least one frame sample, false
+otherwise. A non-judgeable tier reports `verdictAttributed: "smoke-only"`
+instead of `pass` or `fail`. LoAF and Event Timing can be empty on a fast
+machine and no longer affect judgeability. Open the same generated page in a
+real foreground tab when the question is acceptance.
 
 For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
@@ -352,33 +360,42 @@ the dimmed batch matters: on a three-key label it must stay untouched while the
 live prefix splits further (on a two-key tier it is the completing stroke). The
 close reading reports the label count it tore down as `nodes`.
 
-### The two acceptance criteria
+### The acceptance criterion
 
-A tier's `verdictAttributed` is `pass` only when both halves hold:
+A tier's `verdictAttributed` is `pass` exactly when
+`pluginFrameMs.p99 <= frameBudgetMs * 0.5`.
 
-- Attribution: `attributedPluginMs.p99 <= frameBudgetMs * 0.5`. A
-  `PerformanceObserver` collects `long-animation-frame` entries with their
-  `scripts`. Only entries whose `sourceURL` path is the generated bundle file
-  are summed, per frame, into `attributedPluginMs`; frames with no plugin
-  script are counted as `excludedLongFrames` and left out of the percentiles.
-  They are the system preempting the frame, not plugin work.
-  `attributedForcedLayoutMs` repeats the sum with
-  `forcedStyleAndLayoutDuration`. `p50` and `min` estimate the plugin's
-  intrinsic cost because preemption inflates wall clock; `p99` is the upper
-  bound the gate uses and `max` prints the worst attributed frame.
-- Interaction latency: `activationEventDurationMs.p95 <= frameBudgetMs * 2`.
-  A `PerformanceObserver` listens to `event` with `durationThreshold: 0`,
-  keeps `keydown` entries, and reads `PerformanceEventTiming.duration`, which
-  is input to next paint. Two frames, not one: an activation legitimately
-  spans the frame it lands in and the next presentation. This replaces
-  `nextFrameMs` as the interaction gate because the double-rAF construction
-  always crosses two frames and cannot be compared with a one-frame budget.
+`app.perfStats()` returns the plugin's own frame-aligned occupancy:
+`samples.collect` times each stage A slice, `samples.paint` times each canvas
+paint, and both arrays carry one entry per observed frame, so index i of each
+belongs to the same frame and the two values can be added. A frame that runs
+only one stage contributes 0 to the other array. `frames` counts every observed
+frame while the arrays keep the latest 512, dropping the oldest first. The
+probe costs two `performance.now()` reads per stage, allocates nothing per
+frame in steady state, never logs or serializes, and is on by default. A host
+can turn it off with `deps.perfProbe: false`; `perfStats()` then reports empty
+samples and the bench cannot judge that tier.
 
-Event Timing reports trusted events only, so the page publishes a request and
-the driver answers it with real key input. Chrome also floors observed event
-duration at 16ms, so `activationEventSamples` is printed beside the
-percentiles: an empty sample set does not prove a fast activation, and the gate
-refuses to pass without a sample.
+`pluginFrameMs` is the per-frame sum of the two arrays, summarized to
+`p50`/`p99`/`max` with nearest rank. `pluginCollectMs` and `pluginPaintMs`
+repeat the same summary for each stage separately. If a host ever reports
+arrays of different lengths they are not frame-aligned; the combined reading is
+then null instead of pairing by index, and only the separate summaries stand.
+That is also why the two arrays are flushed as pairs rather than appended per
+call: per-call appends cannot be aligned without inventing frames neither stage
+observed.
+
+LoAF and Event Timing stay in the JSON as `loafEvidence` and
+`eventTimingEvidence`, each with a note saying it is coarse corroboration only.
+LoAF observes only frames over 50ms, so a 2ms plugin handler on a 7ms display
+produces no entry; when it does fire, only `scripts` whose `sourceURL` path is
+the generated bundle are summed, and frames with no plugin script are counted
+as `excludedLongFrames` instead of being blamed on the plugin. Event Timing
+floors observation at 16ms even with `durationThreshold: 0`, so a fast
+activation leaves no sample; it reports `p50`/`p95`/`max` of the keydown's
+input-to-next-paint `duration` when samples exist, with `trustedActivations`
+showing how many came from real key input rather than `dispatchEvent`. Neither
+observer can decide the verdict anymore.
 
 The old differential verdict is kept for trend reading but no longer decides
 acceptance. It compares the active over-budget rate with a blank control window
@@ -390,29 +407,34 @@ states this in every tier and in the protocol block.
 
 The tier fields are:
 
-- `frameBudgetMs`: the display budget the page measured for this tier. It runs
-  240 animation frames under a continuous animation and takes the median gap,
-  rounded up to 0.1ms, so a 143Hz panel reports about 7.0 rather than a
-  nominal 60/120/144 constant.
-- `attributedPluginMs`: `p50`, `p99`, `max` and `min` of the plugin bundle's
-  summed `duration` in every long frame that ran it. Nulls when no long frame
-  ran the plugin.
-- `attributedForcedLayoutMs`: the same shape, summing
-  `forcedStyleAndLayoutDuration` instead.
-- `excludedLongFrames`: how many long frames carried no plugin script and were
-  therefore excluded from attribution. `loafFrames` is the total long-frame
-  count and `attributedFrames` the ones that entered the percentiles.
-- `activationEventDurationMs`: `p50`, `p95` and `max` of the activation
-  keydown's Event Timing `duration`, with `activationEventSamples` beside it
-  and `eventTimingSupported` recording whether the entry type exists.
+- `frameBudgetMs`: the display budget the app used for this tier. It runs 240
+  animation frames under a continuous animation and takes the median gap,
+  rounded up to 0.1ms, so a 143Hz panel reports about 7.0 rather than a nominal
+  60/120/144 constant. The bench injects this measurement into `createApp`, so
+  the plugin and the gate talk about one budget.
+- `budgetSource`: where that number came from: `injected` (the bench),
+  `published` (a host global), `measured` (the plugin's own sample) or
+  `fallback` (the conservative 8ms / 60Hz assumption).
+- `pluginFrameMs`: `p50`, `p99`, `max`, `samples` and `aligned` of the
+  per-frame collect plus paint sum. This is the acceptance input.
+- `pluginCollectMs` and `pluginPaintMs`: the same shape for each stage alone.
+  Both carry `samples`; `aligned` lives on `pluginFrameMs`.
+- `perfFrames`: how many frames the probe observed in total, including frames
+  already evicted from the 512-frame window.
+- `loafEvidence`: `supported`, `longFrames`, `attributedPluginMs`,
+  `attributedForcedLayoutMs`, `attributedFrames`, `excludedLongFrames`, `worst`
+  and the coarse-corroboration `note`. `worst` is the longest long-frame entry
+  with `duration`, `blockingDuration`, `renderStart` and `startTime`.
+- `eventTimingEvidence`: `supported`, `samples`, `durationMs` with
+  `p50`/`p95`/`max`, and the coarse-corroboration `note`.
 - `trustedActivations`: how many of the tier's activations were driven by real
-  key input rather than `dispatchEvent`. It is the evidence behind an
-  interaction sample.
+  key input rather than `dispatchEvent`. It is the evidence behind an Event
+  Timing sample.
 - `verdictAttributed`: `pass`, `fail`, `smoke-only` or `stale`. Only a
   judgeable tier can pass or fail; `--verify-fresh` marks an unprovable result
   `stale` exactly like the legacy verdict.
-- `judgeable`: true only for a non-headless browser with a measured display
-  budget and at least one attributed long frame.
+- `judgeable`: true when the display budget is finite and `pluginFrameMs` has
+  at least one sample. LoAF and Event Timing are not part of this decision.
 - `verdict`: the legacy differential verdict, kept for trend reading.
   `verdictLegacyNote` explains why it is not acceptance.
 - `maxFrameMs`, `overBudgetFrames`, `overBudgetPct`, `idleFrameBudgetMs`,
@@ -423,29 +445,28 @@ The tier fields are:
   land. `ms` carries p50/p95/max of the wall clock from the activation
   dispatch returning to every label of the round being painted; `frames`
   carries p50/max of the animation frames observed in the same wait. This is a
-  historical diagnostic, not the interaction gate: it starts after dispatch
-  and waits for paint, while Event Timing starts at the input timestamp and
-  ends at the next paint.
+  historical diagnostic: it starts after dispatch and waits for paint, while
+  Event Timing starts at the input timestamp and ends at the next paint.
 
 The phase readings are retained unchanged: each phase carries `handlerMs`
 (synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from dispatch
 return to the second animation frame), and the phase-level `p50`/`p95` mirror
 `handlerMs`. They are useful for tracking a change, but they no longer decide
-the gate. Percentiles use the nearest rank, not interpolation, so any reading
+acceptance. Percentiles use the nearest rank, not interpolation, so any reading
 can be recomputed from the samples by hand.
 
 Treat a p95 from fewer than 50 samples as a reference only: at 19 or fewer
 samples nearest-rank p95 is literally the maximum, and the bench prints a
-样本偏少 warning below 20. The attribution gate uses p99, which is even more
-sample-hungry: a tier with a handful of long frames can only report what those
+样本偏少 warning below 20. The acceptance gate uses p99, which is even more
+sample-hungry: a tier with a handful of frames can only report what those
 frames did.
 
-`worstLoaf` is the longest `long-animation-frame` entry recorded during the
+`loafEvidence.worst` is the longest long-frame entry recorded during the
 measured window: `duration`, `blockingDuration`, `renderStart` and `startTime`
-in milliseconds. `loafSupported` is `true` when the browser exposes the entry
-type. When it does not, `loafSupported` is `false` and `worstLoaf` is `null`.
-Per-frame script attribution is not copied into `worstLoaf`; it lives in
-`attributedPluginMs` and `excludedLongFrames`.
+in milliseconds. `loafEvidence.supported` is `false` when the browser does not
+expose the entry type; `worst` is then null. Per-frame script attribution is
+not copied into `worst`; it lives in `loafEvidence.attributedPluginMs` and
+`loafEvidence.excludedLongFrames`.
 
 Every button on the measurement grid lives under `data-slot="bench.grid"` and
 carries an `aria-label`, so `identityKey` produces non-empty keys and the label
@@ -479,21 +500,24 @@ is what makes them comparable to each other. Archive mode needs a local Chrome
 cannot write files and the repo ships no third-party browser driver.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
-still carries every measurement hook (including `attributedPluginMs`,
-`attributedForcedLayoutMs`, `excludedLongFrames`, `activationEventDurationMs`,
-`verdictAttributed`, `judgeable`, `verdictLegacyNote`, `frameBudgetMs`,
-`worstLoaf`, `timeToUsable`, `secondStroke`, `close`, `identityKeys` and
-`identityPath`), and proves the attribution arithmetic on a fixed set of LoAF
-entries: vendor scripts are not summed, a long frame without a plugin script is
-excluded, and two plugin slices in one frame add up. It also pins the
-`verdictAttributed` boundaries (p99 at exactly half the budget and p95 at
-exactly two frames pass, one hundredth over fails, a missing half fails), the
-`judgeable` rule (a HeadlessChrome user agent is false), the percentile and
-frame-budget implementations, the legacy idle-control arithmetic, the identity
-calibration, both settle limits, the freshness contract, archive naming and a
-JSON round-trip, and fails if the page or the script imports anything outside
-the local toolchain allowlist (`node:child_process` is there only for the local
-Chrome driver).
+still carries every measurement hook (including `perfStats`, `pluginFrameMs`,
+`pluginCollectMs`, `pluginPaintMs`, `budgetSource`, `loafEvidence`,
+`eventTimingEvidence`, `verdictAttributed`, `judgeable`, `verdictLegacyNote`,
+`frameBudgetMs`, `timeToUsable`, `secondStroke`, `close`, `identityKeys` and
+`identityPath`), and proves the plugin occupancy arithmetic on a fixed series:
+collect and paint pairs add per frame, p50/p99/max are nearest-rank over the
+sums, 600 frames keep the newest 512, an empty window reports nulls, and
+mismatched array lengths are not added. It also proves the LoAF corroboration
+arithmetic (vendor scripts are not summed, a long frame without a plugin script
+is excluded, two plugin slices in one frame add up). It pins the
+`verdictAttributed` boundaries (p99 at exactly half the budget passes, one
+hundredth over fails, a missing plugin sample fails), the `judgeable` rule
+(plugin samples decide, a missing budget or empty samples is false), the
+percentile and frame-budget implementations, the legacy idle-control
+arithmetic, the identity calibration, both settle limits, the freshness
+contract, archive naming and a JSON round-trip. It fails if the page or the
+script imports anything outside the local toolchain allowlist
+(`node:child_process` is there only for the local Chrome driver).
 
 ## v1 boundaries
 

@@ -140,13 +140,17 @@ function recorder(): Recorder {
 
 const mounted: Overlay[] = [];
 
-function mount(options: { clock?: FrameClock } = {}): { overlay: Overlay; recorder: Recorder } {
+function mount(options: { clock?: FrameClock; onPaint?: (durationMs: number) => void } = {}): {
+  overlay: Overlay;
+  recorder: Recorder;
+} {
   const recorded = recorder();
   const overlay = createOverlay({
     doc: document,
     viewport: () => VIEWPORT,
     clock: options.clock,
     canvasContext: () => recorded.context,
+    onPaint: options.onPaint,
   });
   mounted.push(overlay);
   return { overlay, recorder: recorded };
@@ -188,6 +192,23 @@ describe("badge lifecycle", () => {
     // 全量重绘是 canvas 的默认路径：第二次画出的文字序列必须与第一次逐条相同。
     expect(recorded.texts()).toEqual([...first, ...first]);
     expect(overlay.labels()).toEqual(["as", "sd"]);
+  });
+
+  it("reports one paint duration per paint call, and none for teardown", () => {
+    const durations: number[] = [];
+    const { overlay } = mount({ onPaint: (durationMs) => durations.push(durationMs) });
+    const hints = hintsOf(["as", "sd"]);
+
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    expect(durations).toHaveLength(2);
+    for (const value of durations) {
+      expect(Number.isFinite(value)).toBe(true);
+      expect(value).toBeGreaterThanOrEqual(0);
+    }
+
+    overlay.destroy();
+    expect(durations).toHaveLength(2);
   });
 });
 
