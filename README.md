@@ -240,34 +240,39 @@ structured chip.
 
 ## Performance on a busy page
 
-A round costs one collection pass and one paint, and both used to grow with the
-square of the page. Measured on a 1841×1274 view with 1189 visible candidates
-over 25k DOM nodes, a round took 72ms to collect and 5.4ms to repaint on every
-stroke of a three-key label. Neither is on the critical path now:
+A round is two stages with different costs, and neither grows with the square
+of the page. Collection is an interruptible walk: the activation frame scans
+only as many candidates as fit in a fraction of the display frame, and later
+frames resume from where the walk stopped. Labels cannot be issued until the
+total count and the visual order are known, so stage B assigns every label and
+paints the whole batch once, at the end of the scan. Neither stage is on the
+critical path of a stroke:
 
-- Containers are decided by ancestor marking. A candidate that contains another
-  candidate is a wrapper and the deepest target wins; comparing every pair is
-  quadratic with an ancestor walk inside it, while walking up from each
-  candidate and marking the candidates it passes costs O(n · depth) and lands
-  on the same set, because `contains` means exactly "is an ancestor of". 72ms
-  to 8ms.
-- Badges are keyed by label and updated in place. The lit/dim split is a
-  function of the typed prefix alone, so a badge whose prefix did not change is
-  not touched at all; the badges a stroke rules out only get an opacity write
-  and keep their existing child nodes, because a dim badge and an untyped one
-  both read as one whole-label run. Only the few badges the prefix still
-  reaches are re-segmented. 5.4ms to 0.1ms per stroke.
-- Badges share one containing block. They are `position:absolute` inside a
-  container that is `fixed; inset:0` rather than fixed themselves: the viewport
-  coordinate system is the same, and the browser tracks one containing block
-  instead of one per badge. Rendering was verified pixel-identical against the
-  previous build.
+- The candidate walk is interruptible and budgeted. Every slice checks the
+  clock before the next candidate and returns to the next animation frame when
+  its share of the frame is spent, so a 600-candidate page pays a small slice
+  on the activation frame instead of the whole page. A slice is 12% of the
+  measured display budget, clamped to 0.4-1.5ms.
+- Stage B is pure array work. Sorting the candidates into reading order and
+  assigning one label length for the whole round never reads layout or style,
+  which is what keeps the last slice cheap even on a busy page.
+- Badges live on one canvas, not in the DOM. A stroke repaints the round in
+  place: the lit/dim split is a function of the typed prefix, so a full redraw
+  of 600 badges measured 1.7ms including a forced GPU read, against 32.8ms for
+  the DOM round. There is no per-badge node, no containing-block bookkeeping
+  and no style invalidation for the host page.
 
-In-place updating leans on the snapshot rule in
-[v1 boundaries](#v1-boundaries): label, target and rect are fixed when the round
-opens, so only the prefix can change inside a round. A new round mints new
-badges, which is what stops a label from staying over a target that has moved
-since.
+The quantity that answers "when can I start typing" is `timeToUsable`: the
+wall clock from the activation dispatch returning to every label of the round
+being painted, plus the animation frames observed in that wait. A background
+tab throttles animation frames and inflates the wall clock, so the frame count
+is the steadier relative number; `activate.handlerMs` adds the synchronous
+dispatch cost when the full keypress-to-typing span is wanted.
+
+Labels are fixed for the whole round: label, target and rect are snapshotted
+when the round opens, so only the prefix can change inside a round. A new round
+mints new labels, which is what stops a label from staying over a target that
+has moved since.
 
 ## Frame budget bench
 
@@ -309,24 +314,27 @@ foreground tab and read the page's own JSON.
 
 For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
-discards their readings. Every activation waits on `app.settled()` before the
-page reads badges or sends the first label stroke: insertion is adaptive, so
-the number of frames is not a property of the candidate count, and two frames
-after Cmd+H used to be only the first batches of a 300-candidate round. Warmup
-is still required: without it the first tier pays JIT compilation, first layout
-and GC warmup and reports a cold start as a tier cost, so `--warmup <n>` only
-tunes the count. Then it times `runs` complete activations, `runs` first label
-strokes, `runs` second label strokes, `runs` complete labels (each on a fresh
-activation) and one Esc exit on a fully inserted round. The second stroke is
-the phase where the dimmed batch matters: on a three-key label it must stay
-untouched while the live prefix splits further (on a two-key tier it is the
-completing stroke). The close reading reports the badge count it tore down as
-`nodes`.
+discards their readings. Every activation waits until `app.labels()` holds the
+expected number of labels before the page reads them or sends the first label
+stroke: stage A paints nothing until it commits, so a fixed frame count would
+measure a prefix of the round. The wait is bounded at 200 animation frames or
+3 seconds and fails the tier with `collection did not settle` instead of
+silently comparing a half-round. Warmup is still required: without it the first
+tier pays JIT compilation, first layout and GC warmup and reports a cold start
+as a tier cost, so `--warmup <n>` only tunes the count. Then it times `runs`
+complete activations, `runs` first label strokes, `runs` second label strokes,
+`runs` complete labels (each on a fresh activation) and one Esc exit on a fully
+inserted round. The second stroke is the phase where the dimmed batch matters:
+on a three-key label it must stay untouched while the live prefix splits
+further (on a two-key tier it is the completing stroke). The close reading
+reports the label count it tore down as `nodes`.
 
-A tier reports `candidates`, `labels` (badges actually painted), `warmup`
-(cycles discarded before sampling), `overlayCount`, which must stay `1`, and
-the identity pair below; a second runtime would show up as a second overlay and
-its cost would contaminate the reading. The verdict fields are:
+A tier reports `candidates`, `labels` (the round's labels, read through
+`app.labels()`; the canvas overlay keeps them, there is no per-badge DOM node
+to query), `warmup` (cycles discarded before sampling), `overlayCount`, which
+must stay `1`, and the identity pair below; a second runtime would show up as a
+second overlay and its cost would contaminate the reading. The verdict fields
+are:
 
 - `frameBudgetMs`: the display budget the page measured for this tier. It runs
   240 animation frames under a continuous animation and takes the median gap,
@@ -349,6 +357,13 @@ its cost would contaminate the reading. The verdict fields are:
 - `verdict`: `pass` only when `excessOverBudgetPct` is at most 5 percentage
   points (`noiseBandPct`). With `--verify-fresh`, a result that cannot prove it
   came from this navigation is `stale` instead.
+- `timeToUsable`: how long a reader waits before the first label stroke can
+  land. `ms` carries p50/p95/max of the wall clock from the activation
+  `dispatchEvent` returning to every label of the round being painted;
+  `frames` carries p50/max of the animation frames observed in the same wait.
+  A background tab throttles animation frames and inflates the milliseconds,
+  so `frames` is the steadier relative quantity across runs. Add the phase's
+  `activate.handlerMs` for the full keypress-to-typing span.
 
 The idle control is what makes the gate falsifiable. The budget is a median, so
 roughly half of any window's frames sit above it even on a blank page, and a
@@ -365,7 +380,9 @@ dispatch return to the second animation frame), and the phase-level `p50`/`p95`
 mirror `handlerMs`. They are useful for tracking a change, but they no longer
 decide the gate; the gate is the excess over the idle control, while
 `maxFrameMs`, `overBudgetFrames` and the idle counts remain the absolute audit
-numbers. Percentiles use the nearest rank, not interpolation, so any reading
+numbers. `timeToUsable` is the separate read that answers when typing can
+start, because a phase's two-frame window can end while stage A is still
+walking. Percentiles use the nearest rank, not interpolation, so any reading
 can be recomputed from the samples by hand.
 
 Treat the retained p95 from fewer than 50 samples as a reference only: at 19 or
@@ -386,10 +403,11 @@ memory recall and write-back run for real. Each tier reports `identityKeys`
 `collectHints`'s injectable `identity` dependency), `identityRounds` (the
 activations actually dispatched) and `identityPath` (`active` only when those
 calls produced keys the memory recorded). The per-round count is checked
-against the labels the app actually paints after `app.settled()`, so a drifted
-fixture fails the tier instead of reporting a number nobody measured; `--check`
-also proves that a partial read (300 hints against 96 painted badges) is
-rejected rather than accepted.
+against `app.labels().length` after the round settles, so a drifted fixture
+fails the tier instead of reporting a number nobody measured; `--check` also
+proves that a partial read (300 hints against 96 painted labels) is rejected,
+and that a round which never reaches its expected count fails with
+`collection did not settle` rather than passing as a zero-label round.
 
 `--verify-fresh` makes the freshness contract fatal. The automated Chrome path
 already checks every tier; the flag records the requirement in the protocol and
@@ -411,17 +429,18 @@ write files and the repo ships no third-party browser driver.
 `--check` needs no browser: it bundles the app, asserts the generated page
 still carries every measurement hook (including `frameBudgetMs`, `maxFrameMs`,
 `overBudgetFrames`, `idleOverBudgetFrames`, `idleFrameBudgetMs`,
-`excessOverBudgetPct`, `verdict`, `worstLoaf`, `secondStroke`, `close`,
-`identityKeys` and `identityPath`), exercises the percentile and frame-budget
-implementations with fixed inputs (median and 0.1ms ceiling, max rather than
-p95, and the 5-point noise-band verdict boundary), checks the idle-control
-arithmetic on fixed counts, proves that reading badges before progressive
-insertion completes fails the identity calibration, checks the freshness
-contract against a pre-existing result, a reload, an old timestamp and a foreign
-realm, verifies archive file naming and a JSON round-trip into a fresh
-directory, and fails if the page or the script imports anything outside the
-local toolchain allowlist (`node:child_process` is there only for the local
-Chrome driver).
+`excessOverBudgetPct`, `verdict`, `worstLoaf`, `timeToUsable`, `secondStroke`,
+`close`, `identityKeys` and `identityPath`), exercises the percentile and
+frame-budget implementations with fixed inputs (median and 0.1ms ceiling, max
+rather than p95, and the 5-point noise-band verdict boundary), checks the
+idle-control arithmetic on fixed counts, proves that reading labels before
+stage A commits fails the identity calibration, verifies the `timeToUsable`
+summary shape and that both the 200-frame and 3-second settle limits fail with
+`collection did not settle`, checks the freshness contract against a
+pre-existing result, a reload, an old timestamp and a foreign realm, verifies
+archive file naming and a JSON round-trip into a fresh directory, and fails if
+the page or the script imports anything outside the local toolchain allowlist
+(`node:child_process` is there only for the local Chrome driver).
 
 ## v1 boundaries
 

@@ -182,12 +182,13 @@ export function frameVerdict(excessPct) {
 
 /**
  * The calibration invariant: the identity walk, the pure collection and the
- * painted badges must describe the same round.
+ * painted labels must describe the same round.
  *
- * Reading badges before progressive insertion finishes used to leave this check
- * comparing 300 hints against the 96 badges of the first two frames. The bench
- * now waits on `app.settled()`; this function makes the invariant explicit and
- * lets `--check` prove that a partial read is rejected.
+ * Reading badges before stage A settles used to leave this check comparing 300
+ * hints against the 96 badges of the first two frames. The bench now polls
+ * `app.labels()` until the round reaches the expected count; this function
+ * makes the invariant explicit and lets `--check` prove that a partial read is
+ * rejected.
  */
 export function identityCalibrationDrift(identityCalls, identityHints, paintedLabels) {
   if (identityCalls === paintedLabels && identityHints === paintedLabels) return null;
@@ -195,6 +196,61 @@ export function identityCalibrationDrift(identityCalls, identityHints, paintedLa
     "identity calibration drifted: " + String(identityCalls) + " calls, " +
     String(identityHints) + " hints, " + String(paintedLabels) + " painted labels"
   );
+}
+
+/**
+ * How long a round may stay in stage A before the bench calls it broken.
+ *
+ * Two limits, because they fail for different reasons: a loaded machine can
+ * spend seconds inside 200 frames, and a background-throttled tab can starve
+ * animation frames for a full second between them. A round that crosses either
+ * while its label count is still short is reported unfinished, never compared
+ * as a zero-badge round.
+ */
+export const SETTLE_FRAME_LIMIT = 200;
+export const SETTLE_TIMEOUT_MS = 3000;
+
+/**
+ * The settle gate, as a pure decision so `--check` can exercise both limits.
+ *
+ * Stage A paints nothing until it commits, so `labels()` is empty for the whole
+ * walk. Polling the expected total is the only readiness signal the bench has;
+ * without this gate a 300-candidate round that has not started painting looks
+ * exactly like a fixture whose identity count drifted to zero.
+ */
+export function collectionSettleFailure(expected, actual, frames, elapsedMs) {
+  if (actual === expected) return null;
+  if (frames < SETTLE_FRAME_LIMIT && elapsedMs < SETTLE_TIMEOUT_MS) return null;
+  return (
+    "collection did not settle: expected " + String(expected) + " labels, saw " +
+    String(actual) + " after " + String(frames) + " frames / " +
+    String(Math.round(elapsedMs * 1000) / 1000) + "ms"
+  );
+}
+
+/**
+ * timeToUsable summary, split into wall clock and frames.
+ *
+ * The wall clock is the honest duration, but a background tab throttles
+ * animation frames and inflates it; the frame count is the quantity that stays
+ * comparable across machines. Both are printed so neither is silently promoted
+ * to the only story.
+ */
+export function summarizeTimeToUsable(samples) {
+  const round = (value) => (value === null ? null : Math.round(value * 1000) / 1000);
+  const ms = samples.map((sample) => sample.ms);
+  const frames = samples.map((sample) => sample.frames);
+  return {
+    ms: {
+      p50: round(nearestRankPercentile(ms, 50)),
+      p95: round(nearestRankPercentile(ms, 95)),
+      max: round(maxFrameIntervalMs(ms)),
+    },
+    frames: {
+      p50: nearestRankPercentile(frames, 50),
+      max: maxFrameIntervalMs(frames),
+    },
+  };
 }
 
 function parseCandidates(raw) {
@@ -380,11 +436,29 @@ function pageScript(config) {
   const NOISE_BAND_PCT = ${NOISE_BAND_PCT};
   const frameVerdict = ${frameVerdict.toString()};
   const identityCalibrationDrift = ${identityCalibrationDrift.toString()};
+  const SETTLE_FRAME_LIMIT = ${SETTLE_FRAME_LIMIT};
+  const SETTLE_TIMEOUT_MS = ${SETTLE_TIMEOUT_MS};
+  const collectionSettleFailure = ${collectionSettleFailure.toString()};
+  const summarizeTimeToUsable = ${summarizeTimeToUsable.toString()};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
   const output = document.querySelector("[data-bench-output]");
-  const app = window.${GLOBAL_NAME}.createApp({ platform: "macos" });
-  app.apply();
+  let app = null;
+  let disposeApp = () => undefined;
+
+  /**
+   * Mount the app for one tier.
+   *
+   * apply() reads the published display budget once, so the tier must
+   * publish its own measurement before mounting; otherwise every tier silently
+   * collects against the 60Hz fallback while the verdict talks about another
+   * budget.
+   */
+  function mountApp(budget) {
+    disposeApp();
+    app = window.${GLOBAL_NAME}.createApp({ platform: "macos", frameBudgetMs: budget });
+    disposeApp = app.apply();
+  }
 
   // Freshness is decided from facts this realm can prove: whether a result was
   // already sitting on the global before this script ran, and whether this
@@ -470,9 +544,19 @@ function pageScript(config) {
     return { calls: calls, labels: hints.length, remembered: memory.size };
   }
 
-  function badgeLabels() {
-    const badges = document.querySelectorAll("[data-jump-label]");
-    return Array.from(badges, (badge) => badge.getAttribute("data-jump-label") ?? "");
+  /**
+   * Labels of the current round.
+   *
+   * The canvas overlay owns them; there is no DOM node per badge anymore, so
+   * reading [data-jump-label] would always count zero and turn every
+   * calibration into a false drift report.
+   */
+  function roundLabels() {
+    return app.labels();
+  }
+
+  function labelCount() {
+    return app.labels().length;
   }
 
   function overlayCount() {
@@ -520,6 +604,63 @@ function pageScript(config) {
         });
       });
     });
+  }
+
+  /**
+   * Wait until the round has painted every label.
+   *
+   * sinceMs is the moment dispatchEvent returned, so the reading answers
+   * how long a reader has to wait before the first label stroke can land.
+   * Frames are counted as animation frames actually observed: a throttled tab
+   * can inflate the wall clock by a second, but it cannot inflate this count.
+   */
+  function waitForUsable(expected, sinceMs) {
+    let frames = 0;
+    return new Promise((resolve, reject) => {
+      function check() {
+        const actual = labelCount();
+        const elapsed = performance.now() - sinceMs;
+        const failure = collectionSettleFailure(expected, actual, frames, elapsed);
+        if (failure !== null) {
+          reject(new Error(failure));
+          return;
+        }
+        if (actual === expected) {
+          resolve({ ms: elapsed, frames: frames });
+          return;
+        }
+        requestAnimationFrame(() => {
+          frames += 1;
+          check();
+        });
+      }
+      check();
+    });
+  }
+
+  /**
+   * Dispatch one activation and open the two readings it owns.
+   *
+   * The synchronous handler cost feeds the activate phase, while the
+   * readiness wait feeds timeToUsable. They share one dispatch but not one
+   * clock: the second-frame gap is sampled beside the poll so a long collection
+   * cannot move the phase reading.
+   */
+  function beginActivation(expected) {
+    const event = keydown("h", { metaKey: true });
+    const startedAt = performance.now();
+    window.dispatchEvent(event);
+    const dispatchedAt = performance.now();
+    const nextFrameMs = new Promise((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve(performance.now() - dispatchedAt));
+      });
+    });
+    return {
+      handlerMs: dispatchedAt - startedAt,
+      nextFrameMs: nextFrameMs,
+      usable: waitForUsable(expected, dispatchedAt),
+    };
   }
 
   function exitRound() {
@@ -637,6 +778,7 @@ function pageScript(config) {
     // the display again on its own; handing it the same number the verdict
     // uses keeps the batch controller and the gate talking about one budget.
     window.__DSH_JUMP_FRAME_BUDGET_MS__ = frameBudgetMs;
+    mountApp(frameBudgetMs);
 
     // Blank control: the same tier, the same page, no activation. A busy
     // machine misses frames with the plugin idle, so this window is what the
@@ -653,12 +795,17 @@ function pageScript(config) {
     let rounds = 0;
     const activateRound = async () => {
       rounds += 1;
-      const reading = await stroke("h", { metaKey: true });
-      // Batching is adaptive, so the number of frames is not a property of the
-      // candidate count. The round is only complete when the overlay says so;
-      // reading or stroking before that measures a prefix of the round.
-      await app.settled();
-      return reading;
+      const activation = beginActivation(identity.labels);
+      // Stage A is interruptible, so the label count, not a frame count, is
+      // the readiness signal. A round that never reaches the expected count
+      // rejects with "collection did not settle" instead of yielding a
+      // half-round that the calibration would then blame on the fixture.
+      const usable = await activation.usable;
+      return {
+        handlerMs: activation.handlerMs,
+        nextFrameMs: await activation.nextFrameMs,
+        usable: usable,
+      };
     };
 
     // Every tier gets its own cold start: a new grid invalidates layout, the
@@ -667,7 +814,7 @@ function pageScript(config) {
     let warmed = 0;
     for (let index = 0; index < CONFIG.warmup; index += 1) {
       await activateRound();
-      const warmBadges = badgeLabels();
+      const warmBadges = roundLabels();
       const warmFirst = warmBadges[0];
       if (warmFirst === undefined || warmFirst === "") throw new Error("warmup activation produced no label");
       await stroke(warmFirst.slice(0, 1));
@@ -682,16 +829,20 @@ function pageScript(config) {
     const activate = [];
     const firstStroke = [];
     const secondStroke = [];
+    const timeToUsable = [];
     let labels = 0;
     let overlays = 0;
 
     for (let index = 0; index < CONFIG.runs; index += 1) {
-      activate.push(await activateRound());
-      const badges = badgeLabels();
+      const activation = await activateRound();
+      activate.push(activation);
+      timeToUsable.push(activation.usable);
+      const badges = roundLabels();
       if (index === 0) {
         labels = badges.length;
         overlays = overlayCount();
-        // The calibration must describe the round the app really painted.
+        // The calibration must describe the round the app really painted; the
+        // activation above only returned after that count was reached.
         const drift = identityCalibrationDrift(identity.calls, identity.labels, labels);
         if (drift !== null) throw new Error(drift);
       }
@@ -714,7 +865,7 @@ function pageScript(config) {
     const complete = [];
     for (let index = 0; index < CONFIG.runs; index += 1) {
       await activateRound();
-      const labelsNow = badgeLabels();
+      const labelsNow = roundLabels();
       const completeLabel = labelsNow[0];
       if (completeLabel === undefined || completeLabel === "") {
         throw new Error("activation produced no completion label");
@@ -728,7 +879,7 @@ function pageScript(config) {
     // the previous phases painted. One deliberate exit gets its own reading
     // instead of hiding inside the untimed reset between samples.
     await activateRound();
-    const closeNodes = badgeLabels().length;
+    const closeNodes = roundLabels().length;
     const close = await stroke("Escape");
 
     const frameIntervals = frameSampler.stop();
@@ -791,6 +942,7 @@ function pageScript(config) {
       secondStroke: phase(secondStroke),
       complete: phase(complete),
       close: { ...phase([close]), nodes: closeNodes },
+      timeToUsable: summarizeTimeToUsable(timeToUsable),
     };
   }
 
@@ -841,6 +993,10 @@ function pageScript(config) {
           "pass when active over-budget rate minus idle control rate is at most " +
           String(NOISE_BAND_PCT) +
           " percentage points",
+        timeToUsableRule:
+          "wall clock from dispatchEvent return to every label of the round being painted, " +
+          "sampled with performance.now; frames counted as animation frames observed in the same wait. " +
+          "The ms reading is affected by background throttling, the frame count is the steadier relative quantity.",
         note:
           "Readings are sensitive to system load: the idle control window is measured on the same tier before activation, and only the excess over it decides the verdict.",
       },
@@ -1277,7 +1433,9 @@ const REQUIRED_HOOKS = [
   "KeyboardEvent",
   "dispatchEvent",
   "data-dsh-jump-overlay",
-  "data-jump-label",
+  "app.labels()",
+  "timeToUsable",
+  "collection did not settle",
   "handlerMs",
   "nextFrameMs",
   "__BENCH_RESULT__",
@@ -1308,7 +1466,8 @@ const REQUIRED_HOOKS = [
   "noiseBandPct:",
   "verdict:",
   "verdictRule",
-  "app.settled()",
+  "timeToUsable:",
+  "timeToUsableRule",
   "identityCalibrationDrift",
   "staleReasons",
   "worstLoaf",
@@ -1422,22 +1581,88 @@ function assertIdleControlContract() {
 }
 
 /**
- * Calibration invariant for progressive insertion.
+ * Calibration invariant for a settled round.
  *
- * A complete round has calls === hints === painted badges. The old bench read
- * the badge count two frames after activation; on 300 candidates that is about
- * 96 badges, and the calibration must reject that partial round rather than
- * call the fixture drifted or, worse, pass.
+ * A complete round has calls === hints === painted labels. The old bench read
+ * the DOM badge count two frames after activation; on 300 candidates that is
+ * about 96 labels, and the calibration must reject that partial round rather
+ * than call the fixture drifted or, worse, pass.
  */
 function assertIdentityCalibrationContract() {
   if (identityCalibrationDrift(300, 300, 300) !== null) {
-    throw new Error("a complete 300-badge round must pass the identity calibration");
+    throw new Error("a complete 300-label round must pass the identity calibration");
   }
   if (identityCalibrationDrift(300, 300, 96) === null) {
-    throw new Error("reading badges before progressive insertion completes must not pass calibration");
+    throw new Error("reading labels before stage A commits must not pass calibration");
   }
   if (identityCalibrationDrift(299, 300, 300) === null) {
     throw new Error("a round with a missing identity call must not pass calibration");
+  }
+}
+
+/**
+ * timeToUsable contract.
+ *
+ * The shape is fixed because the README table and the acceptance diff both
+ * read it: ms carries p50/p95/max, frames carries p50/max. A frame count is a
+ * small integer, so a p95 there would usually just duplicate the max on ten
+ * samples while pretending to describe a tail.
+ */
+function assertTimeToUsableContract() {
+  const summary = summarizeTimeToUsable([
+    { ms: 12.3456, frames: 2 },
+    { ms: 20, frames: 9 },
+    { ms: 30, frames: 10 },
+    { ms: 40, frames: 12 },
+  ]);
+  const expected = {
+    ms: { p50: 20, p95: 40, max: 40 },
+    frames: { p50: 9, max: 12 },
+  };
+  if (JSON.stringify(summary) !== JSON.stringify(expected)) {
+    throw new Error(
+      `timeToUsable summary is ${JSON.stringify(summary)}, expected ${JSON.stringify(expected)}`,
+    );
+  }
+  const single = summarizeTimeToUsable([{ ms: 7.5555, frames: 4 }]);
+  if (single.ms.p50 !== 7.556 || single.ms.p95 !== 7.556 || single.ms.max !== 7.556) {
+    throw new Error("timeToUsable ms must round to three decimals");
+  }
+  if (single.frames.p50 !== 4 || single.frames.max !== 4) {
+    throw new Error("a single timeToUsable sample must report itself for both frame percentiles");
+  }
+  const empty = summarizeTimeToUsable([]);
+  if (empty.ms.p50 !== null || empty.ms.max !== null || empty.frames.p50 !== null) {
+    throw new Error("an empty timeToUsable window must report nulls, not zeros");
+  }
+}
+
+/**
+ * Settle guard contract.
+ *
+ * Both limits must be able to fail on their own: a throttled tab starves
+ * frames long past the wall clock, and a machine under load can spend three
+ * seconds inside 199 frames. A round that did reach the expected count must
+ * pass even after both limits, otherwise the guard would reject the very
+ * round that proves it works.
+ */
+function assertSettleContract() {
+  if (collectionSettleFailure(300, 299, 0, 0) !== null) {
+    throw new Error("a round still inside both limits must not be declared unfinished");
+  }
+  if (collectionSettleFailure(300, 0, SETTLE_FRAME_LIMIT - 1, SETTLE_TIMEOUT_MS - 1) !== null) {
+    throw new Error("a round one frame and one millisecond short of both limits must still wait");
+  }
+  const byFrames = collectionSettleFailure(300, 0, SETTLE_FRAME_LIMIT, 10);
+  if (byFrames === null || !byFrames.includes("collection did not settle")) {
+    throw new Error("a round past the frame limit must fail with collection did not settle");
+  }
+  const byTime = collectionSettleFailure(300, 96, 3, SETTLE_TIMEOUT_MS);
+  if (byTime === null || !byTime.includes("300") || !byTime.includes("96")) {
+    throw new Error("the settle failure must name the expected and painted label counts");
+  }
+  if (collectionSettleFailure(300, 300, SETTLE_FRAME_LIMIT, SETTLE_TIMEOUT_MS) !== null) {
+    throw new Error("a round that reached its expected count must pass even after the limits");
   }
 }
 
@@ -1602,6 +1827,7 @@ export async function check() {
     !html.includes('"verifyFresh":false') ||
     !html.includes('"nearest-rank"') ||
     !html.includes("active over-budget rate minus idle control rate") ||
+    !html.includes("background throttling, the frame count is the steadier relative quantity") ||
     !html.includes("idleOverBudgetFrames:")
   ) {
     throw new Error("generated page lost its candidate/run/warmup/label/protocol/idle-control configuration");
@@ -1630,6 +1856,12 @@ export async function check() {
 
   assertIdentityCalibrationContract();
   console.log("check identity calibration: ok (complete round passes, partial 96/300 rejected)");
+
+  assertTimeToUsableContract();
+  console.log("check time to usable: ok (ms p50/p95/max, frames p50/max, empty window nulls)");
+
+  assertSettleContract();
+  console.log("check settle guard: ok (frame and wall-clock limits, a settled round passes)");
 
   assertFreshnessContract();
   console.log("check freshness: ok (pre-existing result, reload, timestamp, foreign realm rejected)");
