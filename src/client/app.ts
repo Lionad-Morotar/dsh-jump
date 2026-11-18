@@ -20,7 +20,7 @@ import { collectHints, type Hint } from "./hints.ts";
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
-import { createOverlay } from "./overlay.ts";
+import { createOverlay, type FrameClock } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 import { isUserReachable } from "./reach.ts";
 
@@ -73,6 +73,21 @@ export interface AppDeps {
    * with its own failure modes.
    */
   onReference?: (element: Element) => void;
+  /**
+   * Frame clock for progressive badge insertion.
+   *
+   * Browsers read the document's own requestAnimationFrame; tests inject a
+   * stepper so a batch only lands when the test advances a frame.
+   */
+  frameClock?: FrameClock;
+  /**
+   * Time one badge batch may spend before yielding to the next frame.
+   *
+   * A host with a measured display cadence injects it here; the default is a
+   * 60Hz frame. Seven milliseconds is not hard-coded because it is one machine's
+   * panel, not a property of the plugin.
+   */
+  frameBudgetMs?: number;
 }
 
 export interface JumpApp {
@@ -199,6 +214,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
+    clock: deps.frameClock,
   });
 
   /**
@@ -225,7 +241,10 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       { width: win.innerWidth, height: win.innerHeight },
       { isVisible, memory },
     );
-    overlay.render(hints);
+    // Labels are complete before this call; progressive only decides when each
+    // badge joins the DOM, so a keystroke can already reach a label whose badge
+    // is still queued.
+    overlay.renderProgressive(hints, "", { frameBudgetMs: deps.frameBudgetMs });
     return hints;
   }
 

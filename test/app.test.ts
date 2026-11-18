@@ -9,6 +9,8 @@ import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpWindow } from "../src/client/app.ts";
+import { generateLabels } from "../src/client/hints.ts";
+import type { FrameClock } from "../src/client/overlay.ts";
 import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
@@ -1212,3 +1214,149 @@ describe("stacked background cards stay out of the label set", () => {
   });
 });
 
+/** 手动推进的帧时钟：让分批在测试里只按步进发生。 */
+function frameClock(start = 0): FrameClock & { step(ms: number): void } {
+  let time = start;
+  let nextHandle = 1;
+  const queued = new Map<number, (time: number) => void>();
+  return {
+    now: () => time,
+    request: (callback) => {
+      const handle = nextHandle++;
+      queued.set(handle, callback);
+      return handle;
+    },
+    cancel: (handle) => {
+      queued.delete(handle);
+    },
+    step: (ms) => {
+      time += ms;
+      const due = [...queued.values()];
+      queued.clear();
+      for (const callback of due) callback(time);
+    },
+  };
+}
+
+/** 20 列网格：300 个候选全部落在 jsdom 视口内，视觉顺序等于建按钮的顺序。 */
+function gridButtons(count: number): HTMLElement[] {
+  const cols = 20;
+  const els: HTMLElement[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const el = doc.createElement("button");
+    el.textContent = "g" + String(i);
+    place(el, 10 + (i % cols) * 30, 10 + Math.floor(i / cols) * 30);
+    doc.body.append(el);
+    els.push(el);
+  }
+  return els;
+}
+
+function badgeCount(): number {
+  return doc.querySelectorAll("[data-jump-label]").length;
+}
+
+describe("progressive activation", () => {
+  it("accepts a label whose badge has not been inserted yet", () => {
+    // 300 个候选升到三键，首批 32 枚之后还有大量标签没画出来。
+    const els = gridButtons(300);
+    const clock = frameClock();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+
+    activate();
+    expect(badgeCount()).toBe(32);
+    clock.step(1);
+    const afterFirstFrame = badgeCount();
+    expect(afterFirstFrame).toBeGreaterThan(32);
+    expect(afterFirstFrame).toBeLessThan(300);
+
+    const label = [...generateLabels(3)][299] as string;
+    const target = els[299] as HTMLElement;
+    const hits: string[] = [];
+    target.addEventListener("click", () => hits.push("click"));
+
+    // 前缀击键只重绘已插入的徽章，不能把剩下两百多枚同步补上。
+    win.dispatchEvent(keydown({ key: label[0] }));
+    expect(badgeCount()).toBe(afterFirstFrame);
+    win.dispatchEvent(keydown({ key: label[1] }));
+    expect(badgeCount()).toBe(afterFirstFrame);
+    win.dispatchEvent(keydown({ key: label[2] }));
+
+    expect(hits).toEqual(["click"]);
+    expect(overlayRoot()).toBeNull();
+    // 命中已结束这一轮，队列里剩下的批次不能再把徽章插回来。
+    clock.step(1);
+    expect(badgeCount()).toBe(0);
+    teardown();
+  });
+
+  it("Esc cancels the pending batches and leaves no badge behind", () => {
+    gridButtons(300);
+    const clock = frameClock();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+
+    activate();
+    clock.step(1);
+    expect(badgeCount()).toBeGreaterThan(32);
+    expect(badgeCount()).toBeLessThan(300);
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    expect(overlayRoot()).toBeNull();
+    for (let frame = 0; frame < 5; frame += 1) clock.step(1);
+    expect(badgeCount()).toBe(0);
+    expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+
+  it("starts a fresh round from the initial batch after a cancelled one", () => {
+    gridButtons(300);
+    const clock = frameClock();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+
+    activate();
+    clock.step(1);
+    expect(badgeCount()).toBeGreaterThan(32);
+    win.dispatchEvent(keydown({ key: "Escape" }));
+
+    activate();
+    // 新轮从首批重新开始，不夹带上一轮已经画出的残余。
+    expect(badgeCount()).toBe(32);
+    teardown();
+  });
+});
+
+describe("progressive cancellation surfaces", () => {
+  it("visibilitychange cancels the pending batches", () => {
+    gridButtons(300);
+    const clock = frameClock();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    activate();
+    clock.step(1);
+    expect(badgeCount()).toBeGreaterThan(32);
+
+    Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
+    try {
+      doc.dispatchEvent(new dom.window.Event("visibilitychange"));
+      expect(overlayRoot()).toBeNull();
+      for (let frame = 0; frame < 5; frame += 1) clock.step(1);
+      expect(badgeCount()).toBe(0);
+    } finally {
+      delete (doc as unknown as Record<string, unknown>)["visibilityState"];
+    }
+    teardown();
+  });
+
+  it("dispose cancels the pending batches", () => {
+    gridButtons(300);
+    const clock = frameClock();
+    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock }).apply();
+    activate();
+    clock.step(1);
+    expect(badgeCount()).toBeGreaterThan(32);
+
+    teardown();
+    expect(overlayRoot()).toBeNull();
+    for (let frame = 0; frame < 5; frame += 1) clock.step(1);
+    expect(badgeCount()).toBe(0);
+  });
+});

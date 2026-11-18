@@ -11,8 +11,8 @@
 import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { Hint } from "../src/client/hints.ts";
-import { createOverlay } from "../src/client/overlay.ts";
+import { generateLabels, type Hint } from "../src/client/hints.ts";
+import { createOverlay, type FrameClock } from "../src/client/overlay.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -286,6 +286,159 @@ describe("top layer", () => {
     const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
     overlay.render(hintsOf(["as"]));
     expect(document.querySelector<HTMLElement>(OVERLAY)?.hasAttribute("popover")).toBe(false);
+    overlay.destroy();
+  });
+});
+
+/** 手动推进的帧时钟：jsdom 没有真实帧，分批只在该步进时发生。 */
+function frameClock(start = 0): FrameClock & { step(ms: number): void } {
+  let time = start;
+  let nextHandle = 1;
+  const queued = new Map<number, (time: number) => void>();
+  return {
+    now: () => time,
+    request: (callback) => {
+      const handle = nextHandle++;
+      queued.set(handle, callback);
+      return handle;
+    },
+    cancel: (handle) => {
+      queued.delete(handle);
+    },
+    step: (ms) => {
+      time += ms;
+      const due = [...queued.values()];
+      queued.clear();
+      for (const callback of due) callback(time);
+    },
+  };
+}
+
+function progressiveHints(count: number): Hint[] {
+  // Distinct positions inside the viewport: a label handed to another target
+  // would also change the badge's clamped left/top, so the comparison below can
+  // see a drift instead of two badges stacking on the same clamped corner.
+  return [...generateLabels(4)].slice(0, count).map((label, index) => ({
+    element: document.createElement("button"),
+    label,
+    rect: { x: (index % 30) * 20, y: Math.floor(index / 30) * 20, w: 10, h: 10 },
+  }));
+}
+
+describe("progressive badge insertion", () => {
+  it("inserts the first batch in the activation frame and the rest across later frames", () => {
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+
+    overlay.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 100, initialBatch: 32 });
+
+    // 激活那一帧只插入首批；后续批次等动画帧。
+    expect(badges()).toHaveLength(32);
+    clock.step(1);
+    expect(badges().length).toBeGreaterThan(32);
+    expect(badges().length).toBeLessThan(150);
+
+    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
+    expect(badges()).toHaveLength(300);
+    overlay.destroy();
+  });
+
+  it("keeps every label on the same target as one synchronous render", () => {
+    const hints = progressiveHints(300);
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+
+    overlay.renderProgressive(hints, "", { frameBudgetMs: 100, initialBatch: 32 });
+    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
+
+    const snapshot = (): { label: string | undefined; left: string; top: string; text: string | null }[] =>
+      badges()
+        .map((badge) => ({
+          label: badge.dataset.jumpLabel,
+          left: badge.style.left,
+          top: badge.style.top,
+          text: badge.textContent,
+        }))
+        .sort((a, b) => String(a.label).localeCompare(String(b.label)));
+    const progressive = snapshot();
+
+    overlay.destroy();
+    overlay.render(hints);
+    expect(snapshot()).toEqual(progressive);
+    overlay.destroy();
+  });
+
+  it("grows the batch when frames come in far under budget, never past the ceiling", () => {
+    // 预算 100ms、每帧只花 1ms：批量该连续放大，但上限 256 不能破。
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    overlay.renderProgressive(progressiveHints(2000), "", {
+      frameBudgetMs: 100,
+      initialBatch: 32,
+      minBatch: 8,
+      maxBatch: 256,
+    });
+
+    const deltas: number[] = [];
+    let previous = badges().length;
+    for (let frame = 0; frame < 8; frame += 1) {
+      clock.step(1);
+      const current = badges().length;
+      deltas.push(current - previous);
+      previous = current;
+    }
+
+    expect(deltas[0]).toBeGreaterThan(32);
+    expect(Math.max(...deltas)).toBe(256);
+    overlay.destroy();
+  });
+
+  it("uses the frame budget published by the embedding page when no option is given", () => {
+    // 400ms 在默认 16.7ms 预算下必然收缩；只有读到了页面发布的 1000ms 预算，
+    // 它才算「远低于预算」并放大批量。
+    const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: number };
+    host.__DSH_JUMP_FRAME_BUDGET_MS__ = 1000;
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    try {
+      overlay.renderProgressive(progressiveHints(2000), "", {
+        initialBatch: 128,
+        minBatch: 8,
+        maxBatch: 256,
+      });
+      clock.step(400);
+      expect(badges()).toHaveLength(128 + 192);
+    } finally {
+      delete host.__DSH_JUMP_FRAME_BUDGET_MS__;
+      overlay.destroy();
+    }
+  });
+
+  it("shrinks the batch when a frame misses budget, never past the floor", () => {
+    // 预算 10ms、每帧花 500ms：批量逐帧减半，8 是下限。
+    const clock = frameClock();
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    overlay.renderProgressive(progressiveHints(2000), "", {
+      frameBudgetMs: 10,
+      initialBatch: 128,
+      minBatch: 8,
+      maxBatch: 256,
+    });
+
+    const deltas: number[] = [];
+    let previous = badges().length;
+    for (let frame = 0; frame < 6; frame += 1) {
+      clock.step(500);
+      const current = badges().length;
+      deltas.push(current - previous);
+      previous = current;
+    }
+
+    expect(deltas[0]).toBeLessThan(128);
+    expect(Math.min(...deltas)).toBe(8);
+    for (let index = 1; index < deltas.length; index += 1) {
+      expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1] as number);
+    }
     overlay.destroy();
   });
 });
