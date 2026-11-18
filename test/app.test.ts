@@ -560,6 +560,108 @@ describe("a growing prefix only repaints badges whose look changes", () => {
   });
 });
 
+/**
+ * 首击变暗的整批徽章文字没有变化，不许重建子节点。
+ *
+ * 600 档首击有 519 枚徽章从 whole 转成 whole，唯一变化是 opacity；旧实现每枚
+ * 都 replaceChildren 一次，产出与原来完全相同的 span。最终视觉在两种实现下
+ * 一样，所以只能观察 MutationObserver 的 childList 记录。
+ */
+describe("the first stroke only dims the badges it rules out", () => {
+  let stop: (() => void) | undefined;
+  let watcher: MutationObserver | undefined;
+  afterEach(() => {
+    watcher?.disconnect();
+    watcher = undefined;
+    stop?.();
+    stop = undefined;
+  });
+
+  function mount(): void {
+    stop = createApp({ window: win, isVisible: () => true }).apply();
+  }
+
+  function allBadges(): HTMLElement[] {
+    return [...(overlayRoot()?.children ?? [])] as HTMLElement[];
+  }
+
+  function labelsByOpacity(opacity: string): string[] {
+    return allBadges()
+      .filter((child) => child.style.opacity === opacity)
+      .map((child) => child.dataset.jumpLabel ?? "");
+  }
+
+  /** 只记 childList：样式写入是允许的，重建子节点才是不该有的工作量。 */
+  function watchChildList(): () => MutationRecord[] {
+    const root = overlayRoot();
+    if (root === null) throw new Error("浮层不存在，无法观察");
+    const observer = new dom.window.MutationObserver(() => undefined);
+    observer.observe(root, { subtree: true, childList: true });
+    watcher = observer;
+    return () => observer.takeRecords().filter((record) => record.type === "childList");
+  }
+
+  /** 一条记录算在哪枚徽章上；徽章内部 span 的写入也算它的。 */
+  function owner(record: MutationRecord): string | undefined {
+    const holder = (record.target as Element).closest?.("[data-jump-label]");
+    return (holder as HTMLElement | null | undefined)?.dataset.jumpLabel;
+  }
+
+  it("dims the ruled-out badges without touching their child nodes", () => {
+    // 90 个候选整轮升到三键；首键 a 留下 81 枚点亮，9 枚以 s 开头的在这一击变暗。
+    buttons(90);
+    mount();
+    activate();
+    const drain = watchChildList();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    const records = drain();
+
+    const dim = labelsByOpacity("0.3");
+    const lit = labelsByOpacity("1");
+    expect(dim).toHaveLength(9);
+    expect(lit).toHaveLength(81);
+    // 变暗的这批文字还是整段，重建只会换掉同样的 span。
+    const dimChildList = records.filter((record) => dim.includes(owner(record) ?? ""));
+    expect(dimChildList).toHaveLength(0);
+    // 点亮的那批要拆成 typed/rest，必须有重建记录，否则观察器本身失效了。
+    const litChildList = records.filter((record) => lit.includes(owner(record) ?? ""));
+    expect(litChildList.length).toBeGreaterThan(0);
+    expect((allBadges()[0]?.children[0] as HTMLElement).dataset.jumpPart).toBe("typed");
+  });
+
+  it("relights the dead-key batch without rebuilding their whole-label run", () => {
+    // 两击之后只剩 as 组 9 枚点亮，其余 81 枚都是整段文字加 0.3。
+    buttons(90);
+    mount();
+    activate();
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "s" }));
+    expect(labelsByOpacity("1")).toHaveLength(9);
+
+    const dim = labelsByOpacity("0.3");
+    expect(dim).toHaveLength(81);
+    const drain = watchChildList();
+
+    // x 不在主行，接不上任何 label，前缀被清空，整轮回亮。
+    win.dispatchEvent(keydown({ key: "x" }));
+    const records = drain();
+
+    expect(labelsByOpacity("1")).toHaveLength(90);
+    const dimChildList = records.filter((record) => dim.includes(owner(record) ?? ""));
+    expect(dimChildList).toHaveLength(0);
+    for (const child of allBadges()) {
+      expect(child.style.opacity).toBe("1");
+      expect(textOf(child)).toBe(child.dataset.jumpLabel);
+    }
+  });
+});
+
+/** 徽章当前显示的文字，按子节点顺序拼起来。 */
+function textOf(badge: HTMLElement): string {
+  return [...badge.children].map((child) => child.textContent ?? "").join("");
+}
+
 describe("active-mode key swallowing", () => {
   it("Enter in a focused input is eaten while click mode is active", () => {
     const input = doc.createElement("input");

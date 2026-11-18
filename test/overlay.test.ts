@@ -9,7 +9,7 @@
  * 这里守的是这两条，不是实现细节：节点身份、被跳过的写入、location 的归属。
  */
 import { JSDOM } from "jsdom";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { Hint } from "../src/client/hints.ts";
 import { createOverlay } from "../src/client/overlay.ts";
@@ -102,6 +102,131 @@ describe("prefix painting", () => {
     expect(badges()).toHaveLength(0);
     overlay.destroy();
     expect(document.querySelector(OVERLAY)).toBeNull();
+  });
+});
+
+/**
+ * 文字没变的转态不许重建子节点。
+ *
+ * 首击时整批徽章从「整段」转成「整段」只是变暗，span 的结构与文本完全一样；
+ * replaceChildren 会把同一枚 span 销毁再造一枚，600 档就是 519 次白做。这里用
+ * MutationObserver 的 childList 记录区分「重建」与「只写 opacity」，最终视觉在
+ * 两种实现下相同，不能靠读 DOM 结果断言。
+ */
+describe("badge text repaint", () => {
+  let observer: MutationObserver | undefined;
+
+  afterEach(() => {
+    observer?.disconnect();
+    observer = undefined;
+  });
+
+  function badgeOf(label: string): HTMLElement {
+    const found = badges().find((child) => child.dataset.jumpLabel === label);
+    expect(found).toBeDefined();
+    return found as HTMLElement;
+  }
+
+  function watchChildList(label: string): () => MutationRecord[] {
+    const observerInstance = new dom.window.MutationObserver(() => undefined);
+    observerInstance.observe(badgeOf(label), { subtree: true, childList: true });
+    observer = observerInstance;
+    return () => observerInstance.takeRecords();
+  }
+
+  function partTexts(label: string): (string | null | undefined)[][] {
+    return [...badgeOf(label).children].map((child) => [
+      (child as HTMLElement).dataset.jumpPart,
+      child.textContent,
+    ]);
+  }
+
+  it("keeps the whole-label run when a matching badge is ruled out", () => {
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const hints = hintsOf(["asd", "sd"]);
+    overlay.render(hints);
+    const drain = watchChildList("sd");
+
+    overlay.render(hints, "a");
+
+    // 首击：文字从 whole 到 whole，只有透明度变了。
+    expect(drain()).toHaveLength(0);
+    expect(badgeOf("sd").style.opacity).toBe("0.3");
+    expect(partTexts("sd")).toEqual([["whole", "sd"]]);
+    overlay.destroy();
+  });
+
+  it("keeps the whole-label run when a dead key relights a dimmed badge", () => {
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const hints = hintsOf(["asd", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    expect(badgeOf("sd").style.opacity).toBe("0.3");
+    const drain = watchChildList("sd");
+
+    overlay.render(hints, "");
+
+    // 死键回亮：whole 到 whole，同样只有透明度该动。
+    expect(drain()).toHaveLength(0);
+    expect(badgeOf("sd").style.opacity).toBe("1");
+    expect(partTexts("sd")).toEqual([["whole", "sd"]]);
+    overlay.destroy();
+  });
+
+  it("rebuilds the run when a split badge drops out", () => {
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const hints = hintsOf(["asa", "asd"]);
+    overlay.render(hints, "as");
+    expect(partTexts("asa")).toEqual([
+      ["typed", "as"],
+      ["rest", "a"],
+    ]);
+    const drain = watchChildList("asa");
+
+    overlay.render(hints, "asd");
+
+    // typed/rest 到 whole 是两枚 span 换一枚，必须重建。
+    expect(drain().length).toBeGreaterThan(0);
+    expect(badgeOf("asa").style.opacity).toBe("0.3");
+    expect(partTexts("asa")).toEqual([["whole", "asa"]]);
+    overlay.destroy();
+  });
+
+  it("rebuilds the run when a dimmed badge becomes reachable again", () => {
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const hints = hintsOf(["asa", "asd"]);
+    overlay.render(hints);
+    overlay.render(hints, "asd");
+    expect(badgeOf("asa").style.opacity).toBe("0.3");
+    const drain = watchChildList("asa");
+
+    overlay.render(hints, "as");
+
+    // whole 到 typed/rest，文字内容也变了，必须重建。
+    expect(drain().length).toBeGreaterThan(0);
+    expect(badgeOf("asa").style.opacity).toBe("1");
+    expect(partTexts("asa")).toEqual([
+      ["typed", "as"],
+      ["rest", "a"],
+    ]);
+    overlay.destroy();
+  });
+
+  it("rebuilds the run when a longer prefix splits further", () => {
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const hints = hintsOf(["asd"]);
+    overlay.render(hints, "a");
+    const drain = watchChildList("asd");
+
+    overlay.render(hints, "as");
+
+    expect(drain().length).toBeGreaterThan(0);
+    expect(partTexts("asd")).toEqual([
+      ["typed", "as"],
+      ["rest", "d"],
+    ]);
+    expect(badgeOf("asd").style.opacity).toBe("1");
+    overlay.destroy();
   });
 });
 

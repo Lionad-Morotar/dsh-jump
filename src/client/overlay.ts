@@ -55,10 +55,11 @@ interface Badge {
    */
   matched: boolean;
   /**
-   * Prefix whose text split this badge currently shows.
+   * Prefix whose split this badge currently renders.
    *
-   * Only meaningful while `matched`; a dim badge always reads as its whole
-   * label, whichever prefix ruled it out.
+   * A dim badge always renders the empty prefix, whichever prefix ruled it out.
+   * Kept as the rendered form rather than the live prefix so `paint` can tell a
+   * text change from a light change.
    */
   drawn: string;
 }
@@ -159,7 +160,9 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       "font:11px/1.3 ui-monospace,Menlo,monospace;pointer-events:none;" +
       "opacity:" + (matched ? "1" : "0.3");
     el.append(...segments(hint, matched ? pending : ""));
-    return { element: el, target: hint.element, matched, drawn: pending };
+    // The rendered form, not the live prefix: an unmatched badge paints whole
+    // even when the round was minted under a non-empty prefix.
+    return { element: el, target: hint.element, matched, drawn: matched ? pending : "" };
   }
 
   /**
@@ -171,15 +174,21 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
    */
   function paint(badge: Badge, hint: Hint, pending: string): void {
     const matched = hint.label.startsWith(pending);
+    // The text is a function of the prefix only while the badge is lit; a dim
+    // badge always shows one whole run. Comparing this form instead of the raw
+    // prefix is what keeps the first stroke from rebuilding hundreds of spans
+    // that would come out identical.
+    const drawn = matched ? pending : "";
     const flips = badge.matched !== matched;
-    // A badge already ruled out stays ruled out under every longer prefix:
-    // same opacity, same whole-label run, so both writes would be invisible.
-    if (!flips && (!matched || badge.drawn === pending)) return;
+    const textChanged = badge.drawn !== drawn;
+    if (!flips && !textChanged) return;
     badge.matched = matched;
-    badge.drawn = pending;
+    badge.drawn = drawn;
     // While the badge stays lit the opacity is already 1; only the split moves.
     if (flips) badge.element.style.opacity = matched ? "1" : "0.3";
-    badge.element.replaceChildren(...segments(hint, matched ? pending : ""));
+    // Crossing the lit/dim line with the same whole-label run is an opacity
+    // write only; the children are still the nodes the reader sees.
+    if (textChanged) badge.element.replaceChildren(...segments(hint, drawn));
   }
 
   /**
