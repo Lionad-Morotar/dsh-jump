@@ -8,9 +8,8 @@
 import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createApp, type JumpWindow } from "../src/client/app.ts";
+import { createApp, type JumpApp, type JumpWindow } from "../src/client/app.ts";
 import { generateLabels } from "../src/client/hints.ts";
-import type { FrameClock } from "../src/client/overlay.ts";
 import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
@@ -43,6 +42,110 @@ function overlayRoot(): Element | null {
   return doc.querySelector("[data-dsh-jump-overlay]");
 }
 
+/**
+ * 记录 canvas 绘制调用的替身。
+ *
+ * jsdom 没有 2D 上下文，app 层只关心「这一击画出了什么形态」：分段、字重与
+ * 透明度。每次 canvas 取上下文都拿到一个写入同一份 ops 的记录器，断言落在
+ * 绘制调用上，不依赖任何徽章 DOM。
+ */
+interface CanvasText {
+  readonly text: string;
+  readonly weight: string;
+  readonly alpha: number;
+}
+
+let canvasOps: {
+  readonly kind: "clearRect" | "fillText" | "setTransform" | "roundRect" | "rect" | "fill" | "beginPath";
+  readonly args: readonly unknown[];
+  readonly font: string;
+  readonly alpha: number;
+}[] = [];
+
+function recordingContext(): CanvasRenderingContext2D {
+  let font = "10px sans-serif";
+  let alpha = 1;
+  const stack: { font: string; alpha: number }[] = [];
+  const push = (kind: (typeof canvasOps)[number]["kind"], args: readonly unknown[] = []): void => {
+    canvasOps.push({ kind, args, font, alpha });
+  };
+  return {
+    get font(): string {
+      return font;
+    },
+    set font(value: string) {
+      font = value;
+    },
+    set fillStyle(_value: string) {
+      // The colour is not the assertion target here, only the run shape is.
+    },
+    get fillStyle(): string {
+      return "#000";
+    },
+    get globalAlpha(): number {
+      return alpha;
+    },
+    set globalAlpha(value: number) {
+      alpha = value;
+    },
+    save(): void {
+      stack.push({ font, alpha });
+    },
+    restore(): void {
+      const last = stack.pop();
+      if (last !== undefined) {
+        font = last.font;
+        alpha = last.alpha;
+      }
+    },
+    setTransform(...args: number[]): void {
+      push("setTransform", args);
+    },
+    clearRect(...args: number[]): void {
+      push("clearRect", args);
+    },
+    beginPath(): void {
+      push("beginPath");
+    },
+    roundRect(...args: number[]): void {
+      push("roundRect", args);
+    },
+    rect(...args: number[]): void {
+      push("rect", args);
+    },
+    fill(): void {
+      push("fill");
+    },
+    fillText(text: string, x: number, y: number): void {
+      push("fillText", [text, x, y]);
+    },
+    measureText(text: string): { width: number } {
+      return { width: text.length * 6.6 };
+    },
+  } as unknown as CanvasRenderingContext2D;
+}
+
+function canvasTexts(): CanvasText[] {
+  return canvasOps
+    .filter((op) => op.kind === "fillText")
+    .map((op) => ({
+      text: String(op.args[0]),
+      weight: op.font.split(" ")[0] ?? "",
+      alpha: op.alpha,
+    }));
+}
+
+function since(mark: number): CanvasText[] {
+  return canvasTexts().slice(mark);
+}
+
+// jsdom 不认识 CanvasRenderingContext2D；先把这个构造函数放上去，再让
+// canvas.getContext 返回记录器，overlay 的能力探测才会走真实绘制路径。
+(dom.window as unknown as Record<string, unknown>)["CanvasRenderingContext2D"] = function () {};
+(
+  dom.window.HTMLCanvasElement.prototype as unknown as { getContext: () => CanvasRenderingContext2D }
+).getContext = () => recordingContext();
+
 function activate(): void {
   win.dispatchEvent(keydown({ key: "h", metaKey: true }));
 }
@@ -52,6 +155,7 @@ beforeEach(() => {
   // 浮层挂在 documentElement 上，body 清空带不走它；上一轮漏下的容器会让
   // overlayRoot() 找到错误的节点。
   doc.querySelector("[data-dsh-jump-overlay]")?.remove();
+  canvasOps = [];
   (doc.activeElement as HTMLElement | null)?.blur?.();
 });
 
@@ -129,15 +233,14 @@ describe("createApp wiring", () => {
     const els = buttons(3);
     const leaked = vi.fn();
     win.addEventListener("keydown", leaked);
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
 
     doc.body.dispatchEvent(keydown({ key: "h", metaKey: true }));
     expect(leaked).not.toHaveBeenCalled();
 
-    const root = overlayRoot();
-    expect(root).not.toBeNull();
-    const labels = [...(root?.children ?? [])].map((b) => (b as HTMLElement).dataset.jumpLabel);
-    expect(labels).toEqual(["a", "s", "d"]);
+    expect(overlayRoot()).not.toBeNull();
+    expect(app.labels()).toEqual(["a", "s", "d"]);
     expect(els[0]).toBeDefined();
 
     win.removeEventListener("keydown", leaked);
@@ -158,16 +261,13 @@ describe("createApp wiring", () => {
     const teardown = createApp({ window: win, isVisible: () => true }).apply();
     activate();
 
+    const mark = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
-    const root = overlayRoot();
-    const opacity = (label: string): string | undefined => {
-      const badge = [...(root?.children ?? [])].find(
-        (b) => (b as HTMLElement).dataset.jumpLabel === label,
-      );
-      return (badge as HTMLElement | undefined)?.style.opacity;
-    };
-    expect(opacity("ad")).toBe("1");
-    expect(opacity("sd")).toBe("0.3");
+    const stroke = since(mark);
+    // 命中的 ad 拆成已敲与未敲两段并保持点亮，被排除的 sd 整枚降到 0.3。
+    expect(stroke).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(stroke).toContainEqual({ text: "d", weight: "400", alpha: 1 });
+    expect(stroke).toContainEqual({ text: "sd", weight: "400", alpha: 0.3 });
 
     const seen: string[] = [];
     const target = els[1] as HTMLElement; // 第二个候选，两键轮 label 为 ad
@@ -229,31 +329,16 @@ describe("createApp wiring", () => {
 describe("badge segments in a multi-key round", () => {
   // 断言先失败时也要摘掉监听器，否则漏掉的 app 会接管后续用例的按键。
   let stop: (() => void) | undefined;
+  let app: JumpApp | undefined;
   afterEach(() => {
     stop?.();
     stop = undefined;
+    app = undefined;
   });
 
   function mount(): void {
-    stop = createApp({ window: win, isVisible: () => true }).apply();
-  }
-
-  /** 当前轮里某个 label 的徽章。 */
-  function badge(label: string): HTMLElement {
-    const root = overlayRoot();
-    const found = [...(root?.children ?? [])].find(
-      (child) => (child as HTMLElement).dataset.jumpLabel === label,
-    );
-    expect(found).toBeDefined();
-    return found as HTMLElement;
-  }
-
-  /** 徽章分出的文字段，按 [段名, 文本] 列出。 */
-  function parts(label: string): [string | undefined, string | null][] {
-    return [...badge(label).children].map((part) => [
-      (part as HTMLElement).dataset.jumpPart,
-      part.textContent,
-    ]);
+    app = createApp({ window: win, isVisible: () => true });
+    stop = app.apply();
   }
 
   it("paints a badge as one whole-label segment while no prefix is typed", () => {
@@ -261,7 +346,10 @@ describe("badge segments in a multi-key round", () => {
     mount();
     activate();
 
-    expect(parts("ad")).toEqual([["whole", "ad"]]);
+    expect(app?.labels()).toHaveLength(12);
+    expect(canvasTexts()).toEqual(
+      (app?.labels() ?? []).map((label) => ({ text: label, weight: "400", alpha: 1 })),
+    );
   });
 
   it("splits a still-matching badge into the typed letters and the rest", () => {
@@ -269,18 +357,16 @@ describe("badge segments in a multi-key round", () => {
     mount();
     activate();
 
+    const mark = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
 
-    expect(parts("ad")).toEqual([
-      ["typed", "a"],
-      ["rest", "d"],
-    ]);
-    const [typed, rest] = [...badge("ad").children] as HTMLElement[];
-    expect(typed?.style.fontWeight).not.toBe("");
-    expect(typed?.style.fontWeight).not.toBe(rest?.style.fontWeight);
+    const stroke = since(mark);
+    expect(stroke).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(stroke).toContainEqual({ text: "d", weight: "400", alpha: 1 });
     // 连前缀都对不上的徽章仍是一整段完整标签，只是变暗。
-    expect(parts("sd")).toEqual([["whole", "sd"]]);
-    expect(badge("sd").style.opacity).toBe("0.3");
+    expect(stroke.filter((text) => text.text === "sd")).toEqual([
+      { text: "sd", weight: "400", alpha: 0.3 },
+    ]);
   });
 
   it("returns every badge to one whole segment after a dead-end key", () => {
@@ -289,67 +375,26 @@ describe("badge segments in a multi-key round", () => {
     activate();
 
     win.dispatchEvent(keydown({ key: "a" }));
-    expect(parts("ad")).toEqual([
-      ["typed", "a"],
-      ["rest", "d"],
-    ]);
+    const mark = canvasTexts().length;
 
     // "x" 不在主行，接不上任何 label，前缀被清空。
     win.dispatchEvent(keydown({ key: "x" }));
 
-    expect(parts("ad")).toEqual([["whole", "ad"]]);
-    expect(parts("sd")).toEqual([["whole", "sd"]]);
-    expect(badge("sd").style.opacity).toBe("1");
+    const labels = app?.labels() ?? [];
+    expect(since(mark)).toEqual(labels.map((label) => ({ text: label, weight: "400", alpha: 1 })));
   });
 });
 
 describe("a completing stroke tears the round down without repainting it", () => {
   // 断言先失败时也要摘掉监听器，否则漏掉的 app 会接管后续用例的按键。
   let stop: (() => void) | undefined;
-  let watcher: MutationObserver | undefined;
   afterEach(() => {
-    watcher?.disconnect();
-    watcher = undefined;
     stop?.();
     stop = undefined;
   });
 
   function mount(): void {
     stop = createApp({ window: win, isVisible: () => true }).apply();
-  }
-
-  /** 当前轮里某个 label 的徽章。 */
-  function badge(label: string): HTMLElement {
-    const root = overlayRoot();
-    const found = [...(root?.children ?? [])].find(
-      (child) => (child as HTMLElement).dataset.jumpLabel === label,
-    );
-    expect(found).toBeDefined();
-    return found as HTMLElement;
-  }
-
-  /** 徽章分出的文字段，按 [段名, 文本] 列出。 */
-  function parts(label: string): [string | undefined, string | null][] {
-    return [...badge(label).children].map((part) => [
-      (part as HTMLElement).dataset.jumpPart,
-      part.textContent,
-    ]);
-  }
-
-  /**
-   * 观察浮层容器子树的 DOM 变更。
-   *
-   * 命中完成的那一击里，徽章马上要随容器一起消失，任何 opacity 或
-   * replaceChildren 都是白画。MutationObserver 记下的正是这批白画的写操作，
-   * 因此「这一击有没有整轮重绘」是可观察工作量，不靠 overlay 的内部状态。
-   */
-  function watchBadges(): () => MutationRecord[] {
-    const root = overlayRoot();
-    if (root === null) throw new Error("浮层不存在，无法观察");
-    const observer = new dom.window.MutationObserver(() => undefined);
-    observer.observe(root, { subtree: true, childList: true, attributes: true });
-    watcher = observer;
-    return () => observer.takeRecords();
   }
 
   /** 目标收到的完整 pointer/mouse/click 序列，按到达顺序追加。 */
@@ -367,20 +412,20 @@ describe("a completing stroke tears the round down without repainting it", () =>
     activate();
 
     // 12 个候选超过单键容量，整轮是双键标签；第二个按钮的标签为 ad。
+    const mark = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
-    expect(parts("ad")).toEqual([
-      ["typed", "a"],
-      ["rest", "d"],
-    ]);
-    expect(badge("sd").style.opacity).toBe("0.3");
+    expect(since(mark)).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(since(mark)).toContainEqual({ text: "d", weight: "400", alpha: 1 });
+    expect(since(mark)).toContainEqual({ text: "sd", weight: "400", alpha: 0.3 });
 
     const target = els[1] as HTMLElement;
     const seen = hitSequence(target);
-    const drain = watchBadges();
+    const painted = canvasTexts().length;
 
     win.dispatchEvent(keydown({ key: "d" }));
 
-    expect(drain()).toEqual([]);
+    // 命中后的收尾只清画布，不再为即将消失的一轮补画任何文字。
+    expect(canvasTexts().length).toBe(painted);
     expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
     expect(overlayRoot()).toBeNull();
   });
@@ -392,11 +437,11 @@ describe("a completing stroke tears the round down without repainting it", () =>
 
     const target = els[0] as HTMLElement;
     const seen = hitSequence(target);
-    const drain = watchBadges();
+    const painted = canvasTexts().length;
 
     win.dispatchEvent(keydown({ key: "a" }));
 
-    expect(drain()).toEqual([]);
+    expect(canvasTexts().length).toBe(painted);
     expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
     expect(overlayRoot()).toBeNull();
   });
@@ -407,87 +452,55 @@ describe("a completing stroke tears the round down without repainting it", () =>
     mount();
     activate();
 
+    let mark = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
-    expect(parts("asd")).toEqual([
-      ["typed", "a"],
-      ["rest", "sd"],
-    ]);
+    expect(since(mark)).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(since(mark)).toContainEqual({ text: "sd", weight: "400", alpha: 1 });
 
+    mark = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "s" }));
-    expect(parts("asd")).toEqual([
-      ["typed", "as"],
-      ["rest", "d"],
-    ]);
+    expect(since(mark)).toContainEqual({ text: "as", weight: "700", alpha: 1 });
+    expect(since(mark)).toContainEqual({ text: "d", weight: "400", alpha: 1 });
 
     const target = els[1] as HTMLElement;
     const seen = hitSequence(target);
-    const drain = watchBadges();
+    const painted = canvasTexts().length;
 
     win.dispatchEvent(keydown({ key: "d" }));
 
-    expect(drain()).toEqual([]);
+    expect(canvasTexts().length).toBe(painted);
     expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
     expect(overlayRoot()).toBeNull();
   });
 });
 
 /**
- * 前缀增长时，视觉上没变化的徽章必须整枚跳过。
+ * 前缀增长时，已经被排除的徽章在视觉上必须保持原样。
  *
- * 首键 "a" 之后已经变暗的徽章，到 "as" 仍然不匹配：opacity 还是 0.3，
- * 文字还是单段整标签。它们不该收到 opacity 写入，也不该重建子节点。
- * 断言落在 MutationObserver 记录上，因为修复前后最终视觉完全相同。
+ * 首键 "a" 之后已经变暗的徽章，到 "as" 仍然不匹配：透明度还是 0.3，
+ * 文字还是一整段。canvas 每帧全量重画，所以断言落在这一击画出的形态上，
+ * 不依赖「有没有写 DOM」。
  */
-describe("a growing prefix only repaints badges whose look changes", () => {
+describe("a growing prefix keeps the ruled-out badges dim", () => {
   let stop: (() => void) | undefined;
-  let watcher: MutationObserver | undefined;
+  let app: JumpApp | undefined;
   afterEach(() => {
-    watcher?.disconnect();
-    watcher = undefined;
     stop?.();
     stop = undefined;
+    app = undefined;
   });
 
   function mount(): void {
-    stop = createApp({ window: win, isVisible: () => true }).apply();
+    app = createApp({ window: win, isVisible: () => true });
+    stop = app.apply();
   }
 
-  function allBadges(): HTMLElement[] {
-    return [...(overlayRoot()?.children ?? [])] as HTMLElement[];
-  }
-
-  function badge(label: string): HTMLElement {
-    const found = allBadges().find((child) => child.dataset.jumpLabel === label);
-    expect(found).toBeDefined();
-    return found as HTMLElement;
-  }
-
-  function parts(label: string): [string | undefined, string | null][] {
-    return [...badge(label).children].map((part) => [
-      (part as HTMLElement).dataset.jumpPart,
-      part.textContent,
-    ]);
-  }
-
-  function labelsByOpacity(opacity: string): string[] {
-    return allBadges()
-      .filter((child) => child.style.opacity === opacity)
-      .map((child) => child.dataset.jumpLabel ?? "");
-  }
-
-  function watch(): () => MutationRecord[] {
-    const root = overlayRoot();
-    if (root === null) throw new Error("浮层不存在，无法观察");
-    const observer = new dom.window.MutationObserver(() => undefined);
-    observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["style"] });
-    watcher = observer;
-    return () => observer.takeRecords();
-  }
-
-  /** 一条记录算在哪枚徽章上；徽章内部 span 的写入也算它的。 */
-  function owner(record: MutationRecord): string | undefined {
-    const holder = (record.target as Element).closest?.("[data-jump-label]");
-    return (holder as HTMLElement | null | undefined)?.dataset.jumpLabel;
+  /** 这一击画出的文字里，点亮与变暗各占多少段。 */
+  function alphaCounts(texts: CanvasText[]): { lit: number; dim: number } {
+    return {
+      lit: texts.filter((text) => text.alpha === 1).length,
+      dim: texts.filter((text) => text.alpha === 0.3).length,
+    };
   }
 
   it("leaves the badges that were already dim untouched on the second stroke", () => {
@@ -496,28 +509,28 @@ describe("a growing prefix only repaints badges whose look changes", () => {
     buttons(90);
     mount();
     activate();
+    const markA = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
 
-    const lit = labelsByOpacity("1");
-    const dim = labelsByOpacity("0.3");
-    expect(lit).toHaveLength(81);
-    expect(dim).toHaveLength(9);
-    expect(dim).toContain("saa");
+    const first = since(markA);
+    expect(app?.labels()).toHaveLength(90);
+    // 81 枚点亮各画两段，9 枚变暗各画一整段。
+    expect(alphaCounts(first)).toEqual({ lit: 162, dim: 9 });
+    const dimLabels = first.filter((text) => text.alpha === 0.3).map((text) => text.text);
+    expect(dimLabels).toContain("saa");
 
-    const drain = watch();
+    const markS = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "s" }));
-    const records = drain();
 
-    // 已经变暗的那批继续不匹配，整批零写入。
-    const dimWrites = records.filter((record) => dim.includes(owner(record) ?? ""));
-    expect(dimWrites).toHaveLength(0);
-    // 第二击改动的正好是首键仍点亮的那批：as 组重分段，其余在这一击被排除。
-    const touched = [...new Set(records.map(owner).filter((label): label is string => label !== undefined))];
-    expect(touched.sort()).toEqual([...lit].sort());
-    expect(parts("asd")).toEqual([
-      ["typed", "as"],
-      ["rest", "d"],
-    ]);
+    const second = since(markS);
+    // 第二击后只剩 as 组点亮：9 枚各两段，另外 81 枚整段变暗。
+    expect(alphaCounts(second)).toEqual({ lit: 18, dim: 81 });
+    // 已经变暗的那批继续以整段出现，不再被拆开；这一击把剩余 81 枚都排除了。
+    expect(second.filter((text) => text.alpha === 0.3).map((text) => text.text).sort()).toEqual(
+      (app?.labels() ?? []).filter((label) => !label.startsWith("as")).sort(),
+    );
+    expect(second).toContainEqual({ text: "as", weight: "700", alpha: 1 });
+    expect(second).toContainEqual({ text: "d", weight: "400", alpha: 1 });
   });
 
   it("dims a badge the moment the growing prefix rules it out", () => {
@@ -525,17 +538,17 @@ describe("a growing prefix only repaints badges whose look changes", () => {
     mount();
     activate();
 
+    const markA = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
-    expect(badge("ada").style.opacity).toBe("1");
-    expect(parts("ada")).toEqual([
-      ["typed", "a"],
-      ["rest", "da"],
-    ]);
+    expect(since(markA)).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(since(markA)).toContainEqual({ text: "da", weight: "400", alpha: 1 });
 
+    const markS = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "s" }));
 
-    expect(badge("ada").style.opacity).toBe("0.3");
-    expect(parts("ada")).toEqual([["whole", "ada"]]);
+    expect(since(markS).filter((text) => text.text === "ada")).toEqual([
+      { text: "ada", weight: "400", alpha: 0.3 },
+    ]);
   });
 
   it("relights every badge when a dead key clears the prefix", () => {
@@ -543,70 +556,41 @@ describe("a growing prefix only repaints badges whose look changes", () => {
     mount();
     activate();
 
-    // 两击之后只剩 as 组点亮；s 组那 9 枚从首击起就没亮过，第二击也被跳过。
+    // 两击之后只剩 as 组点亮；s 组那 9 枚从首击起就没亮过。
     win.dispatchEvent(keydown({ key: "a" }));
+    const markS = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "s" }));
-    expect(labelsByOpacity("1")).toHaveLength(9);
-    expect(badge("saa").style.opacity).toBe("0.3");
+    expect(alphaCounts(since(markS))).toEqual({ lit: 18, dim: 81 });
 
+    const markX = canvasTexts().length;
     // "x" 不在主行，接不上任何 label，前缀被清空。
     win.dispatchEvent(keydown({ key: "x" }));
 
-    expect(labelsByOpacity("1")).toHaveLength(90);
-    for (const child of allBadges()) {
-      expect(child.style.opacity).toBe("1");
-      expect([...child.children]).toHaveLength(1);
-      expect((child.children[0] as HTMLElement).dataset.jumpPart).toBe("whole");
-      expect(child.textContent).toBe(child.dataset.jumpLabel);
-    }
+    const relit = since(markX);
+    expect(relit).toHaveLength(90);
+    expect(relit.every((text) => text.weight === "400" && text.alpha === 1)).toBe(true);
+    expect(relit.map((text) => text.text).sort()).toEqual([...(app?.labels() ?? [])].sort());
   });
 });
 
 /**
- * 首击变暗的整批徽章文字没有变化，不许重建子节点。
+ * 首击变暗的整批徽章文字没有变化，画出来的仍是一整段。
  *
- * 600 档首击有 519 枚徽章从 whole 转成 whole，唯一变化是 opacity；旧实现每枚
- * 都 replaceChildren 一次，产出与原来完全相同的 span。最终视觉在两种实现下
- * 一样，所以只能观察 MutationObserver 的 childList 记录。
+ * 600 档首击有 519 枚徽章从 whole 转成 whole，唯一变化是透明度；canvas 每帧
+ * 重画，但视觉契约不变：变暗的那批不许被拆成两段，点亮的那批必须拆开。
  */
 describe("the first stroke only dims the badges it rules out", () => {
   let stop: (() => void) | undefined;
-  let watcher: MutationObserver | undefined;
+  let app: JumpApp | undefined;
   afterEach(() => {
-    watcher?.disconnect();
-    watcher = undefined;
     stop?.();
     stop = undefined;
+    app = undefined;
   });
 
   function mount(): void {
-    stop = createApp({ window: win, isVisible: () => true }).apply();
-  }
-
-  function allBadges(): HTMLElement[] {
-    return [...(overlayRoot()?.children ?? [])] as HTMLElement[];
-  }
-
-  function labelsByOpacity(opacity: string): string[] {
-    return allBadges()
-      .filter((child) => child.style.opacity === opacity)
-      .map((child) => child.dataset.jumpLabel ?? "");
-  }
-
-  /** 只记 childList：样式写入是允许的，重建子节点才是不该有的工作量。 */
-  function watchChildList(): () => MutationRecord[] {
-    const root = overlayRoot();
-    if (root === null) throw new Error("浮层不存在，无法观察");
-    const observer = new dom.window.MutationObserver(() => undefined);
-    observer.observe(root, { subtree: true, childList: true });
-    watcher = observer;
-    return () => observer.takeRecords().filter((record) => record.type === "childList");
-  }
-
-  /** 一条记录算在哪枚徽章上；徽章内部 span 的写入也算它的。 */
-  function owner(record: MutationRecord): string | undefined {
-    const holder = (record.target as Element).closest?.("[data-jump-label]");
-    return (holder as HTMLElement | null | undefined)?.dataset.jumpLabel;
+    app = createApp({ window: win, isVisible: () => true });
+    stop = app.apply();
   }
 
   it("dims the ruled-out badges without touching their child nodes", () => {
@@ -614,22 +598,21 @@ describe("the first stroke only dims the badges it rules out", () => {
     buttons(90);
     mount();
     activate();
-    const drain = watchChildList();
+    const mark = canvasTexts().length;
 
     win.dispatchEvent(keydown({ key: "a" }));
-    const records = drain();
+    const stroke = since(mark);
 
-    const dim = labelsByOpacity("0.3");
-    const lit = labelsByOpacity("1");
+    const dim = stroke.filter((text) => text.alpha === 0.3);
+    const lit = stroke.filter((text) => text.alpha === 1);
     expect(dim).toHaveLength(9);
-    expect(lit).toHaveLength(81);
-    // 变暗的这批文字还是整段，重建只会换掉同样的 span。
-    const dimChildList = records.filter((record) => dim.includes(owner(record) ?? ""));
-    expect(dimChildList).toHaveLength(0);
-    // 点亮的那批要拆成 typed/rest，必须有重建记录，否则观察器本身失效了。
-    const litChildList = records.filter((record) => lit.includes(owner(record) ?? ""));
-    expect(litChildList.length).toBeGreaterThan(0);
-    expect((allBadges()[0]?.children[0] as HTMLElement).dataset.jumpPart).toBe("typed");
+    expect(lit).toHaveLength(162);
+    // 变暗的这批文字还是整段：每条 label 只出现一次。
+    expect(dim.map((text) => text.text).sort()).toEqual(
+      (app?.labels() ?? []).filter((label) => !label.startsWith("a")).sort(),
+    );
+    // 点亮的那批必须拆成 typed/rest，否则观察到的就不是分段绘制。
+    expect(lit[0]).toEqual({ text: "a", weight: "700", alpha: 1 });
   });
 
   it("relights the dead-key batch without rebuilding their whole-label run", () => {
@@ -638,31 +621,20 @@ describe("the first stroke only dims the badges it rules out", () => {
     mount();
     activate();
     win.dispatchEvent(keydown({ key: "a" }));
+    const markS = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "s" }));
-    expect(labelsByOpacity("1")).toHaveLength(9);
+    expect(since(markS).filter((text) => text.alpha === 0.3)).toHaveLength(81);
 
-    const dim = labelsByOpacity("0.3");
-    expect(dim).toHaveLength(81);
-    const drain = watchChildList();
-
+    const markX = canvasTexts().length;
     // x 不在主行，接不上任何 label，前缀被清空，整轮回亮。
     win.dispatchEvent(keydown({ key: "x" }));
-    const records = drain();
+    const relit = since(markX);
 
-    expect(labelsByOpacity("1")).toHaveLength(90);
-    const dimChildList = records.filter((record) => dim.includes(owner(record) ?? ""));
-    expect(dimChildList).toHaveLength(0);
-    for (const child of allBadges()) {
-      expect(child.style.opacity).toBe("1");
-      expect(textOf(child)).toBe(child.dataset.jumpLabel);
-    }
+    expect(relit.filter((text) => text.alpha === 1)).toHaveLength(90);
+    expect(relit.every((text) => text.weight === "400")).toBe(true);
+    expect(relit.map((text) => text.text).sort()).toEqual([...(app?.labels() ?? [])].sort());
   });
 });
-
-/** 徽章当前显示的文字，按子节点顺序拼起来。 */
-function textOf(badge: HTMLElement): string {
-  return [...badge.children].map((child) => child.textContent ?? "").join("");
-}
 
 describe("active-mode key swallowing", () => {
   it("Enter in a focused input is eaten while click mode is active", () => {
@@ -692,21 +664,18 @@ describe("active-mode key swallowing", () => {
     const teardown = createApp({ window: win, isVisible: () => true }).apply();
     activate();
 
+    const markA = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "a" }));
-    let root = overlayRoot();
-    const dim = (label: string): string | undefined => {
-      const kids = [...(root?.children ?? [])] as HTMLElement[];
-      return kids.find((b) => b.dataset.jumpLabel === label)?.style.opacity;
-    };
-    expect(dim("ad")).toBe("1");
-    expect(dim("sd")).toBe("0.3");
+    // 命中的 ad 两段点亮，被排除的 sd 整段变暗。
+    expect(since(markA)).toContainEqual({ text: "a", weight: "700", alpha: 1 });
+    expect(since(markA)).toContainEqual({ text: "sd", weight: "400", alpha: 0.3 });
 
     // "x" is off the home row, so it can never extend "a" to a label.
+    const markX = canvasTexts().length;
     win.dispatchEvent(keydown({ key: "x" }));
-    root = overlayRoot();
-    expect(root).not.toBeNull();
-    expect(dim("ad")).toBe("1");
-    expect(dim("sd")).toBe("1");
+    expect(overlayRoot()).not.toBeNull();
+    expect(since(markX)).toHaveLength(12);
+    expect(since(markX).every((text) => text.weight === "400" && text.alpha === 1)).toBe(true);
 
     win.dispatchEvent(keydown({ key: "Escape" }));
     teardown();
@@ -1072,18 +1041,14 @@ describe("activation clears the page so the next letter is a label", () => {
 });
 
 describe("labels survive a second activation", () => {
-  /** 当前轮徽章上的 label，按绘制顺序（即视觉序）。 */
-  function badgeLabels(): (string | undefined)[] {
-    return [...(overlayRoot()?.children ?? [])].map((b) => (b as HTMLElement).dataset.jumpLabel);
-  }
-
   it("Cmd+H twice then the same label hits the same element after a new button lands ahead of it", () => {
     const els = buttons(3);
     els.forEach((el, i) => el.setAttribute("data-row-key", "row-" + String(i)));
-    const teardown = createApp({ window: win, isVisible: () => true }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
 
     activate();
-    expect(badgeLabels()).toEqual(["a", "s", "d"]);
+    expect(app.labels()).toEqual(["a", "s", "d"]);
     win.dispatchEvent(keydown({ key: "d" }));
 
     // 新按钮插在 DOM 与视觉序里都排在第三个按钮之前，无记忆时它会把 d 顶走。
@@ -1096,7 +1061,7 @@ describe("labels survive a second activation", () => {
     intruder.addEventListener("click", () => hits.push("intruder"));
 
     activate();
-    expect(badgeLabels()).toEqual(["a", "s", "f", "d"]);
+    expect(app.labels()).toEqual(["a", "s", "f", "d"]);
     win.dispatchEvent(keydown({ key: "d" }));
 
     expect(hits).toEqual(["target"]);
@@ -1195,13 +1160,12 @@ describe("stacked background cards stay out of the label set", () => {
     place(fgButton, 10, 10);
     place(bgButton, 30, 30);
 
-    const teardown = createApp({ window: win }).apply();
+    const app = createApp({ window: win });
+    const teardown = app.apply();
     activate();
 
-    const root = overlayRoot();
-    expect(root).not.toBeNull();
-    const labels = [...(root?.children ?? [])].map((b) => (b as HTMLElement).dataset.jumpLabel);
-    expect(labels).toEqual(["a"]);
+    expect(overlayRoot()).not.toBeNull();
+    expect(app.labels()).toEqual(["a"]);
 
     // 唯一的标签属于前景按钮：敲它命中的就是前景按钮本身。
     const hits: string[] = [];
@@ -1213,30 +1177,6 @@ describe("stacked background cards stay out of the label set", () => {
     teardown();
   });
 });
-
-/** 手动推进的帧时钟：让分批在测试里只按步进发生。 */
-function frameClock(start = 0): FrameClock & { step(ms: number): void } {
-  let time = start;
-  let nextHandle = 1;
-  const queued = new Map<number, (time: number) => void>();
-  return {
-    now: () => time,
-    request: (callback) => {
-      const handle = nextHandle++;
-      queued.set(handle, callback);
-      return handle;
-    },
-    cancel: (handle) => {
-      queued.delete(handle);
-    },
-    step: (ms) => {
-      time += ms;
-      const due = [...queued.values()];
-      queued.clear();
-      for (const callback of due) callback(time);
-    },
-  };
-}
 
 /** 20 列网格：300 个候选全部落在 jsdom 视口内，视觉顺序等于建按钮的顺序。 */
 function gridButtons(count: number): HTMLElement[] {
@@ -1252,138 +1192,110 @@ function gridButtons(count: number): HTMLElement[] {
   return els;
 }
 
-function badgeCount(): number {
-  return doc.querySelectorAll("[data-jump-label]").length;
-}
-
 describe("progressive activation", () => {
-  it("settles only after every badge of the current round is in the DOM", async () => {
+  it("settles only after every badge of the current round is painted", async () => {
     gridButtons(300);
-    const clock = frameClock();
-    const app = createApp({
-      window: win,
-      isVisible: () => true,
-      frameClock: clock,
-      frameBudgetMs: 16.7,
-    });
+    const app = createApp({ window: win, isVisible: () => true });
     const teardown = app.apply();
 
     activate();
-    expect(badgeCount()).toBe(32);
+    // 300 枚远低于同步上限：激活这一帧就画完，settled 立刻可等。
+    expect(app.labels()).toHaveLength(300);
     let settled = false;
     void app.settled().then(() => {
       settled = true;
     });
     await Promise.resolve();
-    expect(settled).toBe(false);
-
-    for (let frame = 0; frame < 20 && badgeCount() < 300; frame += 1) clock.step(1);
-    await app.settled();
     expect(settled).toBe(true);
-    expect(badgeCount()).toBe(300);
+
+    await app.settled();
+    expect(app.labels()).toHaveLength(300);
     teardown();
   });
 
-  it("accepts a label whose badge has not been inserted yet", () => {
-    // 300 个候选升到三键，首批 32 枚之后还有大量标签没画出来。
+  it("accepts a label on the activation frame", () => {
+    // 300 个候选升到三键；全部标签在激活帧内已经可用，不需要等任何绘制帧。
     const els = gridButtons(300);
-    const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
 
     activate();
-    expect(badgeCount()).toBe(32);
-    clock.step(1);
-    const afterFirstFrame = badgeCount();
-    expect(afterFirstFrame).toBeGreaterThan(32);
-    expect(afterFirstFrame).toBeLessThan(300);
+    expect(app.labels()).toHaveLength(300);
 
     const label = [...generateLabels(3)][299] as string;
     const target = els[299] as HTMLElement;
     const hits: string[] = [];
     target.addEventListener("click", () => hits.push("click"));
 
-    // 前缀击键只重绘已插入的徽章，不能把剩下两百多枚同步补上。
     win.dispatchEvent(keydown({ key: label[0] }));
-    expect(badgeCount()).toBe(afterFirstFrame);
     win.dispatchEvent(keydown({ key: label[1] }));
-    expect(badgeCount()).toBe(afterFirstFrame);
     win.dispatchEvent(keydown({ key: label[2] }));
 
     expect(hits).toEqual(["click"]);
     expect(overlayRoot()).toBeNull();
-    // 命中已结束这一轮，队列里剩下的批次不能再把徽章插回来。
-    clock.step(1);
-    expect(badgeCount()).toBe(0);
+    // 命中已结束这一轮，画布与标签都不能留下残余。
+    expect(app.labels()).toEqual([]);
     teardown();
   });
 
-  it("Esc cancels the pending batches and leaves no badge behind", () => {
+  it("Esc removes the canvas and leaves no label behind", () => {
     gridButtons(300);
-    const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
 
     activate();
-    clock.step(1);
-    expect(badgeCount()).toBeGreaterThan(32);
-    expect(badgeCount()).toBeLessThan(300);
+    expect(app.labels()).toHaveLength(300);
 
     win.dispatchEvent(keydown({ key: "Escape" }));
     expect(overlayRoot()).toBeNull();
-    for (let frame = 0; frame < 5; frame += 1) clock.step(1);
-    expect(badgeCount()).toBe(0);
-    expect(overlayRoot()).toBeNull();
+    expect(app.labels()).toEqual([]);
+    expect(app.visibleLabels()).toEqual([]);
     teardown();
   });
 
-  it("starts a fresh round from the initial batch after a cancelled one", () => {
+  it("starts a fresh round after a cancelled one", () => {
     gridButtons(300);
-    const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
 
     activate();
-    clock.step(1);
-    expect(badgeCount()).toBeGreaterThan(32);
     win.dispatchEvent(keydown({ key: "Escape" }));
 
     activate();
-    // 新轮从首批重新开始，不夹带上一轮已经画出的残余。
-    expect(badgeCount()).toBe(32);
+    // 新轮从头画满，不夹带上一轮的残余。
+    expect(app.labels()).toHaveLength(300);
     teardown();
   });
 });
 
 describe("progressive cancellation surfaces", () => {
-  it("visibilitychange cancels the pending batches", () => {
+  it("visibilitychange cancels the round", () => {
     gridButtons(300);
-    const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
     activate();
-    clock.step(1);
-    expect(badgeCount()).toBeGreaterThan(32);
+    expect(app.labels()).toHaveLength(300);
 
     Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
     try {
       doc.dispatchEvent(new dom.window.Event("visibilitychange"));
       expect(overlayRoot()).toBeNull();
-      for (let frame = 0; frame < 5; frame += 1) clock.step(1);
-      expect(badgeCount()).toBe(0);
+      expect(app.labels()).toEqual([]);
     } finally {
       delete (doc as unknown as Record<string, unknown>)["visibilityState"];
     }
     teardown();
   });
 
-  it("dispose cancels the pending batches", () => {
+  it("dispose cancels the round", () => {
     gridButtons(300);
-    const clock = frameClock();
-    const teardown = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 }).apply();
+    const app = createApp({ window: win, isVisible: () => true });
+    const teardown = app.apply();
     activate();
-    clock.step(1);
-    expect(badgeCount()).toBeGreaterThan(32);
+    expect(app.labels()).toHaveLength(300);
 
     teardown();
     expect(overlayRoot()).toBeNull();
-    for (let frame = 0; frame < 5; frame += 1) clock.step(1);
-    expect(badgeCount()).toBe(0);
+    expect(app.labels()).toEqual([]);
   });
 });

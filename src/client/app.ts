@@ -74,34 +74,30 @@ export interface AppDeps {
    */
   onReference?: (element: Element) => void;
   /**
-   * Frame clock for progressive badge insertion.
+   * Frame clock for the oversized-round fallback.
    *
    * Browsers read the document's own requestAnimationFrame; tests inject a
-   * stepper so a batch only lands when the test advances a frame.
+   * stepper so a frame only lands when the test advances it. Rounds below the
+   * synchronous limit never ask for a frame.
    */
   frameClock?: FrameClock;
-  /**
-   * Time one badge batch may spend before yielding to the next frame.
-   *
-   * An explicit override for hosts that already measured their display; the
-   * overlay otherwise samples the page's own frame cadence once. Seven
-   * milliseconds is not hard-coded because it is one machine's panel, not a
-   * property of the plugin.
-   */
-  frameBudgetMs?: number;
 }
 
 export interface JumpApp {
   /** Mount the window listener. Returns the symmetric teardown. */
   apply(): () => void;
   /**
-   * Resolves when every badge of the current round is in the DOM.
+   * Resolves when every badge of the current round is painted.
    *
-   * A bench or a host that wants to measure a complete round must wait for
-   * this instead of guessing a frame count: batching is adaptive, so the
-   * number of frames is not a property of the candidate count.
+   * The synchronous path resolves immediately; only an oversized round that
+   * falls back to frames makes the caller wait. A bench or a host that wants a
+   * complete round waits here instead of guessing a frame count.
    */
   settled(): Promise<void>;
+  /** Every label of the current round, in hint order. */
+  labels(): readonly string[];
+  /** Labels already painted; equal to `labels()` once the round settles. */
+  visibleLabels(): readonly string[];
 }
 
 function defaultIsVisible(element: Element): boolean {
@@ -256,16 +252,22 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       { width: win.innerWidth, height: win.innerHeight },
       { isVisible, memory },
     );
-    // Labels are complete before this call; progressive only decides when each
-    // badge joins the DOM, so a keystroke can already reach a label whose badge
-    // is still queued.
-    currentRound = overlay.renderProgressive(hints, "", { frameBudgetMs: deps.frameBudgetMs });
+    // Labels are complete before this call and painting is synchronous for any
+    // realistic round, so a keystroke on the activation frame already reaches
+    // every label.
+    currentRound = overlay.renderProgressive(hints, "");
     return hints;
   }
 
   return {
     settled(): Promise<void> {
       return currentRound?.done ?? Promise.resolve();
+    },
+    labels(): readonly string[] {
+      return overlay.labels();
+    },
+    visibleLabels(): readonly string[] {
+      return overlay.visibleLabels();
     },
     apply(): () => void {
       const state = createKeyState();

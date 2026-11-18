@@ -90,9 +90,40 @@ function overlayCount(): number {
   return doc.querySelectorAll("[data-dsh-jump-overlay]").length;
 }
 
-/** 浮层里的标签徽章；一轮激活只该产出一组。 */
+// canvas 时代的徽章不再是 DOM 节点，这里数的是真正画出的文字段：入口测试
+// 只关心「一轮激活画了几枚标签」，即不带前缀时每枚一次 fillText。
+let paintedLabels = 0;
+
+function installCanvasProbe(): void {
+  (dom.window as unknown as Record<string, unknown>)["CanvasRenderingContext2D"] = function () {};
+  (
+    dom.window.HTMLCanvasElement.prototype as unknown as { getContext: () => unknown }
+  ).getContext = () => ({
+    set font(_value: string) {},
+    set fillStyle(_value: string) {},
+    set globalAlpha(_value: number) {},
+    save() {},
+    restore() {},
+    setTransform() {},
+    clearRect() {},
+    beginPath() {},
+    roundRect() {},
+    rect() {},
+    fill() {},
+    fillText() {
+      paintedLabels += 1;
+    },
+    measureText(text: string) {
+      return { width: text.length * 6.6 };
+    },
+  });
+}
+
+installCanvasProbe();
+
+/** 当前轮画出的标签数；一轮激活只该产出一组。 */
 function badgeCount(): number {
-  return doc.querySelectorAll("[data-jump-label]").length;
+  return paintedLabels;
 }
 
 beforeEach(() => {
@@ -100,6 +131,7 @@ beforeEach(() => {
   doc.head.replaceChildren();
   // 浮层挂在 documentElement 上而不是 body 里，上面的清理带不走它。
   doc.querySelectorAll("[data-dsh-jump-overlay]").forEach((el) => el.remove());
+  paintedLabels = 0;
 });
 
 describe("clientPlugin", () => {

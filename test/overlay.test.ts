@@ -1,18 +1,19 @@
 /**
- * overlay 的两条性能决策，各自都改变行为之外的东西：
+ * overlay 的 canvas 契约，守的是用户看到的形态与画布的生命周期：
  *
- * 1. 同一轮内的击键只改已存在的徽章，不重建。实测 1189 枚徽章、三键 label
- *    的中间态，全量重建每次击键 5.4ms，原地更新 0.1ms。
- * 2. 徽章用 absolute 挂在 fixed 容器里，而不是自己 fixed。600 枚 fixed 就是
- *    600 个 containing block；容器已经铺满视口，坐标系相同，视觉逐像素一致。
- *
- * 这里守的是这两条，不是实现细节：节点身份、被跳过的写入、location 的归属。
+ * 1. 一轮激活只有一个 canvas，徽章是画上去的像素，不是 DOM 节点。实测 600 枚
+ *    全量重绘含等 GPU 只要 1.7ms，所以默认路径同步画完，不走分帧。
+ * 2. 只有候选数超过同步上限时才退回分帧；分帧每帧重画已画出的前缀，语义是
+ *    「已画出的标签」而不是「已插入的节点」。
+ * 3. 视觉分段（已敲前缀 700、剩余 400、被排除整枚 0.3 透明度）通过注入的
+ *    上下文替身记录绘制调用断言，jsdom 没有 2D 上下文。
  */
 import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { generateLabels, type Hint } from "../src/client/hints.ts";
-import { createOverlay, sampleFrameBudget, type FrameClock } from "../src/client/overlay.ts";
+import { BADGE_HEIGHT, BADGE_WIDTH, badgeOrigin } from "../src/client/overlay-canvas.ts";
+import { createOverlay, SYNC_PAINT_LIMIT, type FrameClock, type Overlay } from "../src/client/overlay.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -28,236 +29,315 @@ function hintsOf(labels: string[]): Hint[] {
   }));
 }
 
-function badges(): HTMLElement[] {
-  const root = document.querySelector(OVERLAY);
-  return root === null ? [] : ([...root.children] as HTMLElement[]);
+function overlayCanvas(): HTMLCanvasElement | null {
+  return document.querySelector<HTMLCanvasElement>(OVERLAY);
+}
+
+/** 一次绘制调用的快照；状态取调用发生的那一刻。 */
+interface DrawOp {
+  readonly kind: "clearRect" | "fillText" | "setTransform" | "roundRect" | "rect" | "fill" | "beginPath";
+  readonly args: readonly unknown[];
+  readonly font: string;
+  readonly alpha: number;
+}
+
+interface RecordedText {
+  readonly text: string;
+  readonly weight: string;
+  readonly alpha: number;
+}
+
+interface Recorder {
+  readonly context: CanvasRenderingContext2D;
+  readonly ops: DrawOp[];
+  texts(): RecordedText[];
+  clears(): number;
+}
+
+/**
+ * 记录调用的 2D 上下文替身。
+ *
+ * jsdom 没有 canvas 2D 实现，装 canvas 包只为单测代价太大；这里只实现绘制
+ * 用到的成员，并把每次调用连同当时的 font/globalAlpha 一起记下来，视觉断言
+ * 因此能落在「画了什么」而不是「DOM 里有什么」。
+ */
+function recorder(): Recorder {
+  const ops: DrawOp[] = [];
+  let font = "10px sans-serif";
+  let alpha = 1;
+  const stack: { font: string; alpha: number }[] = [];
+  const push = (kind: DrawOp["kind"], args: readonly unknown[] = []): void => {
+    ops.push({ kind, args, font, alpha });
+  };
+  const context = {
+    get font(): string {
+      return font;
+    },
+    set font(value: string) {
+      font = value;
+    },
+    set fillStyle(_value: string) {
+      // 颜色不是这两个用例的判据，但绘制路径会写它，必须可赋值。
+    },
+    get fillStyle(): string {
+      return "#000";
+    },
+    get globalAlpha(): number {
+      return alpha;
+    },
+    set globalAlpha(value: number) {
+      alpha = value;
+    },
+    save(): void {
+      stack.push({ font, alpha });
+    },
+    restore(): void {
+      const last = stack.pop();
+      if (last !== undefined) {
+        font = last.font;
+        alpha = last.alpha;
+      }
+    },
+    setTransform(...args: number[]): void {
+      push("setTransform", args);
+    },
+    clearRect(...args: number[]): void {
+      push("clearRect", args);
+    },
+    beginPath(): void {
+      push("beginPath");
+    },
+    roundRect(...args: number[]): void {
+      push("roundRect", args);
+    },
+    rect(...args: number[]): void {
+      push("rect", args);
+    },
+    fill(): void {
+      push("fill");
+    },
+    fillText(text: string, x: number, y: number): void {
+      push("fillText", [text, x, y]);
+    },
+    measureText(text: string): { width: number } {
+      return { width: text.length * 6.6 };
+    },
+  } as unknown as CanvasRenderingContext2D;
+  return {
+    context,
+    ops,
+    texts: () =>
+      ops
+        .filter((op) => op.kind === "fillText")
+        .map((op) => ({
+          text: String(op.args[0]),
+          weight: op.font.split(" ")[0] ?? "",
+          alpha: op.alpha,
+        })),
+    clears: () => ops.filter((op) => op.kind === "clearRect").length,
+  };
+}
+
+const mounted: Overlay[] = [];
+
+function mount(options: { clock?: FrameClock } = {}): { overlay: Overlay; recorder: Recorder } {
+  const recorded = recorder();
+  const overlay = createOverlay({
+    doc: document,
+    viewport: () => VIEWPORT,
+    clock: options.clock,
+    canvasContext: () => recorded.context,
+  });
+  mounted.push(overlay);
+  return { overlay, recorder: recorded };
 }
 
 beforeEach(() => {
   document.documentElement.querySelector(OVERLAY)?.remove();
 });
 
+afterEach(() => {
+  while (mounted.length > 0) mounted.pop()?.destroy();
+});
+
 describe("badge lifecycle", () => {
-  it("reuses the same nodes across prefixes of one round", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+  it("reuses one canvas across prefixes of one round", () => {
+    const { overlay } = mount();
     const hints = hintsOf(["as", "sd"]);
     overlay.render(hints);
-    const first = badges();
+    const first = overlayCanvas();
     overlay.render(hints, "a");
-    expect(badges()).toEqual(first);
-    overlay.destroy();
+    expect(overlayCanvas()).toBe(first);
+    expect(overlay.labels()).toEqual(["as", "sd"]);
   });
 
-  it("mints fresh badges when a new round arrives", () => {
-    // 同样的标签可能指到别的元素，原地更新会把徽章留在旧目标上。
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+  it("replaces the labels when a new round arrives", () => {
+    const { overlay } = mount();
     overlay.render(hintsOf(["as", "sd"]));
-    const first = badges();
-    overlay.render(hintsOf(["as", "sd"]));
-    const second = badges();
-    expect(second).toHaveLength(2);
-    expect(second[0]).not.toBe(first[0]);
-    overlay.destroy();
+    overlay.render(hintsOf(["fj", "dk"]));
+    expect(overlay.labels()).toEqual(["fj", "dk"]);
+    expect(overlayCanvas()).not.toBeNull();
   });
 
-  it("leaves a badge untouched when the prefix did not change", () => {
-    // 「不写」是这条优化的本体：同前缀下每枚徽章都该被完全跳过。
-    // 从外部改一个值，若实现真的跳过，它应该原样留着。
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+  it("repaints the same labels when the prefix did not change", () => {
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["as", "sd"]);
     overlay.render(hints, "a");
-    const [, sd] = badges();
-    sd!.style.opacity = "0.9";
+    const first = recorded.texts();
     overlay.render(hints, "a");
-    expect(sd?.style.opacity).toBe("0.9");
-    overlay.destroy();
+    // 全量重绘是 canvas 的默认路径：第二次画出的文字序列必须与第一次逐条相同。
+    expect(recorded.texts()).toEqual([...first, ...first]);
+    expect(overlay.labels()).toEqual(["as", "sd"]);
   });
 });
 
 describe("prefix painting", () => {
   it("splits the badges the prefix reaches and dims the rest", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["as", "sd"]);
     overlay.render(hints);
-    const [as, sd] = badges();
     // 未敲键时每一枚都是一整段。
-    expect(as?.children).toHaveLength(1);
+    expect(recorded.texts()).toEqual([
+      { text: "as", weight: "400", alpha: 1 },
+      { text: "sd", weight: "400", alpha: 1 },
+    ]);
     overlay.render(hints, "a");
+    const stroke = recorded.texts().slice(2);
     // 敲了 a：as 拆成已敲与未敲两段并保持点亮，sd 被前缀排除、整枚变暗。
-    expect(as?.children).toHaveLength(2);
-    expect((as?.children[0] as HTMLElement).dataset.jumpPart).toBe("typed");
-    // 已敲与未敲的字重分工也是用户看到的形态，不能被重分段改掉。
-    expect((as?.children[0] as HTMLElement).style.fontWeight).toBe("700");
-    expect((as?.children[1] as HTMLElement).style.fontWeight).toBe("400");
-    expect(as?.style.opacity).toBe("1");
-    expect(sd?.style.opacity).toBe("0.3");
-    expect(sd?.children).toHaveLength(1);
-    overlay.destroy();
+    expect(stroke).toEqual([
+      { text: "a", weight: "700", alpha: 1 },
+      { text: "s", weight: "400", alpha: 1 },
+      { text: "sd", weight: "400", alpha: 0.3 },
+    ]);
   });
 
-  it("drops empty rounds and leaves no container behind", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+  it("drops empty rounds and leaves no canvas behind", () => {
+    const { overlay } = mount();
     overlay.render(hintsOf(["as"]));
     overlay.render([]);
-    expect(badges()).toHaveLength(0);
+    expect(overlay.labels()).toEqual([]);
     overlay.destroy();
-    expect(document.querySelector(OVERLAY)).toBeNull();
+    expect(overlayCanvas()).toBeNull();
   });
 });
 
 /**
- * 文字没变的转态不许重建子节点。
+ * 文字分段的四种转态。
  *
- * 首击时整批徽章从「整段」转成「整段」只是变暗，span 的结构与文本完全一样；
- * replaceChildren 会把同一枚 span 销毁再造一枚，600 档就是 519 次白做。这里用
- * MutationObserver 的 childList 记录区分「重建」与「只写 opacity」，最终视觉在
- * 两种实现下相同，不能靠读 DOM 结果断言。
+ * 分段是用户看到的形态：已敲部分加粗、剩余部分常规，被排除的整枚只画一段并
+ * 降到 0.3 透明度。canvas 每帧重画，所以这里断言的是这一帧画出的文字序列。
  */
 describe("badge text repaint", () => {
-  let observer: MutationObserver | undefined;
-
-  afterEach(() => {
-    observer?.disconnect();
-    observer = undefined;
-  });
-
-  function badgeOf(label: string): HTMLElement {
-    const found = badges().find((child) => child.dataset.jumpLabel === label);
-    expect(found).toBeDefined();
-    return found as HTMLElement;
-  }
-
-  function watchChildList(label: string): () => MutationRecord[] {
-    const observerInstance = new dom.window.MutationObserver(() => undefined);
-    observerInstance.observe(badgeOf(label), { subtree: true, childList: true });
-    observer = observerInstance;
-    return () => observerInstance.takeRecords();
-  }
-
-  function partTexts(label: string): (string | null | undefined)[][] {
-    return [...badgeOf(label).children].map((child) => [
-      (child as HTMLElement).dataset.jumpPart,
-      child.textContent,
-    ]);
+  function strokeTexts(recorded: Recorder, mark: number): RecordedText[] {
+    return recorded.texts().slice(mark);
   }
 
   it("keeps the whole-label run when a matching badge is ruled out", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["asd", "sd"]);
     overlay.render(hints);
-    const drain = watchChildList("sd");
+    const mark = recorded.texts().length;
 
     overlay.render(hints, "a");
 
-    // 首击：文字从 whole 到 whole，只有透明度变了。
-    expect(drain()).toHaveLength(0);
-    expect(badgeOf("sd").style.opacity).toBe("0.3");
-    expect(partTexts("sd")).toEqual([["whole", "sd"]]);
-    overlay.destroy();
+    // 首击：sd 从 whole 到 whole，只有透明度变了；asd 拆成两段。
+    expect(strokeTexts(recorded, mark)).toEqual([
+      { text: "a", weight: "700", alpha: 1 },
+      { text: "sd", weight: "400", alpha: 1 },
+      { text: "sd", weight: "400", alpha: 0.3 },
+    ]);
   });
 
   it("keeps the whole-label run when a dead key relights a dimmed badge", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["asd", "sd"]);
     overlay.render(hints);
     overlay.render(hints, "a");
-    expect(badgeOf("sd").style.opacity).toBe("0.3");
-    const drain = watchChildList("sd");
+    const mark = recorded.texts().length;
 
     overlay.render(hints, "");
 
     // 死键回亮：whole 到 whole，同样只有透明度该动。
-    expect(drain()).toHaveLength(0);
-    expect(badgeOf("sd").style.opacity).toBe("1");
-    expect(partTexts("sd")).toEqual([["whole", "sd"]]);
-    overlay.destroy();
+    expect(strokeTexts(recorded, mark)).toEqual([
+      { text: "asd", weight: "400", alpha: 1 },
+      { text: "sd", weight: "400", alpha: 1 },
+    ]);
   });
 
   it("rebuilds the run when a split badge drops out", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["asa", "asd"]);
     overlay.render(hints, "as");
-    expect(partTexts("asa")).toEqual([
-      ["typed", "as"],
-      ["rest", "a"],
-    ]);
-    const drain = watchChildList("asa");
+    expect(strokeTexts(recorded, 0)[0]).toEqual({ text: "as", weight: "700", alpha: 1 });
+    const mark = recorded.texts().length;
 
     overlay.render(hints, "asd");
 
-    // typed/rest 到 whole 是两枚 span 换一枚，必须重建。
-    expect(drain().length).toBeGreaterThan(0);
-    expect(badgeOf("asa").style.opacity).toBe("0.3");
-    expect(partTexts("asa")).toEqual([["whole", "asa"]]);
-    overlay.destroy();
+    // typed/rest 到 whole 是两段换一段。
+    expect(strokeTexts(recorded, mark)).toEqual([
+      { text: "asa", weight: "400", alpha: 0.3 },
+      { text: "asd", weight: "700", alpha: 1 },
+    ]);
   });
 
   it("rebuilds the run when a dimmed badge becomes reachable again", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["asa", "asd"]);
     overlay.render(hints);
     overlay.render(hints, "asd");
-    expect(badgeOf("asa").style.opacity).toBe("0.3");
-    const drain = watchChildList("asa");
+    const mark = recorded.texts().length;
 
     overlay.render(hints, "as");
 
-    // whole 到 typed/rest，文字内容也变了，必须重建。
-    expect(drain().length).toBeGreaterThan(0);
-    expect(badgeOf("asa").style.opacity).toBe("1");
-    expect(partTexts("asa")).toEqual([
-      ["typed", "as"],
-      ["rest", "a"],
+    // whole 到 typed/rest，文字内容也变了。
+    expect(strokeTexts(recorded, mark)).toEqual([
+      { text: "as", weight: "700", alpha: 1 },
+      { text: "a", weight: "400", alpha: 1 },
+      { text: "as", weight: "700", alpha: 1 },
+      { text: "d", weight: "400", alpha: 1 },
     ]);
-    overlay.destroy();
   });
 
   it("rebuilds the run when a longer prefix splits further", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["asd"]);
     overlay.render(hints, "a");
-    const drain = watchChildList("asd");
+    const mark = recorded.texts().length;
 
     overlay.render(hints, "as");
 
-    expect(drain().length).toBeGreaterThan(0);
-    expect(partTexts("asd")).toEqual([
-      ["typed", "as"],
-      ["rest", "d"],
+    expect(strokeTexts(recorded, mark)).toEqual([
+      { text: "as", weight: "700", alpha: 1 },
+      { text: "d", weight: "400", alpha: 1 },
     ]);
-    expect(badgeOf("asd").style.opacity).toBe("1");
-    overlay.destroy();
   });
 });
 
-describe("badge positioning", () => {
-  it("positions badges absolutely inside one fixed container", () => {
-    // 徽章自己 fixed 的话，一枚一个 containing block；容器已铺满视口，
-    // absolute 拿到的是同一套坐标。
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+describe("canvas geometry", () => {
+  it("covers the viewport with one fixed canvas", () => {
+    const { overlay } = mount();
     overlay.render(hintsOf(["as"]));
-    const root = document.querySelector<HTMLElement>(OVERLAY);
-    expect(root?.style.position).toBe("fixed");
-    expect(badges()[0]?.style.position).toBe("absolute");
-    overlay.destroy();
+    const canvas = overlayCanvas();
+    expect(canvas?.tagName).toBe("CANVAS");
+    expect(canvas?.style.position).toBe("fixed");
+    expect(canvas?.style.width).toBe(String(VIEWPORT.width) + "px");
+    expect(canvas?.style.height).toBe(String(VIEWPORT.height) + "px");
   });
 
   it("clamps a badge at the viewport edge back inside", () => {
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
-    overlay.render([{ element: document.createElement("button"), label: "as", rect: { x: 795, y: 595, w: 10, h: 10 } }]);
-    const badge = badges()[0];
-    // jsdom 把 left/top 规范化成带单位的写法，这里比的是钳制后的数值。
-    expect(badge?.style.left).toBe(String(VIEWPORT.width - 24) + "px");
-    expect(badge?.style.top).toBe(String(VIEWPORT.height - 16) + "px");
-    overlay.destroy();
+    // 徽章贴在被标注元素的左上角，但边缘目标仍要把整枚徽章夹回视口。
+    expect(badgeOrigin({ x: 795, y: 595, w: 10, h: 10 }, VIEWPORT)).toEqual({
+      x: VIEWPORT.width - BADGE_WIDTH,
+      y: VIEWPORT.height - BADGE_HEIGHT,
+    });
   });
 });
 
 describe("top layer", () => {
   /**
    * 目标可能是 popover（峰价提醒一类）或 showModal 打开的对话框，它们整体放在
-   * top layer 上，会盖住任何 z-index 的普通元素。徽章画在它们下面等于不存在，
-   * 用户看得到卡片、看不到标签。容器必须以 manual popover 进场，每轮重新抬一次。
+   * top layer 上，会盖住任何 z-index 的普通元素。canvas 必须同样以 manual
+   * popover 进场，每轮重新抬一次。
    */
   it("enters the top layer as a manual popover and re-raises on a new round", () => {
     const proto = dom.window.Element.prototype as unknown as Record<string, unknown>;
@@ -265,32 +345,70 @@ describe("top layer", () => {
     proto["showPopover"] = function (this: Element) { shown.push(this) };
     proto["hidePopover"] = function () {};
     try {
-      const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+      const { overlay } = mount();
       overlay.render(hintsOf(["as"]));
-      const first = document.querySelector<HTMLElement>(OVERLAY);
+      const first = overlayCanvas();
       expect(first?.getAttribute("popover")).toBe("manual");
       expect(shown).toContain(first);
       overlay.destroy();
       overlay.render(hintsOf(["as"]));
       expect(shown).toHaveLength(2);
-      overlay.destroy();
     } finally {
       delete proto["showPopover"];
       delete proto["hidePopover"];
     }
   });
 
-  it("falls back to a plain container when popovers are unavailable", () => {
+  it("falls back to a plain canvas when popovers are unavailable", () => {
     // 没有 showPopover 的宿主里留着 popover 属性会被 UA 样式表按「未打开」藏掉，
     // 徽章会整轮消失，所以拿不到能力时不能留下这个属性。
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    const { overlay } = mount();
     overlay.render(hintsOf(["as"]));
-    expect(document.querySelector<HTMLElement>(OVERLAY)?.hasAttribute("popover")).toBe(false);
-    overlay.destroy();
+    expect(overlayCanvas()?.hasAttribute("popover")).toBe(false);
   });
 });
 
-/** 手动推进的帧时钟：jsdom 没有真实帧，分批只在该步进时发生。 */
+describe("canvas backing store", () => {
+  it("sizes the canvas to the viewport", () => {
+    const { overlay } = mount();
+    overlay.render(hintsOf(["as"]));
+    const canvas = overlayCanvas();
+    // jsdom 的 devicePixelRatio 是 1，所以 backing store 与视口同尺寸。
+    expect(canvas?.width).toBe(VIEWPORT.width);
+    expect(canvas?.height).toBe(VIEWPORT.height);
+  });
+
+  it("scales the canvas by the device pixel ratio and sets the transform", () => {
+    const descriptor = Object.getOwnPropertyDescriptor(dom.window, "devicePixelRatio");
+    Object.defineProperty(dom.window, "devicePixelRatio", { configurable: true, value: 2 });
+    try {
+      const { overlay, recorder: recorded } = mount();
+      overlay.render(hintsOf(["as"]));
+      const canvas = overlayCanvas();
+      expect(canvas?.width).toBe(VIEWPORT.width * 2);
+      expect(canvas?.height).toBe(VIEWPORT.height * 2);
+      expect(recorded.ops.some((op) => op.kind === "setTransform" && op.args.join(",") === "2,0,0,2,0,0")).toBe(true);
+    } finally {
+      if (descriptor === undefined) {
+        delete (dom.window as unknown as Record<string, unknown>)["devicePixelRatio"];
+      } else {
+        Object.defineProperty(dom.window, "devicePixelRatio", descriptor);
+      }
+    }
+  });
+
+  it("paints the whole round in one pass", () => {
+    // 300 枚一次画完：一次清屏、每条标签一次 fillText，没有第二帧。
+    const { overlay, recorder: recorded } = mount();
+    const hints = progressiveHints(300);
+    overlay.renderProgressive(hints);
+    expect(overlay.labels()).toHaveLength(300);
+    expect(recorded.clears()).toBe(1);
+    expect(recorded.texts()).toHaveLength(300);
+  });
+});
+
+/** 手动推进的帧时钟：jsdom 没有真实帧，分帧只在该步进时发生。 */
 function frameClock(start = 0): FrameClock & { step(ms: number): void; requests(): number } {
   let time = start;
   let nextHandle = 1;
@@ -317,84 +435,10 @@ function frameClock(start = 0): FrameClock & { step(ms: number): void; requests(
   };
 }
 
-/**
- * 帧周期与批成本分开的两个可调量。
- *
- * `step` 只推进 rAF 时间戳（帧周期），`spend` 只推进 performance.now（批成本）。
- * 旧实现用 `step` 同时扮演两者，所以看不到「帧间隔 7ms、批成本 0.5ms」时批量
- * 不增长这个 bug。真实浏览器里两个量本来就是独立的：帧起点由 vsync 决定，
- * 批成本由这一批 DOM 写入加样式布局决定。
- */
-function costClock(start = 0): FrameClock & {
-  step(ms: number): void;
-  spend(ms: number): void;
-  requests(): number;
-} {
-  let frameTime = start;
-  let wallTime = start;
-  let nextHandle = 1;
-  let requests = 0;
-  const queued = new Map<number, (time: number) => void>();
-  return {
-    now: () => wallTime,
-    request: (callback) => {
-      requests += 1;
-      const handle = nextHandle++;
-      queued.set(handle, callback);
-      return handle;
-    },
-    requests: () => requests,
-    cancel: (handle) => {
-      queued.delete(handle);
-    },
-    spend: (ms) => {
-      wallTime += ms;
-    },
-    step: (ms) => {
-      frameTime += ms;
-      wallTime += ms;
-      const due = [...queued.values()];
-      queued.clear();
-      for (const callback of due) callback(frameTime);
-    },
-  };
-}
-
-/**
- * 让一次整批 append 花掉给定毫秒。
- *
- * jsdom 的 DOM 写入本身不耗时，这里把「插入成本」注入到 overlay 容器的
- * append 上；overlay 在插入前后读 now()，读到的差值就是这批的成本。
- */
-function chargeBatchAppend(clock: { spend(ms: number): void }, ms: number): () => void {
-  const proto = dom.window.Element.prototype as unknown as {
-    append: (...nodes: (Node | string)[]) => void;
-  };
-  const original = proto.append;
-  proto.append = function (this: Element, ...nodes: (Node | string)[]): void {
-    if (this.hasAttribute("data-dsh-jump-overlay")) clock.spend(ms);
-    original.apply(this, nodes);
-  };
-  return () => {
-    proto.append = original;
-  };
-}
-
-/** 每一帧实际插入的徽章数，首帧也算一格。 */
-function batchDeltas(clock: { step(ms: number): void }, steps: readonly number[]): number[] {
-  const deltas = [badges().length];
-  for (const ms of steps) {
-    const before = badges().length;
-    clock.step(ms);
-    deltas.push(badges().length - before);
-  }
-  return deltas;
-}
-
 function progressiveHints(count: number): Hint[] {
   // Distinct positions inside the viewport: a label handed to another target
-  // would also change the badge's clamped left/top, so the comparison below can
-  // see a drift instead of two badges stacking on the same clamped corner.
+  // would also change the badge's clamped origin, so a comparison can see a
+  // drift instead of two badges stacking on the same clamped corner.
   return [...generateLabels(4)].slice(0, count).map((label, index) => ({
     element: document.createElement("button"),
     label,
@@ -402,370 +446,146 @@ function progressiveHints(count: number): Hint[] {
   }));
 }
 
-describe("progressive badge insertion", () => {
-  it("reports when the round is fully inserted", async () => {
-    const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    const round = overlay.renderProgressive(progressiveHints(300), "", {
-      frameBudgetMs: 100,
-      initialBatch: 32,
-    });
+describe("progressive painting", () => {
+  it("paints every hint before returning below the synchronous limit", async () => {
+    const { overlay, recorder: recorded } = mount();
+    const round = overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT));
     let settled = false;
     void round.done.then(() => {
       settled = true;
     });
     await Promise.resolve();
-    // 首批之后还有队列，done 不能提前完成。
-    expect(settled).toBe(false);
-    expect(badges()).toHaveLength(32);
-
-    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
-    await round.done;
     expect(settled).toBe(true);
-    expect(badges()).toHaveLength(300);
-    overlay.destroy();
+    expect(overlay.labels()).toHaveLength(SYNC_PAINT_LIMIT);
+    expect(overlay.visibleLabels()).toHaveLength(SYNC_PAINT_LIMIT);
+    expect(recorded.clears()).toBe(1);
   });
 
-  it("inserts the first batch in the activation frame and the rest across later frames", () => {
+  it("reports the round as already settled below the limit", async () => {
+    const { overlay } = mount();
+    const round = overlay.renderProgressive(progressiveHints(300));
+    await expect(round.done).resolves.toBeUndefined();
+    expect(overlay.labels()).toHaveLength(300);
+  });
+
+  it("paints the first batch in the activation frame above the limit", () => {
     const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
+    const { overlay, recorder: recorded } = mount({ clock });
+    overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT + 1));
+    // 超限才分帧：激活帧只画出第一批，剩余标签还不可见。
+    expect(recorded.clears()).toBe(1);
+    expect(overlay.visibleLabels().length).toBeGreaterThan(0);
+    expect(overlay.visibleLabels().length).toBeLessThan(SYNC_PAINT_LIMIT + 1);
+    expect(overlay.labels()).toHaveLength(SYNC_PAINT_LIMIT + 1);
+  });
 
-    overlay.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 100, initialBatch: 32 });
+  it("grows the drawn prefix across frames until every label is visible", () => {
+    const clock = frameClock();
+    const { overlay } = mount({ clock });
+    const total = SYNC_PAINT_LIMIT + 1;
+    overlay.renderProgressive(progressiveHints(total));
+    const first = overlay.visibleLabels().length;
+    clock.step(16);
+    const second = overlay.visibleLabels().length;
+    expect(second).toBeGreaterThan(first);
+    for (let frame = 0; frame < 10 && overlay.visibleLabels().length < total; frame += 1) clock.step(16);
+    expect(overlay.visibleLabels()).toHaveLength(total);
+  });
 
-    // 激活那一帧只插入首批；后续批次等动画帧。
-    expect(badges()).toHaveLength(32);
-    clock.step(1);
-    expect(badges().length).toBeGreaterThan(32);
-    expect(badges().length).toBeLessThan(150);
-
-    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
-    expect(badges()).toHaveLength(300);
-    overlay.destroy();
+  it("reports when the fallback round is fully painted", async () => {
+    const clock = frameClock();
+    const { overlay } = mount({ clock });
+    const round = overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT + 1));
+    let settled = false;
+    void round.done.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    for (let frame = 0; frame < 10; frame += 1) clock.step(16);
+    await round.done;
+    expect(settled).toBe(true);
+    expect(overlay.visibleLabels()).toHaveLength(SYNC_PAINT_LIMIT + 1);
   });
 
   it("keeps every label on the same target as one synchronous render", () => {
     const hints = progressiveHints(300);
-    const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-
-    overlay.renderProgressive(hints, "", { frameBudgetMs: 100, initialBatch: 32 });
-    for (let frame = 0; frame < 20 && badges().length < 300; frame += 1) clock.step(1);
-
-    const snapshot = (): { label: string | undefined; left: string; top: string; text: string | null }[] =>
-      badges()
-        .map((badge) => ({
-          label: badge.dataset.jumpLabel,
-          left: badge.style.left,
-          top: badge.style.top,
-          text: badge.textContent,
-        }))
-        .sort((a, b) => String(a.label).localeCompare(String(b.label)));
-    const progressive = snapshot();
+    const { overlay } = mount();
+    overlay.renderProgressive(hints);
+    const progressive = overlay.labels();
 
     overlay.destroy();
     overlay.render(hints);
-    expect(snapshot()).toEqual(progressive);
+    expect(overlay.labels()).toEqual(progressive);
+  });
+
+  it("keeps labels stable while the visible prefix grows", () => {
+    const clock = frameClock();
+    const { overlay } = mount({ clock });
+    const hints = progressiveHints(SYNC_PAINT_LIMIT + 1);
+    overlay.renderProgressive(hints);
+    const labels = overlay.labels();
+    expect(labels).toEqual(hints.map((hint) => hint.label));
+    clock.step(16);
+    expect(overlay.labels()).toEqual(labels);
+  });
+
+  it("cancels a queued fallback and removes the canvas", async () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const round = overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT + 1));
+    const done = round.done;
+    round.cancel();
+    // 取消也要释放等待者，否则 settled() 会永远挂着。
+    await expect(done).resolves.toBeUndefined();
+    expect(overlay.labels()).toEqual([]);
+    expect(overlayCanvas()).toBeNull();
+    // cancel 本身清一次画布；之后队列里的帧不能再画一次。
+    const clears = recorded.clears();
+    clock.step(16);
+    expect(recorded.clears()).toBe(clears);
+    expect(overlayCanvas()).toBeNull();
+  });
+
+  it("starts a fresh round from the first batch after a cancelled one", () => {
+    const clock = frameClock();
+    const { overlay } = mount({ clock });
+    const total = SYNC_PAINT_LIMIT + 1;
+    overlay.renderProgressive(progressiveHints(total));
+    const first = overlay.visibleLabels().length;
+    overlay.renderProgressive([]).cancel();
+
+    overlay.renderProgressive(progressiveHints(total));
+    // 新轮从第一批重新开始，不夹带上一轮已经画出的残余。
+    expect(overlay.visibleLabels()).toHaveLength(first);
+    expect(overlay.labels()).toHaveLength(total);
+  });
+
+  it("stops painting after destroy", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT + 1));
     overlay.destroy();
+    const clears = recorded.clears();
+    clock.step(16);
+    expect(recorded.clears()).toBe(clears);
+    expect(overlay.labels()).toEqual([]);
+    expect(overlayCanvas()).toBeNull();
   });
 
-  it("grows the batch when frames come in far under budget, never past the ceiling", () => {
-    // 预算 100ms、每帧只花 1ms：批量该连续放大，但上限 256 不能破。
+  it("falls back to a synchronous paint when the host has no frames", () => {
+    const { overlay } = mount();
+    overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT + 1));
+    // 没有帧调度器的宿主里，正确性优先：整轮落在这一帧里。
+    expect(overlay.visibleLabels()).toHaveLength(SYNC_PAINT_LIMIT + 1);
+  });
+
+  it("treats the limit itself as synchronous", () => {
     const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    overlay.renderProgressive(progressiveHints(2000), "", {
-      frameBudgetMs: 100,
-      initialBatch: 32,
-      minBatch: 8,
-      maxBatch: 256,
-    });
-
-    const deltas: number[] = [];
-    let previous = badges().length;
-    for (let frame = 0; frame < 8; frame += 1) {
-      clock.step(1);
-      const current = badges().length;
-      deltas.push(current - previous);
-      previous = current;
-    }
-
-    expect(deltas[0]).toBeGreaterThan(32);
-    expect(Math.max(...deltas)).toBe(256);
-    overlay.destroy();
-  });
-
-  it("uses the frame budget published by the embedding page when no option is given", () => {
-    // 400ms 在默认 16.7ms 预算下必然收缩；只有读到了页面发布的 1000ms 预算，
-    // 它才算「远低于预算」并放大批量。
-    const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: number };
-    host.__DSH_JUMP_FRAME_BUDGET_MS__ = 1000;
-    const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    try {
-      overlay.renderProgressive(progressiveHints(2000), "", {
-        initialBatch: 128,
-        minBatch: 8,
-        maxBatch: 256,
-      });
-      clock.step(400);
-      expect(badges()).toHaveLength(128 + 192);
-    } finally {
-      delete host.__DSH_JUMP_FRAME_BUDGET_MS__;
-      overlay.destroy();
-    }
-  });
-
-  it("shrinks the batch when a frame misses budget, never past the floor", () => {
-    // 预算 10ms、每帧花 500ms：批量逐帧减半，8 是下限。
-    const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    overlay.renderProgressive(progressiveHints(2000), "", {
-      frameBudgetMs: 10,
-      initialBatch: 128,
-      minBatch: 8,
-      maxBatch: 256,
-    });
-
-    const deltas: number[] = [];
-    let previous = badges().length;
-    for (let frame = 0; frame < 6; frame += 1) {
-      clock.step(500);
-      const current = badges().length;
-      deltas.push(current - previous);
-      previous = current;
-    }
-
-    expect(deltas[0]).toBeLessThan(128);
-    expect(Math.min(...deltas)).toBe(8);
-    for (let index = 1; index < deltas.length; index += 1) {
-      expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1] as number);
-    }
-    overlay.destroy();
-  });
-});
-
-describe("adaptive batch sizing", () => {
-  it("grows the batch when the measured insertion cost is far under budget", () => {
-    // 帧周期 7ms、批成本 0.5ms：增长必须来自批成本，不能来自 vsync 间隔。
-    const clock = costClock();
-    const restore = chargeBatchAppend(clock, 0.5);
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    try {
-      overlay.renderProgressive(progressiveHints(2000), "", {
-        frameBudgetMs: 7,
-        initialBatch: 16,
-        minBatch: 4,
-        maxBatch: 256,
-      });
-      const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7]);
-
-      expect(deltas[0]).toBe(16);
-      expect(deltas[1]).toBeGreaterThan(deltas[0] as number);
-      for (let index = 2; index < deltas.length; index += 1) {
-        expect(deltas[index]).toBeGreaterThan(deltas[index - 1] as number);
-      }
-    } finally {
-      restore();
-      overlay.destroy();
-    }
-  });
-
-  it("shrinks the batch when the measured insertion cost exceeds budget", () => {
-    // 帧周期仍是 7ms（没有错过 vsync），但每批插入花 9ms，必须收缩。
-    const clock = costClock();
-    const restore = chargeBatchAppend(clock, 9);
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    try {
-      overlay.renderProgressive(progressiveHints(2000), "", {
-        frameBudgetMs: 7,
-        initialBatch: 128,
-        minBatch: 4,
-        maxBatch: 256,
-      });
-      const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7, 7]);
-
-      expect(deltas[0]).toBe(128);
-      expect(deltas[1]).toBeLessThan(128);
-      for (let index = 2; index < deltas.length; index += 1) {
-        expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1] as number);
-      }
-      expect(Math.min(...deltas)).toBe(4);
-    } finally {
-      restore();
-      overlay.destroy();
-    }
-  });
-
-  it("does not let frame jitter interrupt growth while the batch cost stays low", () => {
-    // 周期 7±0.5ms 只是测量抖动，不是错过 vsync；批成本稳定 0.5ms。
-    const clock = costClock();
-    const restore = chargeBatchAppend(clock, 0.5);
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    try {
-      overlay.renderProgressive(progressiveHints(4500), "", {
-        frameBudgetMs: 7,
-        initialBatch: 16,
-        minBatch: 4,
-        maxBatch: 256,
-      });
-      const steps = Array.from({ length: 20 }, (_, index) => (index % 2 === 0 ? 6.5 : 7.5));
-      const deltas = batchDeltas(clock, steps);
-
-      for (let index = 1; index < deltas.length; index += 1) {
-        expect(deltas[index]).toBeGreaterThanOrEqual(deltas[index - 1] as number);
-      }
-      expect(deltas[deltas.length - 1]).toBeGreaterThan(deltas[0] as number);
-    } finally {
-      restore();
-      overlay.destroy();
-    }
-  });
-
-  it("stays conservative until the display budget has been measured", async () => {
-    // 采样还没回来时预算只是 60Hz fallback。143Hz 的 7ms 帧会让增长条件
-    // 恒真，所以这里必须从下限的两倍起步，并且只许缩不许涨。
-    const restoreHidden = setDocumentHidden(false);
-    const clock = costClock();
-    const restoreAppend = chargeBatchAppend(clock, 0.5);
-    const overlay = createOverlay({
-      doc: document,
-      viewport: () => VIEWPORT,
-      clock,
-      frameBudgetSampler: () => new Promise(() => undefined),
-    });
-    try {
-      for (let round = 0; round < 3; round += 1) {
-        overlay.renderProgressive(progressiveHints(2000), "", {
-          initialBatch: 128,
-          minBatch: 8,
-          maxBatch: 256,
-        });
-        expect(badges()).toHaveLength(16);
-        const deltas = batchDeltas(clock, [7, 7, 7, 7, 7, 7, 7, 7]);
-        expect(Math.max(...deltas)).toBeLessThanOrEqual(16);
-      }
-    } finally {
-      restoreAppend();
-      overlay.destroy();
-      restoreHidden();
-    }
-  });
-});
-
-
-/** jsdom 默认按 prerender 报 hidden，测量用例先把它掰成真实前台页面。 */
-function setDocumentHidden(value: boolean): () => void {
-  const descriptor = Object.getOwnPropertyDescriptor(document, "hidden");
-  Object.defineProperty(document, "hidden", { configurable: true, get: () => value });
-  return () => {
-    if (descriptor === undefined) {
-      delete (document as unknown as Record<string, unknown>)["hidden"];
-    } else {
-      Object.defineProperty(document, "hidden", descriptor);
-    }
-  };
-}
-
-describe("frame budget measurement", () => {
-  it("measures the display cadence as the median frame interval", async () => {
-    const restore = setDocumentHidden(false);
-    const clock = frameClock();
-    try {
-      const sample = sampleFrameBudget({ doc: document, clock });
-      for (let frame = 0; frame < 121; frame += 1) clock.step(7);
-      await expect(sample).resolves.toEqual({ budgetMs: 7, measured: true });
-    } finally {
-      restore();
-    }
-  });
-
-  it("samples the display once and reuses the budget across later activations", async () => {
-    const restore = setDocumentHidden(false);
-    const clock = frameClock();
-    let runs = 0;
-    const overlay = createOverlay({
-      doc: document,
-      viewport: () => VIEWPORT,
-      clock,
-      frameBudgetSampler: (deps) => {
-        runs += 1;
-        return sampleFrameBudget(deps);
-      },
-    });
-    try {
-      const hints = progressiveHints(300);
-      overlay.renderProgressive(hints);
-      for (let frame = 0; frame < 121; frame += 1) clock.step(7);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      overlay.renderProgressive(hints);
-      overlay.renderProgressive(hints);
-
-      expect(runs).toBe(1);
-      // 缓存命中后按 7ms 缩放首批，与 16.7ms 的 32 枚不同。
-      expect(badges()).toHaveLength(13);
-    } finally {
-      overlay.destroy();
-      restore();
-    }
-  });
-
-  it("falls back to the 60Hz budget on a hidden page instead of measuring throttled frames", async () => {
-    const restore = setDocumentHidden(true);
-    const clock = frameClock();
-    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT, clock });
-    try {
-      await expect(sampleFrameBudget({ doc: document, clock })).resolves.toEqual({
-        budgetMs: 16.7,
-        measured: false,
-      });
-      expect(clock.requests()).toBe(0);
-
-      overlay.renderProgressive(progressiveHints(300));
-      // 预算没测完时是保守模式：从下限的两倍（8 × 2）起步，而不是 32。
-      expect(badges()).toHaveLength(16);
-    } finally {
-      overlay.destroy();
-      restore();
-    }
-  });
-
-  it("scales the activation batch with the frame budget", () => {
-    const sixty = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: frameClock() });
-    sixty.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 16.7 });
-    const atSixty = badges().length;
-    sixty.destroy();
-
-    const fast = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: frameClock() });
-    fast.renderProgressive(progressiveHints(300), "", { frameBudgetMs: 7 });
-    const atFast = badges().length;
-    fast.destroy();
-
-    expect(atSixty).toBe(32);
-    expect(atFast).toBeLessThan(atSixty);
-  });
-
-  it("keeps scaled batches inside an absolute floor and ceiling", () => {
-    const tinyClock = frameClock();
-    const tiny = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: tinyClock });
-    tiny.renderProgressive(progressiveHints(2000), "", { frameBudgetMs: 1 });
-    const tinyDeltas = [badges().length];
-    for (let frame = 0; frame < 3; frame += 1) {
-      const before = badges().length;
-      tinyClock.step(0.1);
-      tinyDeltas.push(badges().length - before);
-    }
-    tiny.destroy();
-    expect(Math.min(...tinyDeltas)).toBe(4);
-    expect(Math.max(...tinyDeltas)).toBeLessThanOrEqual(15);
-
-    const hugeClock = frameClock();
-    const huge = createOverlay({ doc: document, viewport: () => VIEWPORT, clock: hugeClock });
-    huge.renderProgressive(progressiveHints(2000), "", { frameBudgetMs: 100 });
-    const firstHuge = badges().length;
-    hugeClock.step(0.1);
-    const secondHuge = badges().length - firstHuge;
-    huge.destroy();
-    expect(firstHuge).toBe(192);
-    expect(secondHuge).toBe(256);
+    const { overlay, recorder: recorded } = mount({ clock });
+    overlay.renderProgressive(progressiveHints(SYNC_PAINT_LIMIT));
+    expect(recorded.clears()).toBe(1);
+    expect(clock.requests()).toBe(0);
+    expect(overlay.visibleLabels()).toHaveLength(SYNC_PAINT_LIMIT);
   });
 });
