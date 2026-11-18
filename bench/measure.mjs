@@ -29,6 +29,9 @@ export const DEFAULT_CANDIDATES = [80, 300, 600];
 export const DEFAULT_RUNS = 20;
 export const DEFAULT_WARMUP_CAP = 10;
 
+/** The page samples this many animation frames to learn the display budget. */
+export const FRAME_BUDGET_SAMPLES = 240;
+
 /**
  * Below this many samples nearest-rank p95 is literally the maximum, so the
  * reading says nothing about the tail and must not be compared across runs.
@@ -60,6 +63,64 @@ export function nearestRankPercentile(samples, percentile) {
   const sorted = [...samples].sort((left, right) => left - right);
   const rank = Math.ceil((percentile / 100) * sorted.length);
   return sorted[Math.min(sorted.length - 1, Math.max(0, rank - 1))];
+}
+
+function assertFiniteNumbers(values, label) {
+  if (!Array.isArray(values)) throw new TypeError(`${label} must be an array`);
+  for (const value of values) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new TypeError(`${label} must be finite numbers, got ${String(value)}`);
+    }
+  }
+}
+
+/**
+ * Median of the frame intervals, used only to learn the display budget.
+ *
+ * The budget is the cadence the page really runs at, not a nominal 60/120/144:
+ * a 143Hz panel reports gaps around 6.99ms, and a machine under load reports
+ * whatever it can actually hold. A mean would let one long frame drag the
+ * budget up and forgive exactly the hitch this bench is looking for.
+ */
+export function medianOf(values) {
+  assertFiniteNumbers(values, "frame intervals");
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >> 1;
+  if (sorted.length % 2 === 1) return sorted[middle];
+  return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/**
+ * Frame budget in milliseconds, rounded up to 0.1ms.
+ *
+ * Rounding up keeps the budget from floating just below the real cadence
+ * (6.999 => 7), which would mark every single frame as over budget.
+ */
+export function frameBudgetMsOf(intervals) {
+  const median = medianOf(intervals);
+  if (median === null) return null;
+  return Math.ceil(median * 10 - 1e-9) / 10;
+}
+
+/**
+ * The worst single frame in a tier.
+ *
+ * Deliberately the maximum, not a percentile: the acceptance question is
+ * whether every frame met the budget, so one 39ms hitch must survive the
+ * summary even when 95% of frames are fast.
+ */
+export function maxFrameIntervalMs(intervals) {
+  assertFiniteNumbers(intervals, "frame intervals");
+  if (intervals.length === 0) return null;
+  let max = intervals[0];
+  for (const value of intervals) if (value > max) max = value;
+  return max;
+}
+
+/** Pass only when not a single frame exceeded the budget. */
+export function frameVerdict(overBudgetFrames) {
+  return overBudgetFrames === 0 ? "pass" : "fail";
 }
 
 function parseCandidates(raw) {
@@ -126,6 +187,8 @@ export function parseArgs(argv) {
   const options = {
     check: false,
     help: false,
+    verifyFresh: false,
+    noBrowser: false,
     candidates: DEFAULT_CANDIDATES,
     runs: DEFAULT_RUNS,
     warmup: null,
@@ -137,6 +200,14 @@ export function parseArgs(argv) {
     const flag = argv[index];
     if (flag === "--check") {
       options.check = true;
+      continue;
+    }
+    if (flag === "--verify-fresh") {
+      options.verifyFresh = true;
+      continue;
+    }
+    if (flag === "--no-browser") {
+      options.noBrowser = true;
       continue;
     }
     if (flag === "--help" || flag === "-h") {
@@ -224,12 +295,29 @@ function pageScript(config) {
   return `(() => {
   "use strict";
   const CONFIG = ${serializedConfig};
+  const FRAME_BUDGET_SAMPLES = ${FRAME_BUDGET_SAMPLES};
   const nearestRankPercentile = ${nearestRankPercentile.toString()};
+  const assertFiniteNumbers = ${assertFiniteNumbers.toString()};
+  const medianOf = ${medianOf.toString()};
+  const frameBudgetMsOf = ${frameBudgetMsOf.toString()};
+  const maxFrameIntervalMs = ${maxFrameIntervalMs.toString()};
+  const frameVerdict = ${frameVerdict.toString()};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
   const output = document.querySelector("[data-bench-output]");
   const app = window.${GLOBAL_NAME}.createApp({ platform: "macos" });
   app.apply();
+
+  // Freshness is decided from facts this realm can prove: whether a result was
+  // already sitting on the global before this script ran, and whether this
+  // document was reached by a navigation. A repeated navigation inside one
+  // browser tab used to let the poller read the previous realm's JSON.
+  const navigationEntry = performance.getEntriesByType("navigation")[0] || null;
+  const navigationType = navigationEntry === null ? "unknown" : navigationEntry.type;
+  const navigationStartMs = performance.timeOrigin + (navigationEntry === null ? 0 : navigationEntry.startTime);
+  const hadResultAtLoad = Object.prototype.hasOwnProperty.call(window, "__BENCH_RESULT__");
+  const openedAtMs = Date.now();
+  delete window.__BENCH_RESULT__;
 
   function frame() {
     return new Promise((resolve) => {
@@ -315,7 +403,7 @@ function pageScript(config) {
 
   function roundMs(value) {
     // An empty phase has no reading at all; rounding null would print 0ms.
-    if (value === null) return null;
+    if (value === null || value === undefined) return null;
     return Math.round(value * 1000) / 1000;
   }
 
@@ -360,9 +448,113 @@ function pageScript(config) {
     window.dispatchEvent(keydown("Escape"));
   }
 
+  /**
+   * The display's real cadence.
+   *
+   * 240 intervals are sampled with no bench work in flight, then the median is
+   * rounded up to 0.1ms. A nominal 60/120/143 is not good enough: the machine
+   * may be running at a different rate, and the acceptance rule is stated
+   * against the frames this display actually produces.
+   */
+  function measureFrameBudget() {
+    return new Promise((resolve) => {
+      const intervals = [];
+      let previous = null;
+      let remaining = FRAME_BUDGET_SAMPLES;
+      function tick(now) {
+        if (previous !== null) {
+          intervals.push(now - previous);
+          remaining -= 1;
+        }
+        previous = now;
+        if (remaining <= 0) {
+          resolve(intervals);
+          return;
+        }
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    });
+  }
+
+  /**
+   * Every frame gap during the measured window.
+   *
+   * This runs continuously alongside the timed rounds, so the gap that
+   * contains a synchronous activation or a repaint is the gap that is counted.
+   * A sampler that only looked at the two frames following a dispatch would
+   * miss a hitch that landed between samples.
+   */
+  function startFrameSampler() {
+    const intervals = [];
+    let previous = null;
+    let running = true;
+    function tick(now) {
+      if (!running) return;
+      if (previous !== null) intervals.push(now - previous);
+      previous = now;
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+    return {
+      stop: () => {
+        running = false;
+        return intervals;
+      },
+    };
+  }
+
+  function startLoafObserver() {
+    if (typeof PerformanceObserver !== "function") {
+      return { supported: false, entries: [], stop: () => {} };
+    }
+    const supportedTypes = PerformanceObserver.supportedEntryTypes;
+    if (!Array.isArray(supportedTypes) || !supportedTypes.includes("long-animation-frame")) {
+      return { supported: false, entries: [], stop: () => {} };
+    }
+    const entries = [];
+    let observer = null;
+    try {
+      observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) entries.push(entry);
+      });
+      observer.observe({ type: "long-animation-frame", buffered: false });
+    } catch {
+      return { supported: false, entries: [], stop: () => {} };
+    }
+    return {
+      supported: true,
+      entries: entries,
+      stop: () => {
+        observer.disconnect();
+      },
+    };
+  }
+
+  function worstLoafOf(entries) {
+    let worst = null;
+    let worstDuration = -1;
+    for (const entry of entries) {
+      if (entry.duration <= worstDuration) continue;
+      worstDuration = entry.duration;
+      worst = {
+        duration: roundMs(entry.duration),
+        blockingDuration: roundMs(Number.isFinite(entry.blockingDuration) ? entry.blockingDuration : 0),
+        renderStart: roundMs(Number.isFinite(entry.renderStart) ? entry.renderStart : 0),
+        startTime: roundMs(Number.isFinite(entry.startTime) ? entry.startTime : 0),
+      };
+    }
+    return worst;
+  }
+
   async function runTier(candidates) {
     buildGrid(candidates);
     await settle(2);
+
+    // Learned per tier because the driver gives every tier its own browser
+    // context; repeating it also warms the compositor before warmup starts.
+    const budgetSamples = await measureFrameBudget();
+    const frameBudgetMs = frameBudgetMsOf(budgetSamples);
 
     const identity = measureIdentity();
     // One activation per round; counted rather than derived so the identity
@@ -387,6 +579,9 @@ function pageScript(config) {
       await settle(1);
       warmed += 1;
     }
+
+    const frameSampler = startFrameSampler();
+    const loaf = startLoafObserver();
 
     const activate = [];
     const firstStroke = [];
@@ -444,6 +639,27 @@ function pageScript(config) {
     const closeNodes = badgeLabels().length;
     const close = await stroke("Escape");
 
+    const frameIntervals = frameSampler.stop();
+    // Let the observer deliver the entries queued by the final frames before
+    // disconnecting; a LoAF raised by the last measured frame is still part of
+    // the tier.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    loaf.stop();
+    const maxFrameMs = roundMs(maxFrameIntervalMs(frameIntervals));
+    const overBudgetFrames =
+      frameIntervals.length === 0 ? null : frameIntervals.filter((gap) => gap > frameBudgetMs).length;
+    const finishedAtMs = Date.now();
+
+    // Freshness is only enforced under --verify-fresh, but the facts are
+    // always recorded so a stale tier can be explained after the fact.
+    const staleReasons = [];
+    if (CONFIG.verifyFresh) {
+      if (hadResultAtLoad) staleReasons.push("window.__BENCH_RESULT__ already existed before this page ran");
+      if (navigationType !== "navigate") staleReasons.push('navigation.type is "' + navigationType + '"');
+      if (!(finishedAtMs > navigationStartMs)) staleReasons.push("result timestamp is not after navigation start");
+    }
+    const verdict = staleReasons.length > 0 ? "stale" : frameVerdict(overBudgetFrames);
+
     return {
       candidates: candidates,
       labels: labels,
@@ -453,6 +669,16 @@ function pageScript(config) {
       identityKeysPerRound: identity.calls,
       identityRounds: rounds,
       identityPath: identity.calls > 0 && identity.remembered > 0 ? "active" : "inactive",
+      frameBudgetMs: frameBudgetMs,
+      maxFrameMs: maxFrameMs,
+      overBudgetFrames: overBudgetFrames,
+      frameCount: frameIntervals.length,
+      frameBudgetSamples: budgetSamples.length,
+      verdict: verdict,
+      staleReasons: staleReasons,
+      loafSupported: loaf.supported,
+      worstLoaf: worstLoafOf(loaf.entries),
+      finishedAtMs: finishedAtMs,
       activate: phase(activate),
       firstStroke: phase(firstStroke),
       secondStroke: phase(secondStroke),
@@ -461,15 +687,39 @@ function pageScript(config) {
     };
   }
 
+  function queryInteger(name) {
+    const raw = new URLSearchParams(window.location.search).get(name);
+    if (raw === null || raw === "") return null;
+    if (!/^\\d+$/.test(raw)) throw new Error("query " + name + " must be a positive integer");
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error("query " + name + " must be a positive integer");
+    }
+    return value;
+  }
+
   async function run() {
+    const requestedTier = queryInteger("tier");
+    const runToken = new URLSearchParams(window.location.search).get("r") || null;
+    let tiers = CONFIG.candidates;
+    if (requestedTier !== null) {
+      if (!CONFIG.candidates.includes(requestedTier)) {
+        throw new Error("query tier " + String(requestedTier) + " is not one of the configured candidates");
+      }
+      tiers = [requestedTier];
+    }
+
     const startedAt = performance.now();
     const runs = [];
-    for (let index = 0; index < CONFIG.candidates.length; index += 1) {
-      const candidates = CONFIG.candidates[index];
-      status.textContent = "running tier " + String(index + 1) + "/" + String(CONFIG.candidates.length) + " (" + String(candidates) + " candidates)";
+    for (let index = 0; index < tiers.length; index += 1) {
+      const candidates = tiers[index];
+      status.textContent =
+        "running tier " + String(index + 1) + "/" + String(tiers.length) +
+        " (" + String(candidates) + " candidates)" + (runToken === null ? "" : " run " + runToken);
       runs.push(await runTier(candidates));
       await settle(1);
     }
+    const finishedAtMs = Date.now();
     const result = {
       viewport: [window.innerWidth, window.innerHeight],
       dpr: window.devicePixelRatio || 1,
@@ -478,7 +728,20 @@ function pageScript(config) {
         runs: CONFIG.runs,
         warmup: CONFIG.warmup,
         percentileMethod: "nearest-rank",
+        frameBudgetSamples: FRAME_BUDGET_SAMPLES,
+        verdictRule: "pass only when overBudgetFrames === 0",
         note: "Readings are sensitive to system load: compare runs on the same machine in the same period, alternating between sources.",
+      },
+      page: {
+        url: window.location.href,
+        runToken: runToken,
+        requestedTier: requestedTier,
+        navigationType: navigationType,
+        navigationStartMs: navigationStartMs,
+        timeOriginMs: performance.timeOrigin,
+        hadResultAtLoad: hadResultAtLoad,
+        openedAtMs: openedAtMs,
+        finishedAtMs: finishedAtMs,
       },
       runs: runs,
     };
@@ -502,8 +765,8 @@ function pageScript(config) {
 })();`;
 }
 
-export function pageHtml({ bundle, candidates, runs, warmup, label }) {
-  const config = { candidates, runs, warmup, label, identityPath: "active" };
+export function pageHtml({ bundle, candidates, runs, warmup, label, verifyFresh = false }) {
+  const config = { candidates, runs, warmup, label, identityPath: "active", verifyFresh };
   const inlined = bundle.replace(/<\/script/gi, "<\\/script");
   return `<!doctype html>
 <html lang="en">
@@ -519,6 +782,23 @@ export function pageHtml({ bundle, candidates, runs, warmup, label }) {
     inset: 0;
     display: grid;
     gap: 0;
+  }
+  /* The frame budget is sampled under continuous animation, not on a static
+     page: a composited pulse keeps the display committing frames without
+     adding main-thread work that would contaminate the reading. */
+  [data-bench-pulse] {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 2px;
+    height: 2px;
+    pointer-events: none;
+    will-change: transform, opacity;
+    animation: bench-pulse 1s linear infinite;
+  }
+  @keyframes bench-pulse {
+    from { transform: translate3d(0, 0, 0); opacity: 0.01; }
+    to { transform: translate3d(4px, 0, 0); opacity: 0.02; }
   }
   [data-bench-root] button {
     min-width: 0;
@@ -557,6 +837,7 @@ export function pageHtml({ bundle, candidates, runs, warmup, label }) {
 </head>
 <body>
 <div id="bench-root" data-bench-root data-slot="bench.grid"></div>
+<div data-bench-pulse aria-hidden="true"></div>
 <div id="bench-status" data-bench-status>starting</div>
 <pre id="bench-output" data-bench-output></pre>
 <script>${inlined}</script>
@@ -607,7 +888,7 @@ export async function writeArchive(dir, fileName, payload) {
 /**
  * Archive mode drives the page itself.
  *
- * The repo ships no browser driver and the page cannot write files, so the
+ * The repo ships no third-party browser driver and the page cannot write files, so the
  * only way to archive real readings is to run the generated page from here.
  * Playwright and Puppeteer are not dependencies, so this speaks the DevTools
  * protocol to a local Chrome over its loopback port; Node's built-in WebSocket
@@ -674,9 +955,11 @@ async function openCdp(url) {
     else waiter.resolve(message.result);
   });
   return {
-    send(method, params = {}) {
+    send(method, params = {}, sessionId) {
       const id = nextId++;
-      socket.send(JSON.stringify({ id, method, params }));
+      const message = { id, method, params };
+      if (sessionId !== undefined) message.sessionId = sessionId;
+      socket.send(JSON.stringify(message));
       return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
     },
     close() {
@@ -685,11 +968,74 @@ async function openCdp(url) {
   };
 }
 
-async function collectResult(pagePath) {
-  const chrome = await findChrome();
-  if (chrome === null) {
-    throw new Error("--archive needs a local Chrome; set CHROME_PATH to its executable");
+const RESULT_EXPRESSION =
+  "window.__BENCH_ERROR__ ? { error: window.__BENCH_ERROR__ } :" +
+  " (window.__BENCH_RESULT__ ? { result: window.__BENCH_RESULT__ } : null)";
+
+async function evaluateValue(cdp, sessionId, expression) {
+  const evaluation = await cdp.send("Runtime.evaluate", { expression, returnByValue: true }, sessionId);
+  return evaluation?.result?.value;
+}
+
+async function waitForPageResult(cdp, sessionId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(250);
+    let value;
+    try {
+      value = await evaluateValue(cdp, sessionId, RESULT_EXPRESSION);
+    } catch {
+      // A navigation commits by destroying the old execution context; the
+      // next poll lands in the new document.
+      continue;
+    }
+    if (value === null || value === undefined) continue;
+    if (value.error) throw new Error(`bench page failed: ${String(value.error)}`);
+    return value.result;
   }
+  throw new Error(`bench page did not finish within ${String(Math.round(timeoutMs / 1000))}s`);
+}
+
+/**
+ * Why a tier's JSON cannot be trusted as this navigation's reading.
+ *
+ * The structural checks always run, because the whole point of the rewrite is
+ * that no cached result may be merged silently. The `--verify-fresh` flag adds
+ * the full contract: the global must have been empty before the page ran, the
+ * document must have been reached by a navigation, and the result timestamp
+ * must be later than that navigation.
+ */
+function tierFreshnessFailures(result, live, token, verifyFresh) {
+  const failures = [];
+  const page = result?.page;
+  if (page === undefined || page === null) return ["result carries no page metadata"];
+  if (page.runToken !== token) failures.push("result belongs to a different bench run token");
+  if (live !== undefined && live.timeOriginMs !== page.timeOriginMs) {
+    failures.push("result belongs to a different document (timeOrigin mismatch)");
+  }
+  if (verifyFresh) {
+    if (page.hadResultAtLoad !== false) failures.push("window.__BENCH_RESULT__ already existed before the page ran");
+    if (page.navigationType !== "navigate") failures.push(`navigation.type is "${String(page.navigationType)}"`);
+    if (typeof page.finishedAtMs !== "number" || !(page.finishedAtMs > page.navigationStartMs)) {
+      failures.push("result timestamp is not after navigation start");
+    }
+    if (live !== undefined && live.navigationType !== "navigate") {
+      failures.push(`live navigation.type is "${String(live.navigationType)}"`);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Drive one fresh Chrome browser context per tier.
+ *
+ * The defect this replaces was a single tab reused across tiers, where a
+ * poller could read the previous run's `window.__BENCH_RESULT__`. A new
+ * browser context per tier makes storage, the JS realm and the compositor
+ * state start clean, and the random query on every navigation makes a cached
+ * document impossible to mistake for the new one.
+ */
+async function runTiersInChrome({ chrome, pagePath, candidates, verifyFresh }) {
   const profile = await mkdtemp(join(tmpdir(), "dsh-jump-bench-chrome-"));
   const child = spawn(
     chrome,
@@ -700,6 +1046,9 @@ async function collectResult(pagePath) {
       "--no-default-browser-check",
       "--hide-scrollbars",
       "--window-size=1440,900",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
       "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
       "about:blank",
@@ -709,27 +1058,95 @@ async function collectResult(pagePath) {
   let cdp;
   try {
     const port = await readDevtoolsPort(profile);
-    const targets = await (await fetch(`http://127.0.0.1:${String(port)}/json/list`)).json();
-    const target = Array.isArray(targets) ? targets.find((entry) => entry.type === "page") : undefined;
-    if (target === undefined) throw new Error("Chrome exposes no page target");
-    cdp = await openCdp(target.webSocketDebuggerUrl);
-    await cdp.send("Page.enable");
-    await cdp.send("Page.navigate", { url: pathToFileURL(pagePath).href });
-    const deadline = Date.now() + 240000;
-    while (Date.now() < deadline) {
-      await sleep(250);
-      const evaluation = await cdp.send("Runtime.evaluate", {
-        expression:
-          "window.__BENCH_ERROR__ ? { error: window.__BENCH_ERROR__ } :" +
-          " (window.__BENCH_RESULT__ ? { result: window.__BENCH_RESULT__ } : null)",
-        returnByValue: true,
-      });
-      const value = evaluation?.result?.value;
-      if (value === null || value === undefined) continue;
-      if (value.error) throw new Error(`bench page failed: ${String(value.error)}`);
-      return value.result;
+    const version = await (await fetch(`http://127.0.0.1:${String(port)}/json/version`)).json();
+    if (typeof version?.webSocketDebuggerUrl !== "string") {
+      throw new Error("Chrome exposes no browser DevTools socket");
     }
-    throw new Error("bench page did not finish within 240s");
+    cdp = await openCdp(version.webSocketDebuggerUrl);
+
+    const tiers = [];
+    const staleReasons = [];
+    for (const count of candidates) {
+      const context = await cdp.send("Target.createBrowserContext", { disposeOnDetach: true });
+      const browserContextId = context.browserContextId;
+      let targetId;
+      let sessionId;
+      try {
+        const target = await cdp.send("Target.createTarget", { url: "about:blank", browserContextId });
+        targetId = target.targetId;
+        const attached = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+        sessionId = attached.sessionId;
+        await cdp.send("Page.enable", {}, sessionId);
+        await cdp.send("Runtime.enable", {}, sessionId);
+
+        const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        const url =
+          `${pathToFileURL(pagePath).href}?tier=${String(count)}&r=${encodeURIComponent(token)}`;
+        await cdp.send("Page.navigate", { url }, sessionId);
+        const result = await waitForPageResult(cdp, sessionId, 240000);
+        if (!Array.isArray(result.runs) || result.runs.length !== 1 || result.runs[0]?.candidates !== count) {
+          throw new Error(`tier ${String(count)} returned an unexpected result shape`);
+        }
+        const live = await evaluateValue(
+          cdp,
+          sessionId,
+          "(() => { const entry = performance.getEntriesByType('navigation')[0] || null;" +
+            " return { timeOriginMs: performance.timeOrigin, navigationType: entry === null ? 'unknown' : entry.type };" +
+            " })()",
+        );
+        const failures = tierFreshnessFailures(result, live, token, verifyFresh);
+        const tier = result.runs[0];
+        // The page runs the same freshness check from inside the realm; honor
+        // its stale verdict even when the driver's own checks found nothing.
+        let reasons = [];
+        if (failures.length > 0) reasons = failures;
+        else if (tier.verdict === "stale") reasons = tier.staleReasons ?? ["page marked the result stale"];
+        const tierStale = reasons.length > 0;
+        tier.realm = {
+          timeOriginMs: result.page.timeOriginMs,
+          navigationType: result.page.navigationType,
+          hadResultAtLoad: result.page.hadResultAtLoad,
+          runToken: result.page.runToken,
+          url: result.page.url,
+          freshVerified: !tierStale,
+        };
+        if (tierStale) {
+          tier.verdict = "stale";
+          tier.staleReasons = reasons;
+          staleReasons.push(`tier ${String(count)}: ${reasons.join("; ")}`);
+        }
+        tiers.push(result);
+      } finally {
+        if (sessionId !== undefined) {
+          await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => undefined);
+        }
+        if (targetId !== undefined) {
+          await cdp.send("Target.closeTarget", { targetId }).catch(() => undefined);
+        }
+        if (browserContextId !== undefined) {
+          await cdp.send("Target.disposeBrowserContext", { browserContextId }).catch(() => undefined);
+        }
+      }
+    }
+
+    const first = tiers[0];
+    return {
+      result: {
+        viewport: first.viewport,
+        dpr: first.dpr,
+        label: first.label,
+        protocol: {
+          ...first.protocol,
+          driver: "chrome-cdp",
+          browserContextPerTier: true,
+          verifyFresh: verifyFresh,
+          tiers: candidates,
+        },
+        page: first.page,
+        runs: tiers.flatMap((tier) => tier.runs),
+      },
+      staleReasons,
+    };
   } finally {
     cdp?.close();
     child.kill("SIGKILL");
@@ -737,28 +1154,9 @@ async function collectResult(pagePath) {
   }
 }
 
-/**
- * Optional automation probe.
- *
- * The repo ships no browser driver and adding one would change the install
- * surface for a measurement aid, so the normal path is manual. The probe still
- * runs: a machine that happens to have Playwright installed should be told that
- * automatic collection is not wired rather than being told it has no browser.
- */
-async function detectBrowserDriver() {
-  for (const name of ["playwright", "puppeteer"]) {
-    try {
-      await import(name);
-      return name;
-    } catch {
-      // Not installed here; keep probing.
-    }
-  }
-  return null;
-}
-
 const REQUIRED_HOOKS = [
   "data-bench-root",
+  "data-bench-pulse",
   "data-bench-status",
   "data-bench-output",
   "data-bench-state",
@@ -786,6 +1184,16 @@ const REQUIRED_HOOKS = [
   "warmup",
   "protocol",
   "percentileMethod",
+  "frameBudgetMs:",
+  "maxFrameMs:",
+  "overBudgetFrames:",
+  "verdict:",
+  "staleReasons",
+  "worstLoaf",
+  "loafSupported",
+  "long-animation-frame",
+  "verifyFresh",
+  "navigationType",
 ];
 
 function assertPercentileCases() {
@@ -807,6 +1215,94 @@ function assertPercentileCases() {
         `percentile p${item.p} of [${item.samples.join(",")}] is ${String(actual)}, expected ${String(item.expected)}`,
       );
     }
+  }
+}
+
+/**
+ * Frame budget contract.
+ *
+ * The acceptance rule is "no frame may exceed the budget", so the reading has
+ * to be the maximum interval, not a percentile: a single hitch is exactly what
+ * p95 was hiding. The budget itself comes from the display, measured as the
+ * median of 240 animation frames and rounded up to 0.1ms so a 143Hz panel
+ * reports 7.0 rather than a binary-float neighbour.
+ */
+function assertFrameBudgetContract() {
+  const cases = [
+    { intervals: Array.from({ length: 240 }, () => 6.94), expected: 7 },
+    { intervals: [16.6, 16.7, 16.8, 16.9], expected: 16.8 },
+    { intervals: [7.01, 7.02, 7.03], expected: 7.1 },
+    { intervals: [5, 1, 3], expected: 3 },
+    { intervals: [], expected: null },
+  ];
+  for (const item of cases) {
+    const actual = frameBudgetMsOf(item.intervals);
+    if (actual !== item.expected) {
+      throw new Error(
+        `frame budget of ${String(item.intervals.length)} intervals is ${String(actual)}, expected ${String(item.expected)}`,
+      );
+    }
+  }
+  if (frameBudgetMsOf([3, 1, 2]) !== 2) {
+    throw new Error("frame budget must take the median, not the mean or the max");
+  }
+
+  if (frameVerdict(0) !== "pass") throw new Error("zero over-budget frames must pass");
+  if (frameVerdict(1) !== "fail") throw new Error("one over-budget frame must fail");
+  if (frameVerdict(7) !== "fail") throw new Error("many over-budget frames must fail");
+
+  // 100 samples: nearest-rank p95 is 5, but a single 40ms hitch must still win.
+  const tail = [...Array.from({ length: 99 }, () => 5), 40];
+  const max = maxFrameIntervalMs(tail);
+  if (max !== 40) throw new Error(`maxFrameMs must be 40, got ${String(max)}`);
+  if (nearestRankPercentile(tail, 95) !== 5) {
+    throw new Error("fixture is wrong: p95 of 99 fast frames and one hitch should be 5");
+  }
+  if (max === nearestRankPercentile(tail, 95)) {
+    throw new Error("maxFrameMs must not collapse into a percentile");
+  }
+  if (maxFrameIntervalMs([]) !== null) throw new Error("maxFrameMs of no frames must be null");
+}
+
+/**
+ * Freshness contract.
+ *
+ * A fresh tier is a result produced by this navigation in this document. The
+ * cases below are the exact ways the old bench could hand back the previous
+ * run's JSON: a result that already existed, a reload instead of a navigation,
+ * a timestamp from before the navigation, or a different document realm.
+ */
+function assertFreshnessContract() {
+  const base = {
+    runToken: "token-a",
+    timeOriginMs: 1000,
+    navigationType: "navigate",
+    hadResultAtLoad: false,
+    navigationStartMs: 1000,
+    finishedAtMs: 2000,
+  };
+  const live = { timeOriginMs: 1000, navigationType: "navigate" };
+  function failuresWith(patch, token = "token-a", liveValue = live) {
+    return tierFreshnessFailures({ page: { ...base, ...patch } }, liveValue, token, true);
+  }
+  if (failuresWith({}).length !== 0) throw new Error("a fresh result must pass the freshness contract");
+
+  const staleCases = [
+    { name: "pre-existing result", patch: { hadResultAtLoad: true } },
+    { name: "reload instead of navigation", patch: { navigationType: "reload" } },
+    { name: "timestamp before navigation", patch: { finishedAtMs: 999 } },
+  ];
+  for (const item of staleCases) {
+    if (failuresWith(item.patch).length === 0) throw new Error(`--verify-fresh must reject ${item.name}`);
+  }
+  if (failuresWith({}, "token-b").length === 0) throw new Error("--verify-fresh must reject a result from another run");
+  if (failuresWith({}, "token-a", { timeOriginMs: 2000, navigationType: "navigate" }).length === 0) {
+    throw new Error("--verify-fresh must reject a result from another document");
+  }
+  // Without the flag only identity checks run, so a fresh context is still
+  // required and a cached result cannot be merged silently.
+  if (tierFreshnessFailures({ page: { ...base, runToken: "token-b" } }, live, "token-a", false).length === 0) {
+    throw new Error("the structural run-token check must run even without --verify-fresh");
   }
 }
 
@@ -832,10 +1328,13 @@ function assertRunsBoundary() {
     }
     if (!rejected) throw new Error(`--runs "${raw}" should be rejected`);
   }
-  const custom = parseArgs(["--runs", "10", "--warmup", "3", "--label", "smoke"]);
+  const custom = parseArgs(["--runs", "10", "--warmup", "3", "--label", "smoke", "--verify-fresh"]);
   if (custom.warmup !== 3) throw new Error("--warmup 3 should override the default");
   if (custom.label !== "smoke") throw new Error("--label smoke should reach the output");
+  if (custom.verifyFresh !== true) throw new Error("--verify-fresh should reach the page configuration");
   if (parseArgs([]).label !== null) throw new Error("label should default to null");
+  if (parseArgs([]).verifyFresh !== false) throw new Error("freshness verification should default to off");
+  if (parseArgs(["--no-browser"]).noBrowser !== true) throw new Error("--no-browser should force page-only mode");
 }
 
 /**
@@ -923,14 +1422,32 @@ export async function check() {
     !html.includes(`"warmup":${defaultWarmup}`) ||
     !html.includes('"label":null') ||
     !html.includes('"identityPath":"active"') ||
+    !html.includes('"verifyFresh":false') ||
     !html.includes('"nearest-rank"')
   ) {
     throw new Error("generated page lost its candidate/run/warmup/label/protocol configuration");
+  }
+  const freshHtml = pageHtml({
+    bundle,
+    candidates: DEFAULT_CANDIDATES,
+    runs: DEFAULT_RUNS,
+    warmup: defaultWarmup,
+    label: null,
+    verifyFresh: true,
+  });
+  if (!freshHtml.includes('"verifyFresh":true')) {
+    throw new Error("--verify-fresh did not reach the generated page configuration");
   }
   console.log("check html hooks: ok");
 
   assertPercentileCases();
   console.log("check percentile: ok (9 cases, nearest rank)");
+
+  assertFrameBudgetContract();
+  console.log("check frame budget: ok (median ceil to 0.1ms, max not percentile, verdict boundary)");
+
+  assertFreshnessContract();
+  console.log("check freshness: ok (pre-existing result, reload, timestamp, foreign realm rejected)");
 
   assertRunsBoundary();
   console.log("check runs boundary: ok (--runs 1 accepted, p95 warned below the floor)");
@@ -951,21 +1468,27 @@ export async function check() {
 function printHelp() {
   console.log(`dsh-jump frame budget bench
 
-  node bench/measure.mjs                     generate the page, print its path
+  node bench/measure.mjs                     generate the page and run it if Chrome exists
   node bench/measure.mjs --check             deterministic self-check, no browser
   node bench/measure.mjs --candidates 80,300,600,1200
   node bench/measure.mjs --runs 60 --warmup 10 --label before
   node bench/measure.mjs --out temp/bench.html
   node bench/measure.mjs --label before --archive temp/bench-runs
+  node bench/measure.mjs --verify-fresh      require proof of a fresh navigation per tier
+  node bench/measure.mjs --no-browser        generate the page without launching Chrome
 
 Every tier discards min(10, runs) warmup cycles before sampling; --warmup
 overrides that count. --label is copied into the JSON so two sources measured
 under one protocol can be told apart.
 
-Measurements are taken by opening the generated page in a real browser; the
-page prints its JSON into window.__BENCH_RESULT__ and into the page itself.
---archive additionally runs that page in headless Chrome and writes the JSON
-it produced to <dir>/dsh-jump-bench-<label>-<stamp>.json.`);
+When a local Chrome is found, every candidate tier runs in its own headless
+browser context, navigated to a uniquely tagged URL and verified before its
+reading is accepted. Without Chrome the page is only generated and printed, and
+the JSON is collected by opening it in a real browser foreground tab.
+
+A tier passes only when overBudgetFrames is 0: frameBudgetMs is the median of
+240 animation-frame gaps rounded up to 0.1ms, and maxFrameMs is the largest
+single gap in the measured window, not a percentile.`);
 }
 
 async function main() {
@@ -990,28 +1513,55 @@ async function main() {
     runs: options.runs,
     warmup,
     label: options.label,
+    verifyFresh: options.verifyFresh,
   });
   const paths = await writeArtifacts({ bundle, html, out: options.out });
   console.log(`bundle: ${paths.bundlePath}`);
   console.log(`page: ${paths.htmlPath}`);
 
-  if (options.archive !== null) {
-    // The page is the only producer of readings, so archive mode runs it and
-    // stores the JSON it publishes instead of inventing a result here.
-    const result = await collectResult(paths.htmlPath);
-    const archived = await writeArchive(options.archive, archiveFileName(options.label), result);
-    console.log(`archive: ${archived}`);
-    console.log("dsh-jump bench: archived the JSON the page produced in headless Chrome.");
+  const chrome = options.noBrowser ? null : await findChrome();
+  if (chrome === null) {
+    if (options.archive !== null) {
+      throw new Error("--archive needs a local Chrome; set CHROME_PATH to its executable");
+    }
+    console.log(
+      options.noBrowser
+        ? "dsh-jump bench: 已按 --no-browser 跳过浏览器驱动，未采集读数。"
+        : "dsh-jump bench: 未检测到本机 Chrome，未采集读数。",
+    );
+    console.log(
+      "用真实浏览器打开上面的页面：页面会自动跑完每一档，把含 frameBudgetMs / maxFrameMs / overBudgetFrames / verdict 的 JSON 打在页面上。",
+    );
+    if (options.verifyFresh) {
+      console.log("--verify-fresh 的新鲜度自检由页面在每档结束时执行；没有脚本可驱动的浏览器时脚本以 0 退出。");
+    }
     return;
   }
 
-  const driver = await detectBrowserDriver();
-  if (driver === null) {
-    console.log("dsh-jump bench: no playwright or puppeteer installed, so no readings were taken.");
-  } else {
-    console.log(`dsh-jump bench: ${driver} is installed; --archive still uses the local Chrome driver.`);
+  const collected = await runTiersInChrome({
+    chrome,
+    pagePath: paths.htmlPath,
+    candidates: options.candidates,
+    verifyFresh: options.verifyFresh,
+  });
+  const result = collected.result;
+  console.log("driver: chrome-cdp (fresh browser context per tier)");
+  for (const tier of result.runs) {
+    console.log(
+      `tier ${String(tier.candidates)}: frameBudgetMs ${String(tier.frameBudgetMs)}` +
+        ` maxFrameMs ${String(tier.maxFrameMs)} overBudgetFrames ${String(tier.overBudgetFrames)}` +
+        ` verdict ${String(tier.verdict)}`,
+    );
   }
-  console.log("用真实浏览器打开该文件采集读数：页面会自动跑完每一档并把 JSON 打在页面上。");
+  if (options.archive !== null) {
+    const archived = await writeArchive(options.archive, archiveFileName(options.label), result);
+    console.log(`archive: ${archived}`);
+  }
+  console.log("BENCH_RESULT " + JSON.stringify(result));
+  if (collected.staleReasons.length > 0) {
+    console.error(`dsh-jump bench: stale reading: ${collected.staleReasons.join("; ")}`);
+    process.exitCode = 1;
+  }
 }
 
 const invokedDirectly = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

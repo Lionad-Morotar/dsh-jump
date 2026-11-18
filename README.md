@@ -272,10 +272,9 @@ since.
 ## Frame budget bench
 
 `bench/measure.mjs` turns the cost of one activation and of every label stroke
-into a repeatable number that two runs can be diffed against. It bundles
-`src/client/app.ts` with the repo's own esbuild into one browser IIFE, writes a
-self-contained measurement page to the system temp directory, and prints the
-path:
+into a repeatable accept/reject reading. It bundles `src/client/app.ts` with the
+repo's own esbuild into one browser IIFE, writes a self-contained measurement
+page, and prints its path:
 
 ```sh
 node bench/measure.mjs                              # or: pnpm bench
@@ -283,25 +282,79 @@ node bench/measure.mjs --candidates 80,300,600,1200 --runs 60
 node bench/measure.mjs --runs 60 --warmup 10 --label before
 node bench/measure.mjs --out temp/bench.html        # keep the page somewhere
 node bench/measure.mjs --label before --archive temp/bench-runs  # save raw JSON
+node bench/measure.mjs --verify-fresh               # refuse any reused result
+node bench/measure.mjs --no-browser                 # generate the page only
 node bench/measure.mjs --check                      # CI-safe self-check, no browser
 ```
 
-Open the printed page in a real browser and leave it in the foreground. For
-each candidate tier it lays out a viewport-filling grid of visible buttons,
-then runs `min(10, runs)` full activate → first stroke → Esc cycles and
-discards their readings before timing `runs` activations, `runs` first label
-strokes, `runs` second label strokes, `runs` complete labels (each on a fresh
-activation) and one Esc exit. The second stroke is the phase where the dimmed
-batch matters: on a three-key label it must stay untouched while the live
-prefix splits further (on a two-key tier it is the completing stroke). The close reading reports the badge count it tore down
-as `nodes`. Warmup is required: without it the first tier pays JIT
-compilation, first layout and GC warmup and reports a cold start as a tier
-cost, so `--warmup <n>` only tunes the count. The JSON is printed at the
-bottom of the page and kept on `window.__BENCH_RESULT__`; copy it from there.
-`--label <name>` fills the top-level `label`, and the result carries a
-top-level `protocol` with `runs`, `warmup`,
-`percentileMethod: "nearest-rank"` and a note that readings are sensitive to
-system load.
+When a local Chrome is found, the script drives it over the DevTools protocol
+and gives every candidate tier a brand-new browser context: a new target, new
+storage and a new JS realm, navigated to the page with a random query string.
+Before a reading is accepted, the driver checks that this document was reached
+by a navigation (`performance.getEntriesByType("navigation")[0].type ===
+"navigate"`), that its `timeOrigin` matches the tier it just ran, and that the
+result carries the same random run token. This is what makes two runs of the
+same source comparable: one tier can never read the previous tier's
+`window.__BENCH_RESULT__`. When Chrome is missing, or `--no-browser` is passed,
+the script only generates and prints the page, then exits 0 and asks for a real
+browser. Serve that page over HTTP and open it in a foreground tab; the page
+clears `window.__BENCH_RESULT__` on load, so a second run in the same tab cannot
+read the first one's JSON.
+
+Headless Chrome reports its own compositor cadence, typically 60Hz, not the
+physical display's. That is still the right environment for a reproducible
+accept/reject run and for catching a hitch, but when the question is whether
+the page meets a 143Hz panel's budget, open the same generated page in a real
+foreground tab and read the page's own JSON.
+
+For each candidate tier the page lays out a viewport-filling grid of visible
+buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
+discards their readings. Warmup is still required: without it the first tier
+pays JIT compilation, first layout and GC warmup and reports a cold start as a
+tier cost, so `--warmup <n>` only tunes the count. Then it times `runs`
+activations, `runs` first label strokes, `runs` second label strokes, `runs`
+complete labels (each on a fresh activation) and one Esc exit. The second stroke
+is the phase where the dimmed batch matters: on a three-key label it must stay
+untouched while the live prefix splits further (on a two-key tier it is the
+completing stroke). The close reading reports the badge count it tore down as
+`nodes`.
+
+A tier reports `candidates`, `labels` (badges actually painted), `warmup`
+(cycles discarded before sampling), `overlayCount`, which must stay `1`, and
+the identity pair below; a second runtime would show up as a second overlay and
+its cost would contaminate the reading. The verdict fields are:
+
+- `frameBudgetMs`: the display budget the page measured for this tier. It runs
+  240 animation frames under a continuous animation and takes the median gap,
+  rounded up to 0.1ms, so a 143Hz panel reports about 7.0 rather than a
+  nominal 60/120/144 constant.
+- `maxFrameMs`: the largest single frame gap during the measured window, not a
+  percentile. A single hitch survives this number even when 95% of frames are
+  fast.
+- `overBudgetFrames`: how many sampled gaps were strictly greater than
+  `frameBudgetMs`.
+- `verdict`: `pass` only when `overBudgetFrames` is 0, otherwise `fail`. With
+  `--verify-fresh`, a result that cannot prove it came from this navigation is
+  `stale` instead.
+
+The p50/p95 fields are retained, unchanged: each phase still carries
+`handlerMs` (synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from
+dispatch return to the second animation frame), and the phase-level `p50`/`p95`
+mirror `handlerMs`. They are useful for tracking a change, but they no longer
+decide the gate; the acceptance rule is every frame, so `maxFrameMs` and
+`overBudgetFrames` are the numbers that matter. Percentiles use the nearest
+rank, not interpolation, so any reading can be recomputed from the samples by
+hand.
+
+Treat the retained p95 from fewer than 50 samples as a reference only: at 19 or
+fewer samples nearest-rank p95 is literally the maximum, and the bench prints a
+样本偏少 warning below 20. The gate does not depend on p95, which is why a small
+sample count weakens the historical comparison without weakening the verdict.
+
+`worstLoaf` is the longest `long-animation-frame` entry recorded during the
+measured window: `duration`, `blockingDuration`, `renderStart` and `startTime`
+in milliseconds. `loafSupported` is `true` when the browser exposes the entry
+type. When it does not, `loafSupported` is `false` and `worstLoaf` is `null`.
 
 Every button on the measurement grid lives under `data-slot="bench.grid"` and
 carries an `aria-label`, so `identityKey` produces non-empty keys and the label
@@ -314,40 +367,33 @@ calls produced keys the memory recorded). The per-round count is checked
 against the labels the app actually paints, so a drifted fixture fails the tier
 instead of reporting a number nobody measured.
 
-Treat p95 from fewer than 50 samples as a reference only: at 19 or fewer
-samples nearest-rank p95 is literally the maximum, and the bench prints a
-样本偏少 warning below 20. Compare two runs on the same machine in the same
-period, alternating between the two sources, because machine load between page
-loads is part of the reading.
+`--verify-fresh` makes the freshness contract fatal. The automated Chrome path
+already checks every tier; the flag records the requirement in the protocol and
+turns any violation into `verdict: "stale"` with a non-zero exit. The page
+itself performs the same check at the end of each tier: `window.__BENCH_RESULT__`
+must not have existed before the page ran, the document must have
+`navigation.type === "navigate"`, and the result timestamp must be later than
+the navigation start. In page-only mode the JSON carries the `stale` verdict
+even though the process cannot exit for the reader.
 
-A tier reports `candidates`, `labels` (badges actually painted), `warmup`
-(cycles discarded before sampling), `overlayCount`, which must stay `1`, and
-the identity pair above; a second runtime would show up as a second overlay and
-its cost would contaminate the reading. Each phase carries both metrics as
-nearest-rank `p50`/`p95`: `handlerMs` is the synchronous `dispatchEvent` cost,
-`nextFrameMs` is the gap from dispatch return to the second animation frame so
-style and layout land before the reading. The phase-level `p50`/`p95` mirror
-`handlerMs`. Percentiles use the nearest rank, not interpolation, so any
-reading can be recomputed from the samples by hand.
-
-`--archive <dir>` runs the generated page in headless Chrome through the
-DevTools protocol and writes the JSON it produced to
-`<dir>/dsh-jump-bench-<label>-<stamp>.json` (stamp in UTC), creating the directory if needed.
-The file name carries the label, and an unlabelled run is archived as
-`unlabeled`. Foreground runs remain the reference for cross-machine comparisons;
-two archive runs share one automated protocol, which is what makes them
-comparable to each other. Archive mode needs a local Chrome (`CHROME_PATH`
-overrides the usual install paths) because the page itself cannot write files
-and the repo ships no browser driver.
+`--archive <dir>` writes the aggregated JSON the page produced to
+`<dir>/dsh-jump-bench-<label>-<stamp>.json` (stamp in UTC), creating the
+directory if needed. The file name carries the label, and an unlabelled run is
+archived as `unlabeled`. Two archive runs share one automated protocol, which
+is what makes them comparable to each other. Archive mode needs a local Chrome
+(`CHROME_PATH` overrides the usual install paths) because the page itself cannot
+write files and the repo ships no third-party browser driver.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
-still carries every measurement hook (including `secondStroke`, `close`,
-`identityKeys` and `identityPath`) and the warmup/label/protocol configuration,
-exercises the same percentile implementation with fixed inputs, checks that
-`--runs 1` is accepted while its p95 is warned as an invalid sample, verifies
+still carries every measurement hook (including `frameBudgetMs`, `maxFrameMs`,
+`overBudgetFrames`, `verdict`, `worstLoaf`, `secondStroke`, `close`,
+`identityKeys` and `identityPath`), exercises the percentile and frame-budget
+implementations with fixed inputs (median and 0.1ms ceiling, max rather than
+p95, 0-over pass and 1-over fail), checks the freshness contract against a
+pre-existing result, a reload, an old timestamp and a foreign realm, verifies
 archive file naming and a JSON round-trip into a fresh directory, and fails if
 the page or the script imports anything outside the local toolchain allowlist
-(`node:child_process` is there only for the local Chrome archive driver).
+(`node:child_process` is there only for the local Chrome driver).
 
 ## v1 boundaries
 
