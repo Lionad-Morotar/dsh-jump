@@ -1352,7 +1352,7 @@ function trackRects(els: readonly HTMLElement[]): { count: () => number } {
 }
 
 /** 把排队中的采集帧全部跑完，再等浮层画完。 */
-async function drain(app: JumpApp, clock: StepClock): Promise<void> {
+async function drain(app: JumpApp, clock: { pending: number; frame(): void }): Promise<void> {
   for (let i = 0; i < 5000 && clock.pending > 0; i += 1) clock.frame();
   await app.settled();
 }
@@ -1504,6 +1504,231 @@ describe("采集分块", () => {
     for (const key of label) win.dispatchEvent(keydown({ key }));
     expect(hits).toEqual(["click"]);
     expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+});
+
+/**
+ * 可控的显示帧钟：帧时间戳按 step 推进，`now()` 每读一次记 1ms 的采集成本。
+ *
+ * 采集预算按 `now()` 的差值判停，所以「激活帧读了几枚候选」就是预算的可见
+ * 后果：0.84ms 只够读完第一枚，1.5ms 够读两枚。
+ */
+class SampleClock implements FrameClock {
+  private time = 0;
+  private seq = 0;
+  private frames = 0;
+  private queued = new Map<number, (time: number) => void>();
+
+  now(): number {
+    this.time += 1;
+    return this.time;
+  }
+
+  request(callback: (time: number) => void): number {
+    this.frames += 1;
+    this.seq += 1;
+    this.queued.set(this.seq, callback);
+    return this.seq;
+  }
+
+  cancel(handle: number): void {
+    this.queued.delete(handle);
+  }
+
+  frame(ms = 0): void {
+    this.time += ms;
+    const due = [...this.queued.values()];
+    this.queued.clear();
+    for (const callback of due) callback(this.time);
+  }
+
+  get requests(): number {
+    return this.frames;
+  }
+
+  get pending(): number {
+    return this.queued.size;
+  }
+}
+
+function flushIdle(): Promise<void> {
+  return Promise.resolve().then(() => undefined);
+}
+
+/** 把采样的 24 帧按固定间隔跑完，再走完 promise 链。 */
+async function runSampleFrames(clock: SampleClock, intervalMs: number): Promise<void> {
+  for (let index = 0; index < 10000 && clock.pending > 0; index += 1) {
+    if (clock.pending === 0) break;
+    clock.frame(intervalMs);
+  }
+  await flushIdle();
+  await flushIdle();
+}
+
+/** 读一次激活帧里第一个分块碰到的候选数。 */
+function firstSliceReads(clock: SampleClock, els: readonly HTMLElement[]): number {
+  const reads = trackRects(els);
+  activate();
+  return reads.count();
+}
+
+describe("运行时帧预算采样", () => {
+  // jsdom 默认把文档当成隐藏页；这一组测的是前台页面的采样。
+  beforeEach(() => {
+    Object.defineProperty(doc, "hidden", { configurable: true, value: false });
+  });
+  afterEach(() => {
+    delete (doc as unknown as Record<string, unknown>)["hidden"];
+  });
+
+  it("生产路径按实测 7ms 算切片预算，而不是 16.7ms", async () => {
+    const els = gridButtons(500);
+    const clock = new SampleClock();
+    const idle: (() => void)[] = [];
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      idleScheduler: (run) => idle.push(run),
+    });
+    const teardown = app.apply();
+    expect(idle).toHaveLength(1);
+    (idle[0] as () => void)();
+    await runSampleFrames(clock, 7);
+
+    // 0.84ms 的份额只够读完第一枚；16.7ms 会读到第二枚。
+    expect(firstSliceReads(clock, els)).toBe(1);
+    teardown();
+  });
+
+  it("采样只用 24 帧，不多跑一帧", async () => {
+    gridButtons(500);
+    const clock = new SampleClock();
+    const idle: (() => void)[] = [];
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      idleScheduler: (run) => idle.push(run),
+    });
+    const teardown = app.apply();
+    (idle[0] as () => void)();
+    for (let index = 0; index < 24; index += 1) clock.frame(7);
+    await flushIdle();
+    expect(clock.requests).toBeLessThanOrEqual(24);
+    expect(clock.pending).toBe(0);
+    teardown();
+  });
+
+  it("页面隐藏时不起采样，预算用 16.7ms", async () => {
+    const els = gridButtons(500);
+    const clock = new SampleClock();
+    const idle: (() => void)[] = [];
+    Object.defineProperty(doc, "hidden", { configurable: true, value: true });
+    try {
+      const app = createApp({
+        window: win,
+        isVisible: () => true,
+        frameClock: clock,
+        idleScheduler: (run) => idle.push(run),
+      });
+      const teardown = app.apply();
+      for (const run of idle) run();
+      expect(clock.requests).toBe(0);
+      expect(firstSliceReads(clock, els)).toBe(2);
+      teardown();
+    } finally {
+      delete (doc as unknown as Record<string, unknown>)["hidden"];
+    }
+  });
+
+  it("离谱读数被丢弃：2ms 与 60ms 都退回 16.7ms", async () => {
+    for (const interval of [2, 60]) {
+      const els = gridButtons(500);
+      const clock = new SampleClock();
+      const idle: (() => void)[] = [];
+      const app = createApp({
+        window: win,
+        isVisible: () => true,
+        frameClock: clock,
+        idleScheduler: (run) => idle.push(run),
+      });
+      const teardown = app.apply();
+      (idle[0] as () => void)();
+      await runSampleFrames(clock, interval);
+      expect({ interval, reads: firstSliceReads(clock, els) }).toEqual({ interval, reads: 2 });
+      teardown();
+      doc.body.replaceChildren();
+    }
+  });
+});
+
+describe("采集期键盘缓冲", () => {
+  it("采集在途时敲的标签首字母被缓冲，drain 后照常命中", async () => {
+    // 9 枚是一键标签；每读一个候选花 1ms，激活帧只够两枚，采集真的在途。
+    const els = gridButtons(9);
+    const clock = new SampleClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+    expect(app.labels()).toEqual([]);
+    expect(clock.pending).toBeGreaterThan(0);
+
+    const hits: string[] = [];
+    (els[0] as HTMLElement).addEventListener("click", () => hits.push("click"));
+    const stroke = keydown({ key: "a" });
+    win.dispatchEvent(stroke);
+
+    // 不能漏给宿主，也不能当场命中未完成的轮次。
+    expect(stroke.defaultPrevented).toBe(true);
+    expect(hits).toEqual([]);
+
+    await drain(app, clock);
+    expect(hits).toEqual(["click"]);
+    expect(overlayRoot()).toBeNull();
+    teardown();
+  });
+
+  it("采集期连敲超过缓冲上限不炸，收尾状态一致", async () => {
+    gridButtons(500);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+
+    let hits = 0;
+    for (const el of doc.querySelectorAll("button")) el.addEventListener("click", () => (hits += 1));
+    for (const key of ["s", "d", "f", "g", "h", "j", "a", "a", "a", "s"]) {
+      expect(() => win.dispatchEvent(keydown({ key }))).not.toThrow();
+    }
+
+    await expect(drain(app, clock)).resolves.toBeUndefined();
+    // 缓冲只留最近的击键：它们拼成一条完整标签并正常收尾，不会重复派发。
+    expect(hits).toBe(1);
+    expect(overlayRoot()).toBeNull();
+    expect(app.labels()).toEqual([]);
+    teardown();
+  });
+
+  it("pagehide 取消在途采集，恢复后不提交也不画徽章", async () => {
+    const els = gridButtons(500);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+    activate();
+    expect(clock.pending).toBeGreaterThan(0);
+
+    win.dispatchEvent(new dom.window.Event("pagehide"));
+    expect(clock.pending).toBe(0);
+    expect(overlayRoot()).toBeNull();
+    const before = reads.count();
+    for (let index = 0; index < 10; index += 1) clock.frame();
+
+    expect(reads.count()).toBe(before);
+    expect(app.labels()).toEqual([]);
+    expect(app.visibleLabels()).toEqual([]);
     teardown();
   });
 });

@@ -253,6 +253,15 @@ critical path of a stroke:
   its share of the frame is spent, so a 600-candidate page pays a small slice
   on the activation frame instead of the whole page. A slice is 12% of the
   measured display budget, clamped to 0.4-1.5ms.
+- The display budget is measured at runtime, not assumed. An idle callback
+  samples 24 animation frames (about 170ms at 143Hz, 400ms at 60Hz) and caches
+  the median, rounded up to 0.1ms. Until the sample lands the slice is computed
+  from a conservative 8ms budget, not the 60Hz fallback: a 143Hz panel must
+  never be handed a 16.7ms slice in the window where the sample is still
+  running. A hidden page starts no sample and a page hidden mid-sample abandons
+  it; a viewport resize drops the cached value and samples again, because an
+  external monitor can change the refresh rate; a median outside 4-40ms is
+  treated as unmeasurable and 16.7ms is used.
 - Stage B is pure array work. Sorting the candidates into reading order and
   assigning one label length for the whole round never reads layout or style,
   which is what keeps the last slice cheap even on a busy page.

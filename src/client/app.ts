@@ -19,7 +19,7 @@ import {
 import { createHintScan, type Hint, type HintScan } from "./hints.ts";
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
-import { DEFAULT_CONFIG, type JumpConfig } from "./config.ts";
+import { DEFAULT_CONFIG, HOME_ROW_KEYS, type JumpConfig } from "./config.ts";
 import { createOverlay, type FrameClock } from "./overlay.ts";
 import { activationOf, isTextEntry } from "./target.ts";
 import { isUserReachable } from "./reach.ts";
@@ -84,11 +84,19 @@ export interface AppDeps {
   /**
    * Display frame budget in ms, injected by a bench or a test.
    *
-   * A normal page leaves it unset and gets the value the embedding page
-   * publishes (the bench measures the display once and exposes it as
-   * `__DSH_JUMP_FRAME_BUDGET_MS__`), falling back to 60Hz.
+   * A normal page leaves it unset: the app samples its own display, and the
+   * embedding page may publish a measurement instead (the bench measures each
+   * tier and exposes it as `__DSH_JUMP_FRAME_BUDGET_MS__`). Either source
+   * outranks the sample and stops it from running.
    */
   frameBudgetMs?: number;
+  /**
+   * Starts the display sample outside the load path.
+   *
+   * Browsers get requestIdleCallback, or setTimeout(…, 0) where it is absent;
+   * tests inject a queue so the sample only begins when they release it.
+   */
+  idleScheduler?: (run: () => void) => void;
 }
 
 export interface JumpApp {
@@ -132,6 +140,34 @@ function defaultIsVisible(element: Element): boolean {
  * longer than the budget.
  */
 const FALLBACK_FRAME_BUDGET_MS = 16.7;
+/**
+ * Frames one display sample needs.
+ *
+ * The sample answers one question: how often does this display present? 24
+ * frames is about 170ms at 143Hz and 400ms at 60Hz, short enough that a reader
+ * who activates right after load usually gets the measured value, and long
+ * enough that the median outvotes a janky first frame. The previous sampler
+ * asked for 120 frames, which kept a page that never activates paying for two
+ * seconds of animation frames.
+ */
+const FRAME_BUDGET_SAMPLE_FRAMES = 24;
+/** A median below this is a timer or a burst, not a display cadence. */
+const MIN_SAMPLE_FRAME_BUDGET_MS = 4;
+/** A median above this is a throttled or backgrounded page. */
+const MAX_SAMPLE_FRAME_BUDGET_MS = 40;
+/**
+ * Frame budget assumed while the display cadence is still unknown.
+ *
+ * The sample takes a few hundred milliseconds, and a reader can activate
+ * inside that window. Falling back to 16.7ms there is the bug the sample exists
+ * to prevent: on a 143Hz panel it hands the walk twice the real frame, so the
+ * slice grows exactly when it must stay small. Assuming an 8ms display keeps
+ * the slice under 1ms, smaller than any 16.7ms-derived slice; a panel faster
+ * than 125Hz pays a slightly larger slice for that one round and gets the
+ * measured value as soon as the sample lands. A short slice only costs a few
+ * more animation frames, a long one costs dropped frames the reader sees.
+ */
+const CONSERVATIVE_FRAME_BUDGET_MS = Math.min(FALLBACK_FRAME_BUDGET_MS, 8);
 
 /**
  * Share of a display frame the collection walk may spend.
@@ -143,18 +179,144 @@ const FALLBACK_FRAME_BUDGET_MS = 16.7;
 const COLLECT_BUDGET_SHARE = 0.12;
 const COLLECT_BUDGET_MAX_MS = 1.5;
 const COLLECT_BUDGET_MIN_MS = 0.4;
+/**
+ * Home-row strokes kept while stage A is walking.
+ *
+ * Four is more than the three strokes even a three-key label needs and short
+ * enough that a burst of dead-end typing cannot turn into a backlog the reader
+ * never meant to send. Older strokes fall off first: the newest ones are the
+ * ones aimed at the labels about to appear.
+ */
+const BUFFERED_KEY_LIMIT = 4;
 
-/** The display cadence the bench publishes, or the 60Hz fallback. */
-function publishedFrameBudget(): number {
+/** The display cadence the embedding page publishes, or undefined. */
+function publishedFrameBudget(): number | undefined {
   const host = globalThis as typeof globalThis & { __DSH_JUMP_FRAME_BUDGET_MS__?: unknown };
   const value = host.__DSH_JUMP_FRAME_BUDGET_MS__;
-  return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? value
-    : FALLBACK_FRAME_BUDGET_MS;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 function collectBudgetMs(frameBudget: number): number {
   return Math.min(Math.max(frameBudget * COLLECT_BUDGET_SHARE, COLLECT_BUDGET_MIN_MS), COLLECT_BUDGET_MAX_MS);
+}
+
+function medianOf(values: readonly number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]
+    : ((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2;
+}
+
+/**
+ * One display sample, cancellable.
+ *
+ * The promise answers the budget to cache: a number is a decision (the rounded
+ * median, or the 60Hz fallback when the sample is unusable), while undefined
+ * means the sample was abandoned because the page went away, so the caller
+ * should try again later rather than cache anything.
+ */
+interface FrameBudgetSample {
+  done: Promise<number | undefined>;
+  cancel(): void;
+}
+
+/**
+ * Sample the display cadence across {@link FRAME_BUDGET_SAMPLE_FRAMES} frames.
+ *
+ * A hidden page or a cancelled sample resolves undefined: background tabs
+ * report seconds between frames, and that is not a cadence the panel ever had.
+ * A median outside 4-40ms is treated as the 60Hz fallback rather than trusted;
+ * a 2ms median is a burst of two callbacks in one vsync, and 60ms is a
+ * throttled timer. Never rejects: the caller needs a budget, not an error.
+ */
+function startFrameBudgetSample(clock: FrameClock, doc: Document): FrameBudgetSample {
+  const intervals: number[] = [];
+  let previous: number | undefined;
+  let frames = 0;
+  let handle: number | undefined;
+  let finished = false;
+  let resolve: (budgetMs: number | undefined) => void = () => undefined;
+  const done = new Promise<number | undefined>((accept) => {
+    resolve = accept;
+  });
+  const finish = (budgetMs: number | undefined): void => {
+    if (finished) return;
+    finished = true;
+    resolve(budgetMs);
+  };
+  const tick = (time: number): void => {
+    handle = undefined;
+    if (finished) return;
+    if (doc.hidden) {
+      finish(undefined);
+      return;
+    }
+    frames += 1;
+    if (previous !== undefined) {
+      const gap = time - previous;
+      if (Number.isFinite(gap) && gap > 0) intervals.push(gap);
+    }
+    previous = time;
+    if (frames >= FRAME_BUDGET_SAMPLE_FRAMES) {
+      const median = medianOf(intervals);
+      if (
+        median === undefined ||
+        median < MIN_SAMPLE_FRAME_BUDGET_MS ||
+        median > MAX_SAMPLE_FRAME_BUDGET_MS
+      ) {
+        finish(FALLBACK_FRAME_BUDGET_MS);
+        return;
+      }
+      // Round up so a 6.999ms cadence is not filed just under 7ms.
+      finish(Math.ceil(median * 10 - 1e-9) / 10);
+      return;
+    }
+    try {
+      handle = clock.request(tick);
+    } catch {
+      finish(FALLBACK_FRAME_BUDGET_MS);
+    }
+  };
+  try {
+    handle = clock.request(tick);
+  } catch {
+    finish(FALLBACK_FRAME_BUDGET_MS);
+  }
+  return {
+    done,
+    cancel: () => {
+      if (finished) return;
+      finished = true;
+      if (handle !== undefined) {
+        clock.cancel(handle);
+        handle = undefined;
+      }
+      resolve(undefined);
+    },
+  };
+}
+
+/**
+ * Run `run` when the page is idle.
+ *
+ * requestIdleCallback is the whole point: the sample burns one animation frame
+ * callback per tick, and starting it during load would put it in front of the
+ * work that makes the page usable. setTimeout(…, 0) is the fallback for hosts
+ * without the API, still a task after the current work rather than inline.
+ */
+function runWhenIdle(run: () => void): void {
+  const host = globalThis as typeof globalThis & {
+    requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+  };
+  if (typeof host.requestIdleCallback === "function") {
+    // The timeout keeps a permanently busy page from never sampling at all;
+    // one second is long enough that load work still goes first.
+    host.requestIdleCallback(() => run(), { timeout: 1000 });
+    return;
+  }
+  setTimeout(run, 0);
 }
 
 /** The browser's frame clock, or undefined where the host has no frames. */
@@ -322,24 +484,107 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       let hints: Hint[] = [];
       let roundOpen = false;
       const collectClock = deps.frameClock ?? defaultFrameClock(win.document);
-      const injectedBudget = deps.frameBudgetMs;
-      const budgetMs = collectBudgetMs(
-        typeof injectedBudget === "number" && Number.isFinite(injectedBudget) && injectedBudget > 0
-          ? injectedBudget
-          : publishedFrameBudget(),
-      );
+      const injectedBudget =
+        typeof deps.frameBudgetMs === "number" &&
+        Number.isFinite(deps.frameBudgetMs) &&
+        deps.frameBudgetMs > 0
+          ? deps.frameBudgetMs
+          : undefined;
+      const publishedBudget = publishedFrameBudget();
+      const scheduleIdle = deps.idleScheduler ?? runWhenIdle;
       /** The stage A walk still in flight, if any. */
       let collecting: CollectorRound | undefined;
+      /** Home-row strokes typed while stage A is still walking. */
+      let bufferedKeys: string[] = [];
+      /** Measured display cadence; absent until a sample lands. */
+      let measuredBudgetMs: number | undefined;
+      /** Viewport the cached measurement describes. */
+      let measuredViewport: { width: number; height: number } | undefined;
+      let sampling: FrameBudgetSample | undefined;
+
+      /**
+       * The frame budget an activation starting now should use.
+       *
+       * Precedence: the caller's value, the embedding page's published value,
+       * a completed sample, then the conservative budget while the sample is
+       * still in flight. A hidden page answers the 60Hz fallback: nothing can
+       * be painted there, and the sample is not allowed to run in the
+       * background where its gaps are throttled.
+       */
+      function currentFrameBudget(): number {
+        if (injectedBudget !== undefined) return injectedBudget;
+        if (publishedBudget !== undefined) return publishedBudget;
+        if (win.document.hidden) return FALLBACK_FRAME_BUDGET_MS;
+        const current = { width: win.innerWidth, height: win.innerHeight };
+        if (measuredBudgetMs !== undefined) {
+          if (measuredViewport === undefined || sameViewport(measuredViewport, current)) {
+            return measuredBudgetMs;
+          }
+          // The display may have changed under the same window (external
+          // monitor, refresh-rate switch); the old value still serves this
+          // round, and a fresh sample lands for the next one.
+          const stale = measuredBudgetMs;
+          resetSample();
+          sampleDisplay();
+          return stale;
+        }
+        if (collectClock === undefined) return FALLBACK_FRAME_BUDGET_MS;
+        return CONSERVATIVE_FRAME_BUDGET_MS;
+      }
+
+      function sameViewport(a: { width: number; height: number }, b: { width: number; height: number }): boolean {
+        return a.width === b.width && a.height === b.height;
+      }
+
+      /** Drop a cached or in-flight measurement so the next activation resamples. */
+      function resetSample(): void {
+        sampling?.cancel();
+        sampling = undefined;
+        measuredBudgetMs = undefined;
+        measuredViewport = undefined;
+      }
+
+      /**
+       * Ask for one display sample, lazily.
+       *
+       * Nothing runs inline: the request is queued to an idle callback so the
+       * load path keeps the page's own work first. Hidden pages skip it
+       * entirely, and a page that goes hidden mid-sample abandons the sample
+       * instead of caching throttled gaps.
+       */
+      function sampleDisplay(): void {
+        if (sampling !== undefined || measuredBudgetMs !== undefined) return;
+        if (injectedBudget !== undefined || publishedBudget !== undefined) return;
+        if (collectClock === undefined || win.document.hidden) return;
+        const clock = collectClock;
+        scheduleIdle(() => {
+          // The page can hide between queueing and the idle callback; the
+          // sample must not start on a background tab.
+          if (sampling !== undefined || measuredBudgetMs !== undefined) return;
+          if (win.document.hidden) return;
+          const sample = startFrameBudgetSample(clock, win.document);
+          sampling = sample;
+          void sample.done.then((budgetMs) => {
+            if (sampling !== sample) return;
+            sampling = undefined;
+            if (budgetMs === undefined) return;
+            measuredBudgetMs = budgetMs;
+            measuredViewport = { width: win.innerWidth, height: win.innerHeight };
+          });
+        });
+      }
 
       /**
        * Stop the in-flight stage A walk, if one exists.
        *
        * Every cancellation path goes through here: Esc, a completed label, the
-       * activation chord again, a hidden page and teardown. Resolving the
-       * round here is what keeps `settled()` from hanging on a walk that will
-       * never finish.
+       * activation chord again, a hidden page, pagehide and teardown. Resolving
+       * the round here is what keeps `settled()` from hanging on a walk that
+       * will never finish. Buffered strokes belong to the walk being cancelled,
+       * so they are dropped rather than replayed against another round.
        */
       function cancelCollection(): void {
+        bufferedKeys = [];
         const round = collecting;
         if (round === undefined) return;
         collecting = undefined;
@@ -362,9 +607,18 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         const next = round.scan.finish();
         hints = next;
         const render = overlay.renderProgressive(next, "");
+        // Strokes typed while the walk was in flight were swallowed to keep
+        // them away from the host; they come back here, in order, against the
+        // labels they were aimed at.
+        const pending = replayBuffered();
+        if (pending === null) {
+          round.resolve();
+          return;
+        }
+        if (pending !== "") overlay.render(hints, pending);
         // A synchronous paint is the common case: resolve in this frame so a
         // caller awaiting `settled()` after activation does not need a turn.
-        if (overlay.visibleLabels().length >= next.length) {
+        if (overlay.visibleLabels().length >= hints.length) {
           round.resolve();
           return;
         }
@@ -378,7 +632,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         round.handle = frameClock.request(() => {
           round.handle = undefined;
           if (round.cancelled || collecting !== round) return;
-          if (!round.scan.advance(budgetMs, () => frameClock.now())) {
+          if (!round.scan.advance(collectBudgetMs(currentFrameBudget()), () => frameClock.now())) {
             scheduleCollection(round);
             return;
           }
@@ -420,7 +674,7 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           commitCollection(round);
           return hints;
         }
-        if (scan.advance(budgetMs, () => collectClock.now())) {
+        if (scan.advance(collectBudgetMs(currentFrameBudget()), () => collectClock.now())) {
           collecting = undefined;
           commitCollection(round);
           return hints;
@@ -439,6 +693,84 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         roundOpen = false;
         onRound("end");
       };
+
+      /**
+       * End the round on a completed label and act on its target.
+       *
+       * matchKey already cleared the prefix, so the full typed label is the
+       * pre-stroke prefix plus key. No repaint of the empty prefix happens on
+       * the way out: the badges go with the overlay in the same stroke.
+       */
+      function completeLabel(typed: string): void {
+        const hit = hints.find((hint) => hint.label === typed);
+        hints = [];
+        cancelCollection();
+        overlay.destroy();
+        closeRound();
+        const mode = state.mode;
+        state.mode = "idle";
+        if (hit === undefined) return;
+        const cx = hit.rect.x + hit.rect.w / 2;
+        const cy = hit.rect.y + hit.rect.h / 2;
+        // Which action a target needs is a property of the target, not of the
+        // mode the user pressed: a text entry surface has no click semantics
+        // (synthetic pointer events are untrusted, so the browser performs no
+        // focusing default action for them — measured across button, input and
+        // contenteditable, all three left activeElement unchanged), while a
+        // button has no focus semantics (focusing it runs nothing). Mode then
+        // only decides the fallback for targets that do not care.
+        // Reference mode is checked before the target's own activation: it is
+        // the one mode whose whole point is to leave the page alone, so neither
+        // the click sequence nor the focus path may run for it.
+        if (mode === "reference") {
+          deps.onReference?.(hit.element);
+          return;
+        }
+        const activation = activationOf(hit.element);
+        if (activation === "focus") {
+          focusTextEntry(hit.element, win.document);
+        } else if (mode === "click") {
+          fireClickSequence(hit.element, cx, cy);
+        } else {
+          const el = hit.element as HTMLElement;
+          // A widget with no focus method (a leaf div) simply no-ops.
+          if (typeof el.focus === "function") el.focus();
+        }
+      }
+
+      /**
+       * Replay the strokes buffered during stage A.
+       *
+       * The first dead end stops the replay, the same as normal typing: a
+       * prefix that no label can extend clears itself, and keys after it were
+       * aimed at a round the reader never saw. Returns the live prefix, or null
+       * when a label completed and the round is already closed.
+       */
+      function replayBuffered(): string | null {
+        const keys = bufferedKeys;
+        bufferedKeys = [];
+        for (const key of keys) {
+          const before = state.pending;
+          const action = matchKey(
+            state,
+            { key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, isComposing: false },
+            hints.map((hint) => hint.label),
+            bindings.get(),
+          );
+          if (action.type !== "label") return state.pending;
+          if (state.pending !== "") continue;
+          completeLabel(before + action.key);
+          return null;
+        }
+        return state.pending;
+      }
+
+      /** Whether a stroke is a label character that must not reach the host. */
+      function bufferableStroke(event: KeyboardEvent): boolean {
+        if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.isComposing) return false;
+        if (event.key === "Escape") return false;
+        return (HOME_ROW_KEYS as readonly string[]).includes(event.key);
+      }
 
       const onKeyDown = (raw: Event): void => {
         const event = raw as KeyboardEvent;
@@ -460,6 +792,18 @@ export function createApp(deps: AppDeps = {}): JumpApp {
             matchesBinding(event, reachable.reference) &&
             !firesInTextEntry(reachable.reference));
         if (state.mode === "idle" && bareMatch && isTextEntry(win.document.activeElement)) return;
+
+        // Stage A is walking and the round has no labels yet, so matchKey
+        // would rule every home-row stroke a dead end while the listener still
+        // eats it. Hold the stroke instead, and replay it against the finished
+        // label set: the reader's typing must land somewhere, not vanish.
+        if (state.mode !== "idle" && collecting !== undefined && bufferableStroke(event)) {
+          bufferedKeys.push(event.key);
+          if (bufferedKeys.length > BUFFERED_KEY_LIMIT) bufferedKeys.shift();
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
 
         const before = state.pending;
         const like: KeyEventLike = {
@@ -509,72 +853,63 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           }
           return;
         }
-        // A completed label ends the round: matchKey already cleared the
-        // prefix, so the full typed label is the pre-stroke prefix plus key.
-        // No repaint of the now-empty prefix happens on the way out: the badges
-        // are removed with the overlay in the same stroke, so rewriting the
-        // whole round would only produce work the reader never sees.
-        const typed = before + action.key;
-        const hit = hints.find((hint) => hint.label === typed);
-        hints = [];
-        cancelCollection();
-        overlay.destroy();
-        closeRound();
-        const mode = state.mode;
-        state.mode = "idle";
-        if (hit === undefined) return;
-        const cx = hit.rect.x + hit.rect.w / 2;
-        const cy = hit.rect.y + hit.rect.h / 2;
-        // Which action a target needs is a property of the target, not of the
-        // mode the user pressed: a text entry surface has no click semantics
-        // (synthetic pointer events are untrusted, so the browser performs no
-        // focusing default action for them — measured across button, input and
-        // contenteditable, all three left activeElement unchanged), while a
-        // button has no focus semantics (focusing it runs nothing). Mode then
-        // only decides the fallback for targets that do not care.
-        // Reference mode is checked before the target's own activation: it is
-        // the one mode whose whole point is to leave the page alone, so neither
-        // the click sequence nor the focus path may run for it.
-        if (mode === "reference") {
-          deps.onReference?.(hit.element);
-          return;
-        }
-        const activation = activationOf(hit.element);
-        if (activation === "focus") {
-          focusTextEntry(hit.element, win.document);
-        } else if (mode === "click") {
-          fireClickSequence(hit.element, cx, cy);
-        } else {
-          const el = hit.element as HTMLElement;
-          // A widget with no focus method (a leaf div) simply no-ops.
-          if (typeof el.focus === "function") el.focus();
-        }
+        completeLabel(before + action.key);
       };
 
-      // 切到别的应用时这一轮不再有人敲标签，但输入法是全系统的，英文会跟过去。
-      // 隐藏即结束，比等一分钟的兜底更早把输入源还回去。
-      const onVisibility = (): void => {
-        if (win.document.visibilityState !== "hidden") return;
+      /** Drop the live round and give the input source back. */
+      function endRound(): void {
         hints = [];
         cancelCollection();
         overlay.destroy();
         state.mode = "idle";
         state.pending = "";
         closeRound();
+      }
+
+      // 切到别的应用时这一轮不再有人敲标签，但输入法是全系统的，英文会跟过去。
+      // 隐藏即结束，比等一分钟的兜底更早把输入源还回去。
+      const onVisibility = (): void => {
+        if (win.document.visibilityState === "hidden") {
+          endRound();
+          return;
+        }
+        // A page that loaded hidden or was hidden before its sample landed
+        // gets another lazy attempt now that frames are real again.
+        sampleDisplay();
       };
-      // 刷新或关掉页面时插件的卸载函数不会跑。pagehide 是这一轮还能发出 end 的最后时机。
-      const onPageHide = (): void => closeRound();
+      // 刷新或关掉页面时插件的卸载函数不会跑。pagehide 是这一轮还能发出 end
+      // 的最后时机，也是唯一能停下在途采集的地方：bfcache 恢复后不能再来一次
+      // "end" 之后的 commit。
+      const onPageHide = (): void => {
+        endRound();
+        sampling?.cancel();
+        sampling = undefined;
+      };
+      // A refresh-rate change under the same window is announced as a resize;
+      // drop the cached cadence and take a new lazy sample.
+      const onResize = (): void => {
+        if (injectedBudget !== undefined || publishedBudget !== undefined) return;
+        const current = { width: win.innerWidth, height: win.innerHeight };
+        if (measuredViewport !== undefined && sameViewport(measuredViewport, current)) return;
+        if (sampling === undefined && measuredBudgetMs === undefined) return;
+        resetSample();
+        sampleDisplay();
+      };
       win.addEventListener("keydown", onKeyDown, { capture: true });
       win.document.addEventListener("visibilitychange", onVisibility);
       win.addEventListener("pagehide", onPageHide);
+      win.addEventListener("resize", onResize);
+      // Loading the page is the one moment the sample must not compete with:
+      // queue it behind the host's own work.
+      sampleDisplay();
       return () => {
         win.removeEventListener("keydown", onKeyDown, { capture: true });
         win.document.removeEventListener("visibilitychange", onVisibility);
         win.removeEventListener("pagehide", onPageHide);
-        cancelCollection();
-        overlay.destroy();
-        hints = [];
-        closeRound();
+        win.removeEventListener("resize", onResize);
+        sampling?.cancel();
+        sampling = undefined;
+        endRound();
       };
     },
   };
