@@ -47,6 +47,9 @@ function activate(): void {
 
 beforeEach(() => {
   doc.body.replaceChildren();
+  // 浮层挂在 documentElement 上，body 清空带不走它；上一轮漏下的容器会让
+  // overlayRoot() 找到错误的节点。
+  doc.querySelector("[data-dsh-jump-overlay]")?.remove();
   (doc.activeElement as HTMLElement | null)?.blur?.();
 });
 
@@ -295,6 +298,134 @@ describe("badge segments in a multi-key round", () => {
     expect(parts("ad")).toEqual([["whole", "ad"]]);
     expect(parts("sd")).toEqual([["whole", "sd"]]);
     expect(badge("sd").style.opacity).toBe("1");
+  });
+});
+
+describe("a completing stroke tears the round down without repainting it", () => {
+  // 断言先失败时也要摘掉监听器，否则漏掉的 app 会接管后续用例的按键。
+  let stop: (() => void) | undefined;
+  let watcher: MutationObserver | undefined;
+  afterEach(() => {
+    watcher?.disconnect();
+    watcher = undefined;
+    stop?.();
+    stop = undefined;
+  });
+
+  function mount(): void {
+    stop = createApp({ window: win, isVisible: () => true }).apply();
+  }
+
+  /** 当前轮里某个 label 的徽章。 */
+  function badge(label: string): HTMLElement {
+    const root = overlayRoot();
+    const found = [...(root?.children ?? [])].find(
+      (child) => (child as HTMLElement).dataset.jumpLabel === label,
+    );
+    expect(found).toBeDefined();
+    return found as HTMLElement;
+  }
+
+  /** 徽章分出的文字段，按 [段名, 文本] 列出。 */
+  function parts(label: string): [string | undefined, string | null][] {
+    return [...badge(label).children].map((part) => [
+      (part as HTMLElement).dataset.jumpPart,
+      part.textContent,
+    ]);
+  }
+
+  /**
+   * 观察浮层容器子树的 DOM 变更。
+   *
+   * 命中完成的那一击里，徽章马上要随容器一起消失，任何 opacity 或
+   * replaceChildren 都是白画。MutationObserver 记下的正是这批白画的写操作，
+   * 因此「这一击有没有整轮重绘」是可观察工作量，不靠 overlay 的内部状态。
+   */
+  function watchBadges(): () => MutationRecord[] {
+    const root = overlayRoot();
+    if (root === null) throw new Error("浮层不存在，无法观察");
+    const observer = new dom.window.MutationObserver(() => undefined);
+    observer.observe(root, { subtree: true, childList: true, attributes: true });
+    watcher = observer;
+    return () => observer.takeRecords();
+  }
+
+  /** 目标收到的完整 pointer/mouse/click 序列，按到达顺序追加。 */
+  function hitSequence(target: HTMLElement): string[] {
+    const seen: string[] = [];
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      target.addEventListener(type, () => seen.push(type));
+    }
+    return seen;
+  }
+
+  it("two-key label: first stroke splits the badge, second stroke clicks with no badge write", () => {
+    const els = buttons(12);
+    mount();
+    activate();
+
+    // 12 个候选超过单键容量，整轮是双键标签；第二个按钮的标签为 ad。
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(parts("ad")).toEqual([
+      ["typed", "a"],
+      ["rest", "d"],
+    ]);
+    expect(badge("sd").style.opacity).toBe("0.3");
+
+    const target = els[1] as HTMLElement;
+    const seen = hitSequence(target);
+    const drain = watchBadges();
+
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    expect(drain()).toEqual([]);
+    expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
+    expect(overlayRoot()).toBeNull();
+  });
+
+  it("single-key label: the hit stroke clicks and closes with no badge write", () => {
+    const els = buttons(2);
+    mount();
+    activate();
+
+    const target = els[0] as HTMLElement;
+    const seen = hitSequence(target);
+    const drain = watchBadges();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+
+    expect(drain()).toEqual([]);
+    expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
+    expect(overlayRoot()).toBeNull();
+  });
+
+  it("three-key label: every prefix stroke repaints the split, the completing stroke only closes", () => {
+    // 82 个候选超过双键容量（81），整轮升到三键；前两个按钮的标签是 asa、asd。
+    const els = buttons(82);
+    mount();
+    activate();
+
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(parts("asd")).toEqual([
+      ["typed", "a"],
+      ["rest", "sd"],
+    ]);
+
+    win.dispatchEvent(keydown({ key: "s" }));
+    expect(parts("asd")).toEqual([
+      ["typed", "as"],
+      ["rest", "d"],
+    ]);
+
+    const target = els[1] as HTMLElement;
+    const seen = hitSequence(target);
+    const drain = watchBadges();
+
+    win.dispatchEvent(keydown({ key: "d" }));
+
+    expect(drain()).toEqual([]);
+    expect(seen).toEqual(["pointerdown", "mousedown", "pointerup", "mouseup", "click"]);
+    expect(overlayRoot()).toBeNull();
   });
 });
 

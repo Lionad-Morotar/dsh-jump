@@ -306,14 +306,19 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           closeRound();
           return;
         }
-        if (state.pending !== before) {
-          // The prefix changed (extended, or reset by a dead-end key), so
-          // the lit/dim split must mirror the live prefix again.
-          overlay.render(hints, state.pending);
+        if (state.pending !== "") {
+          if (state.pending !== before) {
+            // The stroke extended the prefix, so the lit/dim split must mirror
+            // the live prefix again.
+            overlay.render(hints, state.pending);
+          }
+          return;
         }
-        if (state.pending !== "") return;
         // A completed label ends the round: matchKey already cleared the
         // prefix, so the full typed label is the pre-stroke prefix plus key.
+        // No repaint of the now-empty prefix happens on the way out: the badges
+        // are removed with the overlay in the same stroke, so rewriting the
+        // whole round would only produce work the reader never sees.
         const typed = before + action.key;
         const hit = hints.find((hint) => hint.label === typed);
         hints = [];
