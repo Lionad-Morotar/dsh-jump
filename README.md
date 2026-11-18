@@ -16,7 +16,7 @@ focused.
 
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
-[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [How labels are assigned](#how-labels-are-assigned) · [Performance](#performance-on-a-busy-page) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
+[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [How labels are assigned](#how-labels-are-assigned) · [Performance](#performance-on-a-busy-page) · [Frame budget bench](#frame-budget-bench) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
 ## Install
 
@@ -267,6 +267,41 @@ In-place updating leans on the snapshot rule in
 opens, so only the prefix can change inside a round. A new round mints new
 badges, which is what stops a label from staying over a target that has moved
 since.
+
+## Frame budget bench
+
+`bench/measure.mjs` turns the cost of one activation and of every label stroke
+into a repeatable number that two runs can be diffed against. It bundles
+`src/client/app.ts` with the repo's own esbuild into one browser IIFE, writes a
+self-contained measurement page to the system temp directory, and prints the
+path:
+
+```sh
+node bench/measure.mjs                              # or: pnpm bench
+node bench/measure.mjs --candidates 80,300,600,1200 --runs 20
+node bench/measure.mjs --out temp/bench.html        # keep the page somewhere
+node bench/measure.mjs --check                      # CI-safe self-check, no browser
+```
+
+Open the printed page in a real browser and leave it in the foreground. For
+each candidate tier it lays out a viewport-filling grid of visible buttons,
+then times 20 activations, 20 first label strokes and one label completion.
+The JSON is printed at the bottom of the page and kept on
+`window.__BENCH_RESULT__`; copy it from there.
+
+A tier reports `candidates`, `labels` (badges actually painted) and
+`overlayCount`, which must stay `1`; a second runtime would show up as a second
+overlay and its cost would contaminate the reading. Each phase carries both
+metrics as nearest-rank `p50`/`p95`: `handlerMs` is the synchronous
+`dispatchEvent` cost, `nextFrameMs` is the gap from dispatch return to the
+second animation frame so style and layout land before the reading. The
+phase-level `p50`/`p95` mirror `handlerMs`. Percentiles use the nearest rank,
+not interpolation, so any reading can be recomputed from the samples by hand.
+
+`--check` needs no browser: it bundles the app, asserts the generated page
+still carries every measurement hook, exercises the same percentile
+implementation with fixed inputs, and fails if the page or the script can reach
+the network.
 
 ## v1 boundaries
 
