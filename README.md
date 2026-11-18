@@ -278,30 +278,46 @@ path:
 
 ```sh
 node bench/measure.mjs                              # or: pnpm bench
-node bench/measure.mjs --candidates 80,300,600,1200 --runs 20
+node bench/measure.mjs --candidates 80,300,600,1200 --runs 60
+node bench/measure.mjs --runs 60 --warmup 10 --label before
 node bench/measure.mjs --out temp/bench.html        # keep the page somewhere
 node bench/measure.mjs --check                      # CI-safe self-check, no browser
 ```
 
 Open the printed page in a real browser and leave it in the foreground. For
 each candidate tier it lays out a viewport-filling grid of visible buttons,
-then times 20 activations, 20 first label strokes and one label completion.
-The JSON is printed at the bottom of the page and kept on
-`window.__BENCH_RESULT__`; copy it from there.
+then runs `min(10, runs)` full activate → first stroke → Esc cycles and
+discards their readings before timing `runs` activations, `runs` first label
+strokes and one label completion. Warmup is required: without it the first
+tier pays JIT compilation, first layout and GC warmup and reports a cold start
+as a tier cost, so `--warmup <n>` only tunes the count. The JSON is printed at
+the bottom of the page and kept on `window.__BENCH_RESULT__`; copy it from
+there. `--label <name>` fills the top-level `label`, and the result carries a
+top-level `protocol` with `runs`, `warmup`,
+`percentileMethod: "nearest-rank"` and a note that readings are sensitive to
+system load.
 
-A tier reports `candidates`, `labels` (badges actually painted) and
-`overlayCount`, which must stay `1`; a second runtime would show up as a second
-overlay and its cost would contaminate the reading. Each phase carries both
-metrics as nearest-rank `p50`/`p95`: `handlerMs` is the synchronous
-`dispatchEvent` cost, `nextFrameMs` is the gap from dispatch return to the
-second animation frame so style and layout land before the reading. The
-phase-level `p50`/`p95` mirror `handlerMs`. Percentiles use the nearest rank,
-not interpolation, so any reading can be recomputed from the samples by hand.
+Treat p95 from fewer than 50 samples as a reference only: at 19 or fewer
+samples nearest-rank p95 is literally the maximum, and the bench prints a
+样本偏少 warning below 20. Compare two runs on the same machine in the same
+period, alternating between the two sources, because machine load between page
+loads is part of the reading.
+
+A tier reports `candidates`, `labels` (badges actually painted), `warmup`
+(cycles discarded before sampling) and `overlayCount`, which must stay `1`; a
+second runtime would show up as a second overlay and its cost would contaminate
+the reading. Each phase carries both metrics as nearest-rank `p50`/`p95`:
+`handlerMs` is the synchronous `dispatchEvent` cost, `nextFrameMs` is the gap
+from dispatch return to the second animation frame so style and layout land
+before the reading. The phase-level `p50`/`p95` mirror `handlerMs`. Percentiles
+use the nearest rank, not interpolation, so any reading can be recomputed from
+the samples by hand.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
-still carries every measurement hook, exercises the same percentile
-implementation with fixed inputs, and fails if the page or the script can reach
-the network.
+still carries every measurement hook and the warmup/label/protocol
+configuration, exercises the same percentile implementation with fixed inputs,
+checks that `--runs 1` is accepted while its p95 is warned as an invalid
+sample, and fails if the page or the script can reach the network.
 
 ## v1 boundaries
 

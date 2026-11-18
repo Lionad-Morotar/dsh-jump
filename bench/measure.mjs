@@ -26,6 +26,16 @@ const OUTPUT_DIR = join(tmpdir(), "dsh-jump-bench");
 
 export const DEFAULT_CANDIDATES = [80, 300, 600];
 export const DEFAULT_RUNS = 20;
+export const DEFAULT_WARMUP_CAP = 10;
+
+/**
+ * Below this many samples nearest-rank p95 is literally the maximum, so the
+ * reading says nothing about the tail and must not be compared across runs.
+ */
+export const MIN_RELIABLE_RUNS = 20;
+
+/** The sample count the README points readers at when they plan a comparison. */
+export const RECOMMENDED_RUNS = 50;
 
 /**
  * Nearest-rank percentile, deliberately not interpolated.
@@ -78,8 +88,49 @@ function parseRuns(raw) {
   return value;
 }
 
+function parseWarmup(raw) {
+  if (!/^\d+$/.test(raw)) throw new Error(`--warmup expects a non-negative integer, got "${raw}"`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1000) {
+    throw new Error(`--warmup must be an integer within 0..1000, got "${raw}"`);
+  }
+  return value;
+}
+
+function parseLabel(raw) {
+  if (raw.trim() === "") throw new Error("--label expects a non-empty name");
+  return raw;
+}
+
+/**
+ * Warmup defaults to ten cycles but never more than the sample count: a tier
+ * with three samples should not spend three times as long getting warm as it
+ * spends measuring. An explicit `--warmup 0` stays an escape hatch for
+ * debugging the bench itself, and the protocol block records the zero.
+ */
+export function resolveWarmup(runs, warmup) {
+  if (warmup === null || warmup === undefined) return Math.min(DEFAULT_WARMUP_CAP, runs);
+  return warmup;
+}
+
+export function sampleFloorWarning(runs) {
+  if (runs >= MIN_RELIABLE_RUNS) return null;
+  return (
+    `dsh-jump bench: 样本偏少：--runs ${runs} 时 nearest-rank p95 会等于最大值，读数只能作参考；` +
+    `建议 --runs ${RECOMMENDED_RUNS} 及以上再做跨运行比较。`
+  );
+}
+
 export function parseArgs(argv) {
-  const options = { check: false, help: false, candidates: DEFAULT_CANDIDATES, runs: DEFAULT_RUNS, out: null };
+  const options = {
+    check: false,
+    help: false,
+    candidates: DEFAULT_CANDIDATES,
+    runs: DEFAULT_RUNS,
+    warmup: null,
+    label: null,
+    out: null,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--check") {
@@ -90,12 +141,14 @@ export function parseArgs(argv) {
       options.help = true;
       continue;
     }
-    if (flag === "--candidates" || flag === "--runs" || flag === "--out") {
+    if (flag === "--candidates" || flag === "--runs" || flag === "--warmup" || flag === "--label" || flag === "--out") {
       const value = argv[index + 1];
       if (value === undefined || value === "") throw new Error(`${flag} needs a value`);
       index += 1;
       if (flag === "--candidates") options.candidates = parseCandidates(value);
       else if (flag === "--runs") options.runs = parseRuns(value);
+      else if (flag === "--warmup") options.warmup = parseWarmup(value);
+      else if (flag === "--label") options.label = parseLabel(value);
       else options.out = value;
       continue;
     }
@@ -148,9 +201,12 @@ export async function bundleApp() {
  * incomparable.
  */
 function pageScript(config) {
+  // A label is free text from the command line; escaping `<` keeps it from
+  // closing the inline script tag, and `\u003c` still decodes to `<` in JS.
+  const serializedConfig = JSON.stringify(config).replace(/</g, "\\u003c");
   return `(() => {
   "use strict";
-  const CONFIG = ${JSON.stringify(config)};
+  const CONFIG = ${serializedConfig};
   const nearestRankPercentile = ${nearestRankPercentile.toString()};
   const root = document.querySelector("[data-bench-root]");
   const status = document.querySelector("[data-bench-status]");
@@ -251,6 +307,21 @@ function pageScript(config) {
     buildGrid(candidates);
     await settle(2);
 
+    // Every tier gets its own cold start: a new grid invalidates layout, the
+    // first round pays JIT and the first label mint pays allocation. Those
+    // cycles run the exact measured shape so the warm path is the same path.
+    let warmed = 0;
+    for (let index = 0; index < CONFIG.warmup; index += 1) {
+      await stroke("h", { metaKey: true });
+      const warmBadges = badgeLabels();
+      const warmFirst = warmBadges[0];
+      if (warmFirst === undefined || warmFirst === "") throw new Error("warmup activation produced no label");
+      await stroke(warmFirst.slice(0, 1));
+      exitRound();
+      await settle(1);
+      warmed += 1;
+    }
+
     const activate = [];
     const firstStroke = [];
     let labels = 0;
@@ -285,6 +356,7 @@ function pageScript(config) {
       candidates: candidates,
       labels: labels,
       overlayCount: overlays,
+      warmup: warmed,
       activate: phase(activate),
       firstStroke: phase(firstStroke),
       complete: phase([complete]),
@@ -303,6 +375,13 @@ function pageScript(config) {
     const result = {
       viewport: [window.innerWidth, window.innerHeight],
       dpr: window.devicePixelRatio || 1,
+      label: CONFIG.label,
+      protocol: {
+        runs: CONFIG.runs,
+        warmup: CONFIG.warmup,
+        percentileMethod: "nearest-rank",
+        note: "Readings are sensitive to system load: compare runs on the same machine in the same period, alternating between sources.",
+      },
       runs: runs,
     };
     window.__BENCH_RESULT__ = result;
@@ -325,8 +404,8 @@ function pageScript(config) {
 })();`;
 }
 
-export function pageHtml({ bundle, candidates, runs }) {
-  const config = { candidates, runs };
+export function pageHtml({ bundle, candidates, runs, warmup, label }) {
+  const config = { candidates, runs, warmup, label };
   const inlined = bundle.replace(/<\/script/gi, "<\\/script");
   return `<!doctype html>
 <html lang="en">
@@ -440,6 +519,9 @@ const REQUIRED_HOOKS = [
   "nearestRankPercentile",
   "firstStroke",
   "complete",
+  "warmup",
+  "protocol",
+  "percentileMethod",
 ];
 
 function assertPercentileCases() {
@@ -462,6 +544,34 @@ function assertPercentileCases() {
       );
     }
   }
+}
+
+function assertRunsBoundary() {
+  const single = parseArgs(["--runs", "1"]);
+  if (single.runs !== 1) throw new Error(`--runs 1 should be accepted, got ${String(single.runs)}`);
+  if (resolveWarmup(single.runs, single.warmup) !== 1) {
+    throw new Error("--runs 1 should default warmup to min(10, runs), which is 1");
+  }
+  const warning = sampleFloorWarning(single.runs);
+  if (warning === null || !warning.includes("样本偏少")) {
+    throw new Error("--runs 1 must warn that its p95 is not a valid sample");
+  }
+  if (sampleFloorWarning(MIN_RELIABLE_RUNS) !== null) {
+    throw new Error(`${MIN_RELIABLE_RUNS} runs should sit above the warning floor`);
+  }
+  for (const raw of ["0", "-1", "1.5", "abc", ""]) {
+    let rejected = false;
+    try {
+      parseRuns(raw);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error(`--runs "${raw}" should be rejected`);
+  }
+  const custom = parseArgs(["--runs", "10", "--warmup", "3", "--label", "smoke"]);
+  if (custom.warmup !== 3) throw new Error("--warmup 3 should override the default");
+  if (custom.label !== "smoke") throw new Error("--label smoke should reach the output");
+  if (parseArgs([]).label !== null) throw new Error("label should default to null");
 }
 
 function assertOfflineSource(source) {
@@ -493,17 +603,33 @@ export async function check() {
   if (!bundle.includes("createApp")) throw new Error("bundle does not export createApp");
   console.log(`check bundle: ok (${bundle.length} bytes)`);
 
-  const html = pageHtml({ bundle, candidates: DEFAULT_CANDIDATES, runs: DEFAULT_RUNS });
+  const defaultWarmup = resolveWarmup(DEFAULT_RUNS, null);
+  const html = pageHtml({
+    bundle,
+    candidates: DEFAULT_CANDIDATES,
+    runs: DEFAULT_RUNS,
+    warmup: defaultWarmup,
+    label: null,
+  });
   for (const hook of REQUIRED_HOOKS) {
     if (!html.includes(hook)) throw new Error(`generated page is missing the "${hook}" hook`);
   }
-  if (!html.includes(JSON.stringify(DEFAULT_CANDIDATES)) || !html.includes(`"runs":${DEFAULT_RUNS}`)) {
-    throw new Error("generated page lost its candidate/run configuration");
+  if (
+    !html.includes(JSON.stringify(DEFAULT_CANDIDATES)) ||
+    !html.includes(`"runs":${DEFAULT_RUNS}`) ||
+    !html.includes(`"warmup":${defaultWarmup}`) ||
+    !html.includes('"label":null') ||
+    !html.includes('"nearest-rank"')
+  ) {
+    throw new Error("generated page lost its candidate/run/warmup/label/protocol configuration");
   }
   console.log("check html hooks: ok");
 
   assertPercentileCases();
   console.log("check percentile: ok (9 cases, nearest rank)");
+
+  assertRunsBoundary();
+  console.log("check runs boundary: ok (--runs 1 accepted, p95 warned below the floor)");
 
   assertNoNetworkApis(html, "generated page");
   assertNoNetworkApis(bundle, "bundle");
@@ -520,8 +646,12 @@ function printHelp() {
   node bench/measure.mjs                     generate the page, print its path
   node bench/measure.mjs --check             deterministic self-check, no browser
   node bench/measure.mjs --candidates 80,300,600,1200
-  node bench/measure.mjs --runs 20
+  node bench/measure.mjs --runs 60 --warmup 10 --label before
   node bench/measure.mjs --out temp/bench.html
+
+Every tier discards min(10, runs) warmup cycles before sampling; --warmup
+overrides that count. --label is copied into the JSON so two sources measured
+under one protocol can be told apart.
 
 Measurements are taken by opening the generated page in a real browser; the
 page prints its JSON into window.__BENCH_RESULT__ and into the page itself.`);
@@ -538,8 +668,18 @@ async function main() {
     return;
   }
 
+  const warning = sampleFloorWarning(options.runs);
+  if (warning !== null) console.error(warning);
+
+  const warmup = resolveWarmup(options.runs, options.warmup);
   const bundle = await bundleApp();
-  const html = pageHtml({ bundle, candidates: options.candidates, runs: options.runs });
+  const html = pageHtml({
+    bundle,
+    candidates: options.candidates,
+    runs: options.runs,
+    warmup,
+    label: options.label,
+  });
   const paths = await writeArtifacts({ bundle, html, out: options.out });
 
   const driver = await detectBrowserDriver();
