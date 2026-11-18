@@ -31,6 +31,13 @@ export interface CollectDeps {
    * element across activations.
    */
   memory?: LabelMemory;
+  /**
+   * The identity oracle of one round, defaulting to `identityKey`. The seam
+   * lets a caller replace or count the walk without changing what a key means;
+   * collectHints reads each candidate through it once and spends that value on
+   * both recall and the write-back.
+   */
+  identity?: (element: Element) => string;
 }
 
 /**
@@ -175,9 +182,20 @@ export function collectHints(
   const deepest = kept.filter(({ element }) => !wrappers.has(element));
   const ordered = visualOrder(deepest);
   const keys = keysPerLabel(ordered.length);
-  const recalled = deps.memory === undefined
+  const memory = deps.memory;
+  const identity = deps.identity ?? identityKey;
+  // One key per candidate for the whole round: recall groups by it and the
+  // write-back needs the same value, while each computation walks the ancestor
+  // chain and normalises the text, which a page with a thousand candidates
+  // cannot afford to repeat. Without a memory neither path reads a key, so the
+  // round pays nothing for one.
+  const identityKeys = new Map<Element, string>();
+  if (memory !== undefined) {
+    for (const { element } of ordered) identityKeys.set(element, identity(element));
+  }
+  const recalled = memory === undefined
     ? new Map<Element, string>()
-    : recallLabels(deps.memory, ordered.map((entry) => entry.element), keys);
+    : recallLabels(memory, ordered.map((entry) => entry.element), keys, identityKeys);
   const taken = new Set(recalled.values());
   const labels = generateLabels(keys);
   const hints = ordered.map((entry) => {
@@ -191,8 +209,8 @@ export function collectHints(
       return { element: entry.element, label: next.value, rect: entry.rect };
     }
   });
-  if (deps.memory !== undefined) {
-    for (const hint of hints) deps.memory.record(identityKey(hint.element), hint.label);
+  if (memory !== undefined) {
+    for (const hint of hints) memory.record(identityKeys.get(hint.element) ?? "", hint.label);
   }
   return hints;
 }

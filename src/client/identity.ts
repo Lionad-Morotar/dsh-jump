@@ -134,19 +134,28 @@ export function recallLabels(
   memory: LabelMemory,
   candidates: readonly Element[],
   labelLength: number,
+  /**
+   * Identities the caller already computed for `candidates`, so a round that
+   * also writes the memory does not walk the same elements twice. A candidate
+   * the map does not name counts as keyless rather than as a reason to read
+   * the element again.
+   */
+  keys?: ReadonlyMap<Element, string>,
 ): Map<Element, string> {
+  const keyOf = (element: Element): string =>
+    keys === undefined ? identityKey(element) : (keys.get(element) ?? "");
   const byKey = new Map<string, Element[]>();
   for (const element of candidates) {
-    const key = identityKey(element);
+    const key = keyOf(element);
     if (key === "") continue;
     const group = byKey.get(key);
     if (group === undefined) byKey.set(key, [element]);
     else group.push(element);
   }
   const claims: { element: Element; label: string }[] = [];
-  for (const group of byKey.values()) {
+  for (const [key, group] of byKey) {
     if (group.length !== 1) continue;
-    const label = memory.lookup(identityKey(group[0] as Element));
+    const label = memory.lookup(key);
     if (label === undefined || label.length !== labelLength) continue;
     claims.push({ element: group[0] as Element, label });
   }

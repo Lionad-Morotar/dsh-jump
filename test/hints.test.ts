@@ -246,6 +246,33 @@ describe("label memory across rounds", () => {
     expect(labelOf(second, intruder)).toBe("sd");
   });
 
+  it("computes one identity per candidate and reuses it for recall and record", () => {
+    const memory = createLabelMemory();
+    const els = keyed(10);
+    const asked: Element[] = [];
+    // 键故意与 DOM 无关：召回若绕过注入的取值自己重读元素，第二轮的记忆就找不回来。
+    const identity = (el: Element): string => {
+      asked.push(el);
+      const index = els.indexOf(el);
+      return index === -1 ? "" : "id-" + String(index);
+    };
+
+    collectHints(select(...els), VIEWPORT, { isVisible: visible, memory, identity });
+    expect(asked).toEqual(els);
+    // 写回也必须落在同一批键上：按元素自身键记录的话这里查不到。
+    expect(memory.lookup("id-4")).toBe("ah");
+    expect(memory.lookup("k4")).toBeUndefined();
+
+    const intruder = document.createElement("button");
+    place(intruder, 5, 0);
+    document.body.append(intruder);
+
+    asked.length = 0;
+    const second = collectHints(select(intruder, ...els), VIEWPORT, { isVisible: visible, memory, identity });
+    expect(asked).toHaveLength(els.length + 1);
+    expect(labelOf(second, els[4] as Element)).toBe("ah");
+  });
+
   it("refuses a two-key memory when this round is single-key", () => {
     const memory = createLabelMemory();
     const els = keyed(10);
