@@ -35,7 +35,17 @@ const FONT_FAMILY = "ui-monospace, Menlo, monospace";
 const BADGE_FILL = "#ffd60a";
 const BADGE_INK = "#000";
 /** A ruled-out badge fades as a whole; the DOM badge did this with opacity. */
-const DIM_ALPHA = 0.3;
+export const DIM_ALPHA = 0.3;
+
+/**
+ * Opacity of one badge on this repaint.
+ *
+ * The exclusion fade is time-dependent, so the surface cannot derive it from
+ * (hints, prefix) alone. The overlay owns the clock and the fade state and hands
+ * the answer down; without a resolver the surface keeps the original two-state
+ * look, which is what a host with no frames gets.
+ */
+export type BadgeAlpha = (hint: Hint, matched: boolean) => number;
 
 /**
  * Target outline, in two tiers.
@@ -118,7 +128,7 @@ export interface CanvasSurface {
    * frames repaint the prefix they have already shown instead of trying to
    * patch pixels.
    */
-  paint(hints: readonly Hint[], bounds: OverlayViewport, pending: string, count: number): void;
+  paint(hints: readonly Hint[], bounds: OverlayViewport, pending: string, count: number, alpha?: BadgeAlpha): void;
   /**
    * Draw hints in `[from, to)` without clearing what is already there.
    *
@@ -132,6 +142,7 @@ export interface CanvasSurface {
     pending: string,
     from: number,
     to: number,
+    alpha?: BadgeAlpha,
   ): void;
   clear(): void;
 }
@@ -205,6 +216,7 @@ export function createCanvasSurface(
     hint: Hint,
     bounds: OverlayViewport,
     pending: string,
+    alpha?: BadgeAlpha,
   ): void {
     // Long labels (the >2000 fallback round uses four keys) must not spill out
     // of the box; 24px is the floor that keeps ordinary one-to-three key
@@ -215,7 +227,7 @@ export function createCanvasSurface(
     const { x, y } = badgeOrigin(hint.rect, bounds, width);
     const matched = hint.label.startsWith(pending);
     ctx.save();
-    ctx.globalAlpha = matched ? 1 : DIM_ALPHA;
+    ctx.globalAlpha = alpha === undefined ? (matched ? 1 : DIM_ALPHA) : alpha(hint, matched);
     ctx.fillStyle = BADGE_FILL;
     ctx.beginPath();
     if (typeof ctx.roundRect === "function") {
@@ -296,6 +308,7 @@ export function createCanvasSurface(
     pending: string,
     from: number,
     to: number,
+    alpha?: BadgeAlpha,
   ): void {
     ctx.textBaseline = "middle";
     // Outlines first: a badge sits on the target's corner and has to stay
@@ -304,13 +317,13 @@ export function createCanvasSurface(
     for (let index = from; index < to; index += 1) {
       const hint = hints[index];
       if (hint === undefined) break;
-      paintBadge(ctx, hint, bounds, pending);
+      paintBadge(ctx, hint, bounds, pending, alpha);
     }
   }
 
   return {
     canvas,
-    paint(hints, bounds, pending, count): void {
+    paint(hints, bounds, pending, count, alpha): void {
       resize(bounds);
       if (context === null) {
         // No 2D API: keep the round readable as canvas fallback text instead of
@@ -322,9 +335,9 @@ export function createCanvasSurface(
         return;
       }
       context.clearRect(0, 0, bounds.width, bounds.height);
-      drawRange(context, hints, bounds, pending, 0, count);
+      drawRange(context, hints, bounds, pending, 0, count, alpha);
     },
-    paintRange(hints, bounds, pending, from, to): void {
+    paintRange(hints, bounds, pending, from, to, alpha): void {
       resize(bounds);
       if (context === null) {
         canvas.textContent = hints
@@ -333,7 +346,7 @@ export function createCanvasSurface(
           .join(" ");
         return;
       }
-      drawRange(context, hints, bounds, pending, from, to);
+      drawRange(context, hints, bounds, pending, from, to, alpha);
     },
     clear(): void {
       if (context === null) {

@@ -15,6 +15,8 @@
 import type { Hint, HintRect } from "./hints.ts";
 import {
   createCanvasSurface,
+  DIM_ALPHA,
+  type BadgeAlpha,
   type CanvasContextFactory,
   type CanvasSurface,
   type OverlayViewport,
@@ -130,6 +132,28 @@ const CONFIRM_COLOR = "#ffd60a";
 /** Fade-out only; the box appears instantly so the receipt is never delayed. */
 const CONFIRM_FADE_MS = 120;
 
+/**
+ * How long an excluded badge takes to reach the dim alpha.
+ *
+ * Long enough to read as motion (about 12 frames at 145Hz), short enough that
+ * the reader never waits on it: a badge is already useless as a candidate the
+ * moment the prefix rules it out, so this confirms a decision rather than
+ * delivering information.
+ */
+export const EXCLUDE_FADE_MS = 80;
+
+/**
+ * One badge on its way out.
+ *
+ * `from` is where this fade picked up, not always 1: a second key inside the
+ * window hands over the opacity the badge is being drawn at, so the series keeps
+ * decreasing instead of restarting or jumping.
+ */
+interface Fade {
+  from: number;
+  startedAt: number;
+}
+
 interface Round {
   /** Painted hints; `append` extends this array in place. */
   hints: Hint[];
@@ -208,6 +232,23 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   let confirmation: { element: HTMLElement; handle: number } | undefined;
   /** Timers of the live confirmation; the caller's seam wins over the host's. */
   let confirmTimers: ConfirmTimers | undefined;
+  /**
+   * Badges currently fading out, keyed by the hint they belong to.
+   *
+   * Keyed by hint rather than by label: two targets can share a label across
+   * rounds, and a fade must never leak from one round into the next.
+   */
+  let fades = new Map<Hint, Fade>();
+  /**
+   * Opacity each excluded badge was last drawn at.
+   *
+   * The fade needs a starting point that is not always 1: a second key inside
+   * the window has to pick the badge up exactly where the screen left it, and a
+   * badge that already reached the dim alpha must not fade a second time.
+   */
+  let drawnAlpha = new Map<Hint, number>();
+  /** The queued fade frame, or undefined when nothing is animating. */
+  let fadeHandle: number | undefined;
 
   /**
    * The host's timers, or a no-op pair where the document has no window.
@@ -251,6 +292,130 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     confirmation = undefined;
     (confirmTimers ?? hostTimers()).clearTimeout(handle);
     element.remove();
+  }
+
+  /**
+   * Opacity of one badge right now, or undefined when it is not fading.
+   *
+   * Linear on purpose: an eased curve would spend most of the 80ms in the
+   * barely-visible range, which is the opposite of showing the reader that
+   * something just left. The end of the curve snaps to the exact dim alpha so
+   * the badge lands on the same value a non-animated round would draw.
+   */
+  function fadeAlpha(hint: Hint, now: number): number | undefined {
+    const fade = fades.get(hint);
+    if (fade === undefined) return undefined;
+    const elapsed = now - fade.startedAt;
+    if (elapsed >= EXCLUDE_FADE_MS) return DIM_ALPHA;
+    const progress = Math.max(0, elapsed / EXCLUDE_FADE_MS);
+    return fade.from + (DIM_ALPHA - fade.from) * progress;
+  }
+
+  /**
+   * Reconcile the fade set against the prefix that was just applied.
+   *
+   * Only the excluded direction animates. A badge that still matches is lit
+   * instantly, and a badge the reader just brought back (a dead key clearing the
+   * prefix) is restored instantly too: both are information arriving, and late
+   * information is wrong information. A badge already drawn at the dim alpha has
+   * nothing left to animate and is skipped.
+   */
+  function reconcileFades(target: Round, now: number): void {
+    const next = new Map<Hint, Fade>();
+    for (const hint of target.hints) {
+      if (hint.label.startsWith(target.pending)) continue;
+      const existing = fades.get(hint);
+      if (existing !== undefined) {
+        // Handover: keep the fade this badge is already partway through, so a
+        // second key inside the window neither restarts it nor jumps.
+        next.set(hint, existing);
+        continue;
+      }
+      const drawn = drawnAlpha.get(hint) ?? 1;
+      if (drawn <= DIM_ALPHA) continue;
+      next.set(hint, { from: drawn, startedAt: now });
+    }
+    fades = next;
+  }
+
+  /** Whether any fade still has distance to cover; drops the finished ones. */
+  function fadesRunning(now: number): boolean {
+    for (const [hint, fade] of fades) {
+      if (now - fade.startedAt < EXCLUDE_FADE_MS) return true;
+      fades.delete(hint);
+    }
+    return false;
+  }
+
+  /**
+   * Repaint the round with the fades advanced to `now`.
+   *
+   * The resolver is only built when something is actually fading: a round with
+   * no fade in flight must not pay a Map lookup per badge on every stroke.
+   */
+  function paintWithFades(target: Round, count: number, now: number): void {
+    const alpha: BadgeAlpha | undefined =
+      fades.size === 0
+        ? undefined
+        : (hint, matched) => (matched ? 1 : (fadeAlpha(hint, now) ?? DIM_ALPHA));
+    const started = paintNow === undefined ? 0 : paintNow();
+    try {
+      const canvas = ensureSurface();
+      canvas.paint(target.hints, target.bounds, target.pending, count, alpha);
+    } finally {
+      if (paintNow !== undefined) deps.onPaint?.(paintNow() - started);
+    }
+    target.drawn = count;
+    rememberDrawnAlpha(target, now);
+    if (count >= target.hints.length) settle(target);
+  }
+
+  /**
+   * Record what each excluded badge was just drawn at.
+   *
+   * This is the handover state: the next stroke reads it instead of assuming the
+   * badge is still fully lit, which is what keeps a fast second key from
+   * restarting the fade or leaving it stuck mid-way.
+   */
+  function rememberDrawnAlpha(target: Round, now: number): void {
+    drawnAlpha = new Map();
+    for (const hint of target.hints) {
+      if (hint.label.startsWith(target.pending)) continue;
+      drawnAlpha.set(hint, fadeAlpha(hint, now) ?? DIM_ALPHA);
+    }
+  }
+
+  /**
+   * Drive the fades frame by frame until none is left, then stop.
+   *
+   * The loop has to stop on its own: a permanent rAF would keep the page awake
+   * for a decoration that is already over. `clock` is the same seam the
+   * oversized-round fallback uses, so a host without frames skips the animation
+   * and draws the end state instead.
+   */
+  function scheduleFade(): void {
+    const frameClock = clock;
+    if (frameClock === undefined || fadeHandle !== undefined) return;
+    fadeHandle = frameClock.request(() => {
+      fadeHandle = undefined;
+      const target = round;
+      if (target === undefined) {
+        fades = new Map();
+        return;
+      }
+      const now = frameClock.now();
+      paintWithFades(target, target.drawn, now);
+      if (fadesRunning(now)) scheduleFade();
+    });
+  }
+
+  /** Drop every fade and its queued frame. */
+  function stopFades(): void {
+    fades = new Map();
+    drawnAlpha = new Map();
+    if (fadeHandle === undefined) return;
+    clock?.cancel(fadeHandle);
+    fadeHandle = undefined;
   }
 
   /** The one canvas this overlay ever attaches; rounds reuse it. */
@@ -305,6 +470,7 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       if (paintNow !== undefined) deps.onPaint?.(paintNow() - started);
     }
     target.drawn = next;
+    rememberDrawnAlpha(target, clock?.now() ?? 0);
     if (next >= target.hints.length) settle(target);
   }
 
@@ -376,6 +542,7 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     if (round === undefined) return;
     abandon(round);
     round = undefined;
+    stopFades();
     surface?.clear();
     removeSurface();
   }
@@ -386,10 +553,33 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       // prefix and leave the queued frames alone; later frames open in the
       // prefix the round has reached.
       if (round !== undefined && round.hints === hints) {
-        round.pending = pending;
-        paint(round, round.drawn);
+        const target = round;
+        const previous = target.pending;
+        target.pending = pending;
+        // Only an exclusion animates, and only where frames exist. A prefix
+        // that grew or shrank without ruling anything out has nothing to show;
+        // a cleared prefix is the reader correcting themselves, which must land
+        // instantly; and a host with no frame clock cannot animate at all, so it
+        // gets the end state rather than a badge stuck at full opacity.
+        const animates =
+          pending !== "" &&
+          pending !== previous &&
+          clock !== undefined &&
+          motionAllowed();
+        if (animates) {
+          const now = clock.now();
+          reconcileFades(target, now);
+          if (fades.size > 0) {
+            paintWithFades(target, target.drawn, now);
+            scheduleFade();
+            return;
+          }
+        }
+        stopFades();
+        paint(target, target.drawn);
         return;
       }
+      stopFades();
       const target = begin(hints, pending);
       paint(target, hints.length);
     },
@@ -485,6 +675,7 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     },
     destroy(): void {
       dropConfirmation();
+      stopFades();
       if (round !== undefined) {
         abandon(round);
         round = undefined;

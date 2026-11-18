@@ -986,3 +986,174 @@ describe("hit confirmation", () => {
     }
   });
 });
+
+/**
+ * 排除过渡。
+ *
+ * 敲一个键，被排除的徽章从 1.0 瞬间掉到 0.3，用户看不见「哪些被排掉了」这个
+ * 过程。这里只给「被排除」这一个方向加约 80ms 的过渡：仍匹配的瞬时点亮，死键
+ * 回退也瞬时恢复，因为那两件事都是信息，晚到就是错。
+ *
+ * 断言落在绘制调用的 opacity 序列上：canvas 每帧全量重绘，所以「过渡」就是
+ * 同一枚徽章在连续几帧里被画成递减的透明度。
+ */
+describe("exclusion fade", () => {
+  /** 某段文字在每一帧被画出来时的透明度序列。 */
+  function alphasOf(recorded: Recorder, text: string): number[] {
+    return recorded
+      .texts()
+      .filter((entry) => entry.text === text)
+      .map((entry) => entry.alpha);
+  }
+
+  it("fades an excluded badge down to the dim alpha over about 80ms", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+
+    // 第一帧仍是 1.0：过渡从当前状态起步，不能一上来就跳。
+    const start = alphasOf(recorded, "sd");
+    expect(start[start.length - 1]).toBe(1);
+
+    clock.step(40);
+    const mid = alphasOf(recorded, "sd");
+    const atHalf = mid[mid.length - 1]!;
+    expect(atHalf).toBeGreaterThan(0.3);
+    expect(atHalf).toBeLessThan(1);
+
+    clock.step(39);
+    const nearEnd = alphasOf(recorded, "sd");
+    expect(nearEnd[nearEnd.length - 1]!).toBeGreaterThan(0.3);
+
+    clock.step(1);
+    const done = alphasOf(recorded, "sd");
+    expect(done[done.length - 1]).toBe(0.3);
+  });
+
+  it("lights a still-matching badge instantly, with no intermediate value", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    clock.step(40);
+    clock.step(40);
+
+    // 只剩一枚且它一直匹配：任何一帧都不该出现中间透明度。
+    for (const entry of recorded.texts()) expect(entry.alpha).toBe(1);
+  });
+
+  it("restores instantly when a dead key clears the prefix", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    clock.step(40);
+    const before = alphasOf(recorded, "sd").length;
+
+    overlay.render(hints, "");
+
+    // 死键是用户在纠错，越快越好：这一帧直接回到 1.0，没有中间态。
+    const restored = alphasOf(recorded, "sd").slice(before);
+    expect(restored).toEqual([1]);
+    // 而且不该再排任何过渡帧。
+    const requests = clock.requests();
+    clock.step(16);
+    clock.step(16);
+    expect(clock.requests()).toBe(requests);
+  });
+
+  it("hands a mid-fade badge over to the next key without jumping", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as", "ad", "sd"]);
+    overlay.render(hints);
+    // 第一击：sd 被排除，开始淡出。
+    overlay.render(hints, "a");
+    clock.step(40);
+    const beforeSecond = alphasOf(recorded, "sd");
+    const live = beforeSecond[beforeSecond.length - 1]!;
+    expect(live).toBeLessThan(1);
+    expect(live).toBeGreaterThan(0.3);
+
+    // 第二击：ad 被排除，sd 仍然被排除。sd 必须从当前插值位置接着走。
+    overlay.render(hints, "as");
+    const afterSecond = alphasOf(recorded, "sd");
+    expect(afterSecond[afterSecond.length - 1]).toBe(live);
+
+    // 再走完剩下的 40ms：sd 从接管点走到底，ad 从 1.0 走到底。
+    clock.step(40);
+    const finished = alphasOf(recorded, "sd");
+    // 单调不增，且最终落到 0.3，不卡在中间。
+    const series = finished;
+    for (let i = 1; i < series.length; i += 1) expect(series[i]!).toBeLessThanOrEqual(series[i - 1]!);
+    expect(series[series.length - 1]).toBe(0.3);
+
+    // 第二击自己排除的 ad 从第二击起算自己的 80ms，所以还要再走 40ms。
+    clock.step(40);
+    const ad = alphasOf(recorded, "ad");
+    expect(ad[ad.length - 1]).toBe(0.3);
+  });
+
+  it("stops the frame loop once every fade has finished", () => {
+    const clock = frameClock();
+    const { overlay } = mount({ clock });
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+
+    // 过渡期间必须有帧在排队。
+    const during = clock.requests();
+    expect(during).toBeGreaterThan(0);
+
+    // 走完 80ms 之后，再推进帧也不能再排新的：循环必须自己停。
+    clock.step(80);
+    const settled = clock.requests();
+    clock.step(16);
+    clock.step(16);
+    clock.step(16);
+    expect(clock.requests()).toBe(settled);
+  });
+
+  it("dims instantly when the reader asked for reduced motion", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const original = dom.window.matchMedia;
+    (dom.window as unknown as Record<string, unknown>)["matchMedia"] = (query: string) => ({
+      matches: query.includes("prefers-reduced-motion"),
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    });
+    try {
+      const hints = hintsOf(["as", "sd"]);
+      overlay.render(hints);
+      overlay.render(hints, "a");
+
+      // 减少动态偏好下完全跳过过渡：这一帧就是 0.3，也不排任何帧。
+      const series = alphasOf(recorded, "sd");
+      expect(series[series.length - 1]).toBe(0.3);
+      expect(clock.requests()).toBe(0);
+    } finally {
+      (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
+    }
+  });
+
+  it("does not fade a badge that was already dim", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    clock.step(80);
+    const mark = recorded.texts().length;
+
+    // 再敲一个仍然排除 sd 的键：它已经在 0.3，不该重新淡一遍。
+    overlay.render(hints, "as");
+    const after = recorded.texts().slice(mark).filter((entry) => entry.text === "sd");
+    expect(after.every((entry) => entry.alpha === 0.3)).toBe(true);
+  });
+});
