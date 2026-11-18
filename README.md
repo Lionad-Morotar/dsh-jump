@@ -309,12 +309,16 @@ foreground tab and read the page's own JSON.
 
 For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
-discards their readings. Warmup is still required: without it the first tier
-pays JIT compilation, first layout and GC warmup and reports a cold start as a
-tier cost, so `--warmup <n>` only tunes the count. Then it times `runs`
-activations, `runs` first label strokes, `runs` second label strokes, `runs`
-complete labels (each on a fresh activation) and one Esc exit. The second stroke
-is the phase where the dimmed batch matters: on a three-key label it must stay
+discards their readings. Every activation waits on `app.settled()` before the
+page reads badges or sends the first label stroke: insertion is adaptive, so
+the number of frames is not a property of the candidate count, and two frames
+after Cmd+H used to be only the first batches of a 300-candidate round. Warmup
+is still required: without it the first tier pays JIT compilation, first layout
+and GC warmup and reports a cold start as a tier cost, so `--warmup <n>` only
+tunes the count. Then it times `runs` complete activations, `runs` first label
+strokes, `runs` second label strokes, `runs` complete labels (each on a fresh
+activation) and one Esc exit on a fully inserted round. The second stroke is
+the phase where the dimmed batch matters: on a three-key label it must stay
 untouched while the live prefix splits further (on a two-key tier it is the
 completing stroke). The close reading reports the badge count it tore down as
 `nodes`.
@@ -332,19 +336,37 @@ its cost would contaminate the reading. The verdict fields are:
   percentile. A single hitch survives this number even when 95% of frames are
   fast.
 - `overBudgetFrames`: how many sampled gaps were strictly greater than
-  `frameBudgetMs`.
-- `verdict`: `pass` only when `overBudgetFrames` is 0, otherwise `fail`. With
-  `--verify-fresh`, a result that cannot prove it came from this navigation is
-  `stale` instead.
+  `frameBudgetMs`, with `frameCount` and `overBudgetPct` beside it.
+- `idleFrameBudgetMs`: the cadence of a blank control window on the same tier,
+  sampled before any activation. It exposes a machine whose idle cadence itself
+  drifted between the budget sample and the measured window.
+- `idleOverBudgetFrames`: how many blank-control gaps exceeded the tier's
+  `frameBudgetMs`, with `idleFrameCount` and `idleOverBudgetPct`. Both windows
+  are counted against the same budget so the two rates answer one question.
+- `excessOverBudgetPct`: active over-budget rate minus the idle control rate, in
+  percentage points. Negative means the active window was calmer than the
+  control.
+- `verdict`: `pass` only when `excessOverBudgetPct` is at most 5 percentage
+  points (`noiseBandPct`). With `--verify-fresh`, a result that cannot prove it
+  came from this navigation is `stale` instead.
+
+The idle control is what makes the gate falsifiable. The budget is a median, so
+roughly half of any window's frames sit above it even on a blank page, and a
+loaded machine reaches 45-50% without the plugin doing anything. An absolute
+`overBudgetFrames === 0` rule therefore measured the machine and failed forever.
+The bench now prints both windows and compares their rates; the raw counts stay
+in the result so the difference can be recomputed by hand. `maxFrameMs`,
+`overBudgetFrames`, `overBudgetPct` and the idle numbers are kept unchanged for
+that audit.
 
 The p50/p95 fields are retained, unchanged: each phase still carries
 `handlerMs` (synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from
 dispatch return to the second animation frame), and the phase-level `p50`/`p95`
 mirror `handlerMs`. They are useful for tracking a change, but they no longer
-decide the gate; the acceptance rule is every frame, so `maxFrameMs` and
-`overBudgetFrames` are the numbers that matter. Percentiles use the nearest
-rank, not interpolation, so any reading can be recomputed from the samples by
-hand.
+decide the gate; the gate is the excess over the idle control, while
+`maxFrameMs`, `overBudgetFrames` and the idle counts remain the absolute audit
+numbers. Percentiles use the nearest rank, not interpolation, so any reading
+can be recomputed from the samples by hand.
 
 Treat the retained p95 from fewer than 50 samples as a reference only: at 19 or
 fewer samples nearest-rank p95 is literally the maximum, and the bench prints a
@@ -364,8 +386,10 @@ memory recall and write-back run for real. Each tier reports `identityKeys`
 `collectHints`'s injectable `identity` dependency), `identityRounds` (the
 activations actually dispatched) and `identityPath` (`active` only when those
 calls produced keys the memory recorded). The per-round count is checked
-against the labels the app actually paints, so a drifted fixture fails the tier
-instead of reporting a number nobody measured.
+against the labels the app actually paints after `app.settled()`, so a drifted
+fixture fails the tier instead of reporting a number nobody measured; `--check`
+also proves that a partial read (300 hints against 96 painted badges) is
+rejected rather than accepted.
 
 `--verify-fresh` makes the freshness contract fatal. The automated Chrome path
 already checks every tier; the flag records the requirement in the protocol and
@@ -386,14 +410,18 @@ write files and the repo ships no third-party browser driver.
 
 `--check` needs no browser: it bundles the app, asserts the generated page
 still carries every measurement hook (including `frameBudgetMs`, `maxFrameMs`,
-`overBudgetFrames`, `verdict`, `worstLoaf`, `secondStroke`, `close`,
+`overBudgetFrames`, `idleOverBudgetFrames`, `idleFrameBudgetMs`,
+`excessOverBudgetPct`, `verdict`, `worstLoaf`, `secondStroke`, `close`,
 `identityKeys` and `identityPath`), exercises the percentile and frame-budget
 implementations with fixed inputs (median and 0.1ms ceiling, max rather than
-p95, 0-over pass and 1-over fail), checks the freshness contract against a
-pre-existing result, a reload, an old timestamp and a foreign realm, verifies
-archive file naming and a JSON round-trip into a fresh directory, and fails if
-the page or the script imports anything outside the local toolchain allowlist
-(`node:child_process` is there only for the local Chrome driver).
+p95, and the 5-point noise-band verdict boundary), checks the idle-control
+arithmetic on fixed counts, proves that reading badges before progressive
+insertion completes fails the identity calibration, checks the freshness
+contract against a pre-existing result, a reload, an old timestamp and a foreign
+realm, verifies archive file naming and a JSON round-trip into a fresh
+directory, and fails if the page or the script imports anything outside the
+local toolchain allowlist (`node:child_process` is there only for the local
+Chrome driver).
 
 ## v1 boundaries
 
