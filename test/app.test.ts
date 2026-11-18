@@ -1812,3 +1812,330 @@ describe("采集期键盘缓冲", () => {
     teardown();
   });
 });
+
+/**
+ * 墙钟帧钟：`now()` 每读一次记 0.1ms 的采集成本，`frame(ms)` 把墙钟往前推
+ * 一整段。两者必须分开：采集预算看的是每次读取之间的微小差值，1 秒硬上限
+ * 看的是激活以来的墙钟跨度。
+ */
+class DeadlineClock implements FrameClock {
+  private time = 0;
+  private seq = 0;
+  private callbacks = new Map<number, (time: number) => void>();
+
+  now(): number {
+    this.time += 0.1;
+    return this.time;
+  }
+
+  request(callback: (time: number) => void): number {
+    this.seq += 1;
+    this.callbacks.set(this.seq, callback);
+    return this.seq;
+  }
+
+  cancel(handle: number): void {
+    this.callbacks.delete(handle);
+  }
+
+  frame(ms: number): void {
+    this.time += ms;
+    const due = [...this.callbacks.values()];
+    this.callbacks.clear();
+    for (const callback of due) callback(this.time);
+  }
+
+  get pending(): number {
+    return this.callbacks.size;
+  }
+}
+
+/** 最后一整轮重绘的标签与位置，按画布绘制顺序返回。 */
+function lastDrawnPairs(count: number): Map<string, string> {
+  const draws = canvasOps
+    .filter((op) => op.kind === "fillText")
+    .slice(-count)
+    .map((op) => ({ text: String(op.args[0]), x: Number(op.args[1]), y: Number(op.args[2]) }));
+  return new Map(draws.map((entry) => [entry.x + "," + entry.y, entry.text]));
+}
+
+function labelRanks(labels: readonly string[], keys: number): Map<string, number> {
+  const stream = [...generateLabels(keys)];
+  return new Map(labels.map((label) => [label, stream.indexOf(label)]));
+}
+
+describe("条件回退：快路径、慢路径与硬上限", () => {
+  it("快路径不变：一帧内采集完时，激活帧画满全部标签", () => {
+    gridButtons(9);
+    const clock = new StepClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    // 9 枚在一键容量内，采集在激活帧跑完，画布一次画满。
+    expect(app.labels()).toHaveLength(9);
+    expect(app.visibleLabels()).toHaveLength(9);
+    expect(clock.pending).toBe(0);
+    expect(canvasTexts().map((entry) => entry.text)).toEqual([...generateLabels(1)].slice(0, 9));
+    teardown();
+  });
+
+  it("慢路径在第 N+1 帧先画出已采到的部分", () => {
+    gridButtons(300);
+    const clock = new StepClock();
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+      progressiveAfterFrames: 3,
+    });
+    const teardown = app.apply();
+
+    activate();
+    // 激活帧只采到一小段，慢路径还没到点，屏幕上仍然静默。
+    expect(app.visibleLabels()).toEqual([]);
+    clock.frame();
+    clock.frame();
+    expect(app.visibleLabels()).toEqual([]);
+
+    // 激活帧算第 1 帧，第 N+1 帧（这里是第 4 帧）开始先画已采到的部分。
+    clock.frame();
+    const first = app.visibleLabels().length;
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThan(300);
+    expect(app.labels().length).toBe(first);
+    teardown();
+  });
+
+  it("慢路径标签不漂移：与一次性采集的配对只在标签长度上不同", async () => {
+    // 100 个候选里藏起 40 个：总数让慢路径定三键，有效数让快路径定两键。
+    const hidden = (el: Element): boolean => !el.hasAttribute("data-hidden");
+    const build = (): HTMLElement[] => {
+      const els = gridButtons(100);
+      for (const [index, el] of els.entries()) {
+        if (index % 5 === 4 || index % 5 === 0) el.setAttribute("data-hidden", "");
+      }
+      return els;
+    };
+
+    build();
+    const fast = createApp({ window: win, isVisible: hidden });
+    const fastTeardown = fast.apply();
+    activate();
+    const fastLabels = [...fast.labels()];
+    expect(fastLabels).toHaveLength(60);
+    const fastPairs = lastDrawnPairs(fastLabels.length);
+    fastTeardown();
+
+    doc.body.replaceChildren();
+    doc.querySelector("[data-dsh-jump-overlay]")?.remove();
+    build();
+    const clock = new StepClock();
+    const slow = createApp({
+      window: win,
+      isVisible: hidden,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+      progressiveAfterFrames: 3,
+    });
+    const slowTeardown = slow.apply();
+    activate();
+    await drain(slow, clock);
+    const slowLabels = [...slow.labels()];
+    expect(slowLabels).toHaveLength(60);
+    const slowPairs = lastDrawnPairs(slowLabels.length);
+
+    // 同一批元素：位置集合完全一致。
+    expect([...slowPairs.keys()].sort()).toEqual([...fastPairs.keys()].sort());
+    // 每个元素在标签流里的位次一致，只有标签长度从 2 变成 3。
+    const fastRank = labelRanks(fastLabels, 2);
+    const slowRank = labelRanks(slowLabels, 3);
+    for (const [cell, label] of fastPairs) {
+      expect({ cell, rank: slowRank.get(slowPairs.get(cell) ?? "") }).toEqual({
+        cell,
+        rank: fastRank.get(label),
+      });
+    }
+    expect(new Set(fastLabels.map((label) => label.length))).toEqual(new Set([2]));
+    expect(new Set(slowLabels.map((label) => label.length))).toEqual(new Set([3]));
+    slowTeardown();
+  });
+
+  it("慢路径首批标签可立即敲中", () => {
+    const els = gridButtons(100);
+    const clock = new StepClock();
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+      progressiveAfterFrames: 3,
+    });
+    const teardown = app.apply();
+
+    activate();
+    clock.frame();
+    clock.frame();
+    clock.frame();
+    const first = app.visibleLabels();
+    expect(first.length).toBeGreaterThan(0);
+
+    const hits: string[] = [];
+    (els[0] as HTMLElement).addEventListener("click", () => hits.push("first"));
+    for (const key of first[0] as string) win.dispatchEvent(keydown({ key }));
+
+    expect(hits).toEqual(["first"]);
+    expect(overlayRoot()).toBeNull();
+    expect(app.labels()).toEqual([]);
+    teardown();
+  });
+
+  it("1 秒硬上限停止采集并冻结已画出的标签", () => {
+    const els = gridButtons(300);
+    const reads = trackRects(els);
+    const clock = new DeadlineClock();
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+      progressiveAfterFrames: 100,
+    });
+    const teardown = app.apply();
+
+    activate();
+    expect(app.visibleLabels()).toEqual([]);
+    // 每帧推进 300ms：第 4 帧的墙钟越过 1 秒，采集必须当场停手。
+    for (let index = 0; index < 4; index += 1) clock.frame(300);
+
+    const painted = app.visibleLabels().length;
+    expect(painted).toBeGreaterThan(0);
+    expect(painted).toBeLessThan(300);
+    // 页面上每个候选都可见且在视口内：读过的矩形数就是已采到的数量。
+    expect(painted).toBe(reads.count());
+    expect(clock.pending).toBe(0);
+    const frozenReads = reads.count();
+    for (let index = 0; index < 10; index += 1) clock.frame(300);
+
+    expect(reads.count()).toBe(frozenReads);
+    expect(app.visibleLabels()).toHaveLength(painted);
+    expect(app.labels()).toHaveLength(painted);
+    teardown();
+  });
+
+  it.each(["Esc", "命中", "重激活", "visibilitychange", "dispose", "pagehide"])(
+    "%s 中断后不再采集、不再绘制、画布移除",
+    (surface) => {
+      const els = gridButtons(300);
+      const reads = trackRects(els);
+      const clock = new StepClock();
+      const app = createApp({
+        window: win,
+        isVisible: () => true,
+        frameClock: clock,
+        frameBudgetMs: 16.7,
+        progressiveAfterFrames: 3,
+      });
+      const teardown = app.apply();
+
+      activate();
+      clock.frame();
+      clock.frame();
+      clock.frame();
+      const painted = app.visibleLabels();
+      expect(painted.length).toBeGreaterThan(0);
+
+      const readsBefore = reads.count();
+      if (surface === "Esc") {
+        win.dispatchEvent(keydown({ key: "Escape" }));
+      } else if (surface === "命中") {
+        for (const key of painted[0] as string) win.dispatchEvent(keydown({ key }));
+      } else if (surface === "重激活") {
+        win.dispatchEvent(keydown({ key: "h", metaKey: true }));
+      } else if (surface === "visibilitychange") {
+        Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
+        try {
+          doc.dispatchEvent(new dom.window.Event("visibilitychange"));
+        } finally {
+          delete (doc as unknown as Record<string, unknown>)["visibilityState"];
+        }
+      } else if (surface === "dispose") {
+        teardown();
+      } else {
+        win.dispatchEvent(new dom.window.Event("pagehide"));
+      }
+
+      expect(overlayRoot()).toBeNull();
+      expect(app.labels()).toEqual([]);
+      expect(app.visibleLabels()).toEqual([]);
+      expect(clock.pending).toBe(0);
+      const opsAfterCancel = canvasOps.length;
+      for (let index = 0; index < 10; index += 1) clock.frame();
+
+      expect(reads.count()).toBe(readsBefore);
+      expect(canvasOps.length).toBe(opsAfterCancel);
+      if (surface !== "dispose") teardown();
+    },
+  );
+
+  it("中断清空采集期缓冲：重激活不会补发上一轮盲敲的首字母", async () => {
+    const els = gridButtons(9);
+    const clock = new SampleClock();
+    const app = createApp({ window: win, isVisible: () => true, frameClock: clock, frameBudgetMs: 16.7 });
+    const teardown = app.apply();
+
+    activate();
+    // 一枚候选花 1ms，激活帧只采到两枚：屏幕还没有标签，首字母只能进缓冲。
+    expect(app.labels()).toEqual([]);
+    const hits: string[] = [];
+    (els[0] as HTMLElement).addEventListener("click", () => hits.push("first"));
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(new dom.window.Event("pagehide"));
+    expect(app.labels()).toEqual([]);
+
+    activate();
+    await drain(app, clock);
+    // 缓冲属于被中断的那一轮，不能在新一轮里补发成一次点击。
+    expect(hits).toEqual([]);
+    teardown();
+  });
+
+  it("慢路径中途 Esc 后重激活从新的一轮重新开始", () => {
+    const els = gridButtons(300);
+    const reads = trackRects(els);
+    const clock = new StepClock();
+    const app = createApp({
+      window: win,
+      isVisible: () => true,
+      frameClock: clock,
+      frameBudgetMs: 16.7,
+      progressiveAfterFrames: 3,
+    });
+    const teardown = app.apply();
+
+    activate();
+    clock.frame();
+    clock.frame();
+    clock.frame();
+    expect(app.visibleLabels().length).toBeGreaterThan(0);
+
+    win.dispatchEvent(keydown({ key: "Escape" }));
+    expect(overlayRoot()).toBeNull();
+    expect(app.visibleLabels()).toEqual([]);
+
+    const readsBefore = reads.count();
+    activate();
+    // 新轮从零开始：激活帧只采集，不夹带上一轮画出的任何标签。
+    expect(reads.count()).toBeGreaterThan(readsBefore);
+    expect(app.labels()).toEqual([]);
+    expect(app.visibleLabels()).toEqual([]);
+    expect(overlayRoot()).toBeNull();
+
+    clock.frame();
+    clock.frame();
+    clock.frame();
+    expect(app.visibleLabels().length).toBeGreaterThan(0);
+    teardown();
+  });
+});

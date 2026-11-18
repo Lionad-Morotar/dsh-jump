@@ -53,6 +53,15 @@ export interface Overlay {
    * spread across frames, in which case `done` waits for the last one.
    */
   renderProgressive(hints: readonly Hint[], pending?: string): ProgressiveRender;
+  /**
+   * Draw one more batch on the live round without clearing or repainting the
+   * badges already on the canvas.
+   *
+   * The slow collection path calls this once per frame with the candidates it
+   * just accepted, which is what makes the first painted badges typeable while
+   * the rest of the page is still being walked.
+   */
+  append(hints: readonly Hint[], pending?: string): void;
   /** Every label of the current round, in hint order. */
   labels(): readonly string[];
   /**
@@ -92,7 +101,8 @@ export const SYNC_PAINT_LIMIT = 2000;
 const FALLBACK_FIRST_BATCH = 1000;
 
 interface Round {
-  readonly hints: readonly Hint[];
+  /** Painted hints; `append` extends this array in place. */
+  hints: Hint[];
   readonly bounds: OverlayViewport;
   readonly promise: Promise<void>;
   pending: string;
@@ -229,7 +239,10 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       resolve = done;
     });
     const target: Round = {
-      hints,
+      // Kept by reference on purpose: `render(hints, pending)` on a prefix
+      // stroke compares identity with the live round and must repaint the
+      // painted prefix instead of starting a new round from scratch.
+      hints: hints as Hint[],
       bounds: viewport(),
       promise,
       pending,
@@ -320,6 +333,30 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
           cancelRound();
         },
       };
+    },
+    append(hints: readonly Hint[], pending = ""): void {
+      if (hints.length === 0) return;
+      const started = paintNow === undefined ? 0 : paintNow();
+      try {
+        const target = round;
+        if (target === undefined) {
+          // First batch of a slow round: there is no previous canvas state to
+          // preserve, so the round starts at this batch.
+          const fresh = begin(hints, pending);
+          const canvas = ensureSurface();
+          canvas.paintRange(fresh.hints, fresh.bounds, pending, 0, fresh.hints.length);
+          fresh.drawn = fresh.hints.length;
+          return;
+        }
+        target.pending = pending;
+        const from = target.drawn;
+        target.hints.push(...hints);
+        const canvas = ensureSurface();
+        canvas.paintRange(target.hints, target.bounds, pending, from, target.hints.length);
+        target.drawn = target.hints.length;
+      } finally {
+        if (paintNow !== undefined) deps.onPaint?.(paintNow() - started);
+      }
     },
     labels(): readonly string[] {
       return round === undefined ? [] : round.hints.map((hint) => hint.label);

@@ -8,7 +8,7 @@
 import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { collectHints, createHintScan } from "../src/client/hints.ts";
+import { collectHints, createHintScan, keysPerLabel } from "../src/client/hints.ts";
 import { createLabelMemory } from "../src/client/identity.ts";
 import { CANDIDATE_SELECTOR, HOME_ROW_KEYS } from "../src/client/config.ts";
 
@@ -478,5 +478,40 @@ describe("分块采集", () => {
     }
     expect(scan.scanned).toBe(els.length);
     expect(scan.finish()).toHaveLength(60);
+  });
+});
+
+describe("渐进标签锁定", () => {
+  it("先锁定长度再逐批发放，已发标签在收尾后原样保留", () => {
+    const els = [...Array(7)].map((_, index) => {
+      const el = document.createElement("button");
+      place(el, index * 20, 0);
+      document.body.append(el);
+      return el;
+    });
+    let time = 0;
+    const now = (): number => {
+      time += 1;
+      return time;
+    };
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    scan.lockLabelLength(3);
+    expect(scan.advance(2, now)).toBe(false);
+
+    const first = scan.harvest();
+    expect(first.added.length).toBeGreaterThan(0);
+    expect(first.added.every((hint) => hint.label.length === 3)).toBe(true);
+    const issued = new Map(first.added.map((hint) => [hint.element, hint.label]));
+
+    while (!scan.advance(2, now)) scan.harvest();
+    const all = scan.finish();
+    expect(all).toHaveLength(7);
+    for (const hint of all) {
+      if (issued.has(hint.element)) expect(hint.label).toBe(issued.get(hint.element));
+    }
+  });
+
+  it("锁定长度按候选总数取档，总数跨过容量就变长", () => {
+    expect([9, 10, 81, 82].map((count) => keysPerLabel(count))).toEqual([1, 2, 2, 3]);
   });
 });

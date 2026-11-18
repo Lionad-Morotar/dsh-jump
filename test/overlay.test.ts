@@ -610,3 +610,24 @@ describe("progressive painting", () => {
     expect(overlay.visibleLabels()).toHaveLength(SYNC_PAINT_LIMIT);
   });
 });
+
+describe("appending a later batch", () => {
+  it("画布只补画新增的一批，不清屏也不重画已有标签", () => {
+    const { overlay, recorder: recorded } = mount();
+    overlay.append(hintsOf(["a", "s"]));
+    const clears = recorded.clears();
+    overlay.append(hintsOf(["d", "f"]));
+
+    expect(recorded.clears()).toBe(clears);
+    expect(overlay.labels()).toEqual(["a", "s", "d", "f"]);
+    expect(overlay.visibleLabels()).toEqual(["a", "s", "d", "f"]);
+    expect(recorded.texts().map((entry) => entry.text)).toEqual(["a", "s", "d", "f"]);
+  });
+
+  it("空批次不碰画布", () => {
+    const { overlay, recorder: recorded } = mount();
+    overlay.append([]);
+    expect(overlayCanvas()).toBeNull();
+    expect(recorded.texts()).toEqual([]);
+  });
+});

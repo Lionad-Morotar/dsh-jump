@@ -16,7 +16,7 @@ import {
   type JumpBindings,
   type JumpPlatform,
 } from "./bindings.ts";
-import { createHintScan, type Hint, type HintScan } from "./hints.ts";
+import { createHintScan, keysPerLabel, type Hint, type HintScan } from "./hints.ts";
 import { createLabelMemory } from "./identity.ts";
 import { createKeyState, matchKey, type KeyEventLike } from "./keys.ts";
 import { DEFAULT_CONFIG, HOME_ROW_KEYS, type JumpConfig } from "./config.ts";
@@ -90,6 +90,16 @@ export interface AppDeps {
    * outranks the sample and stops it from running.
    */
   frameBudgetMs?: number;
+  /**
+   * Animation frames a round may collect before it paints what it has.
+   *
+   * Frames, not milliseconds, so the trigger stays the same shape on a 60Hz
+   * and a 143Hz display. The default of 3 means a page that finishes in one
+   * frame keeps the silent single-paint path; a page that does not starts
+   * showing badges on the fourth frame (the activation frame counts as the
+   * first). Injected by tests that need a deterministic slow round.
+   */
+  progressiveAfterFrames?: number;
   /**
    * Starts the display sample outside the load path.
    *
@@ -231,6 +241,19 @@ const BUFFERED_KEY_LIMIT = 4;
  * runs for hours. Older frames fall off first.
  */
 const PERF_SAMPLE_LIMIT = 512;
+/**
+ * Frames after activation that must not wait for collection.
+ *
+ * The reader accepted "progressive appearance within one second". The frame
+ * trigger makes a normal page pay nothing, and this wall-clock cap bounds the
+ * pages that are slow enough to stay silent: at one second the walk stops and
+ * whatever has been collected is painted. The limit is measured from
+ * activation, not from the first slice, so a single pathological slice cannot
+ * push the deadline out.
+ */
+const HARD_COLLECT_LIMIT_MS = 1000;
+/** Default frame trigger for {@link AppDeps.progressiveAfterFrames}. */
+const DEFAULT_PROGRESSIVE_AFTER_FRAMES = 3;
 
 /** The display cadence the embedding page publishes, or undefined. */
 function publishedFrameBudget(): number | undefined {
@@ -569,9 +592,15 @@ function focusTextEntry(element: Element, doc: Document): void {
 /** One round's stage A walk, from activation to painted labels. */
 interface CollectorRound {
   readonly scan: HintScan;
+  /** Clock reading at activation, the origin of the 1s hard limit. */
+  readonly startedAt: number;
   handle: number | undefined;
   cancelled: boolean;
   resolve: () => void;
+  /** Animation frames since activation; the activation slice itself is 0. */
+  frames: number;
+  /** The round has painted partial batches and keeps appending. */
+  progressive: boolean;
 }
 
 /** The navigator's platform string, or "" where the host has none. */
@@ -596,6 +625,14 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   // frame boundary, the overlay reports paint durations into the open frame.
   const probe = deps.perfProbe === false ? undefined : createPerfProbe();
   const measureNow = frameNow(win.document);
+  const progressiveAfterFrames = Math.max(
+    0,
+    Math.floor(
+      deps.progressiveAfterFrames !== undefined && Number.isFinite(deps.progressiveAfterFrames)
+        ? deps.progressiveAfterFrames
+        : DEFAULT_PROGRESSIVE_AFTER_FRAMES,
+    ),
+  );
   const overlay = createOverlay({
     doc: win.document,
     viewport: () => ({ width: win.innerWidth, height: win.innerHeight }),
@@ -851,6 +888,71 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         return done;
       }
 
+      /**
+       * Fix the label length and let the round paint before it is complete.
+       *
+       * The length comes from the raw candidate total, an upper bound of the
+       * filtered count, so the labels can be one or more keys longer than the
+       * finished round would have chosen (100 candidates where 50 are visible
+       * means three keys instead of two). Deciding it at the trigger is what keeps
+       * already-painted labels from drifting; the slow path is the only place
+       * that pays this price, and a longer label only costs extra strokes.
+       */
+      function enterProgressive(round: CollectorRound): void {
+        if (round.progressive || round.cancelled) return;
+        round.progressive = true;
+        round.scan.lockLabelLength(keysPerLabel(round.scan.total));
+      }
+
+      /**
+       * Paint the candidates accepted since the last batch.
+       *
+       * Labels are issued once and never reassigned, so the only visible change
+       * is appended badges. `pending` is carried along so a batch that lands
+       * while the reader is mid-label opens in the same lit/dim split as the
+       * badges already on screen.
+       */
+      function flushProgressive(round: CollectorRound): void {
+        if (round.cancelled || collecting !== round) return;
+        const batch = round.scan.harvest();
+        if (batch.removed.length > 0) {
+          // A painted candidate turned out to wrap a later one: its badge has
+          // to disappear, and an append-only canvas cannot erase it.
+          const gone = new Set(batch.removed);
+          hints = hints.filter((hint) => !gone.has(hint.element));
+          overlay.render(hints, state.pending);
+        }
+        if (batch.added.length === 0) return;
+        hints = hints.concat(batch.added);
+        overlay.append(batch.added, state.pending);
+      }
+
+      /**
+       * Hard limit: stop the walk and paint what has been collected.
+       *
+       * The round is frozen here. No later frame is scheduled and `finish` on a
+       * locked scan only hands out the already accepted candidates, so the
+       * canvas cannot grow after this point.
+       */
+      function stopCollection(round: CollectorRound): void {
+        collecting = undefined;
+        const next = round.scan.finish();
+        // The last flushed batch is already on the canvas, so the deadline
+        // usually has nothing left to paint. Repaint only when the frozen set
+        // differs from the painted one (a wrapper removal, or a round that
+        // reached the deadline before its first batch).
+        const unchanged =
+          next.length === hints.length && next.every((hint, index) => hint === hints[index]);
+        if (!unchanged) {
+          hints = next;
+          if (next.length > 0) overlay.render(next, state.pending);
+        }
+        const pending = replayBuffered();
+        if (pending === null) return;
+        if (pending !== "") overlay.render(hints, pending);
+        round.resolve();
+      }
+
       /** Queue the next stage A slice on the next frame. */
       function scheduleCollection(round: CollectorRound): void {
         const frameClock = collectClock;
@@ -858,7 +960,23 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         round.handle = frameClock.request(() => {
           round.handle = undefined;
           if (round.cancelled || collecting !== round) return;
+          round.frames += 1;
+          const nowMs = frameClock.now();
+          // The deadline is checked before the slice, so a page that spends
+          // whole frames in one slice still stops on the first frame past 1s.
+          const expired = nowMs - round.startedAt >= HARD_COLLECT_LIMIT_MS;
+          if (!round.progressive && (expired || round.frames >= progressiveAfterFrames)) {
+            enterProgressive(round);
+          }
+          if (round.cancelled || collecting !== round) return;
+          if (expired) {
+            stopCollection(round);
+            return;
+          }
           if (!runCollectSlice(round, collectBudgetMs(currentFrameBudget()), () => frameClock.now())) {
+            if (round.cancelled || collecting !== round) return;
+            if (round.progressive) flushProgressive(round);
+            if (round.cancelled || collecting !== round) return;
             scheduleCollection(round);
           }
         });
@@ -867,11 +985,13 @@ export function createApp(deps: AppDeps = {}): JumpApp {
       /**
        * Start collection for one activation.
        *
-       * The first slice runs inside the activation frame; a small page finishes
-       * there and paints immediately. A large one returns an empty hint array
-       * and keeps walking on later frames, then paints the whole round at once:
-       * labels cannot be issued before the total count and visual order are
-       * known, so partial painting would only show labels that later change.
+       * Three paths share one scan. A page that finishes in the activation
+       * frame paints every label at once, exactly as before. A page still
+       * walking after {@link progressiveAfterFrames} frames switches to the
+       * slow path: labels are fixed from the candidate total and appended batch
+       * by batch, so the reader can see and type the first badges while the
+       * rest of the page is still being walked. A page that crosses one second
+       * stops and paints whatever it has.
        */
       function collectRound(): Hint[] {
         cancelCollection();
@@ -889,7 +1009,15 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           resolve = done;
         });
         roundSettled = promise;
-        const round: CollectorRound = { scan, handle: undefined, cancelled: false, resolve };
+        const round: CollectorRound = {
+          scan,
+          handle: undefined,
+          cancelled: false,
+          resolve,
+          frames: 0,
+          progressive: false,
+          startedAt: collectClock === undefined ? 0 : collectClock.now(),
+        };
         collecting = round;
         if (collectClock === undefined) {
           runCollectSlice(round, Number.POSITIVE_INFINITY, measureNow);
@@ -1016,7 +1144,12 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         // would rule every home-row stroke a dead end while the listener still
         // eats it. Hold the stroke instead, and replay it against the finished
         // label set: the reader's typing must land somewhere, not vanish.
-        if (state.mode !== "idle" && collecting !== undefined && bufferableStroke(event)) {
+        if (
+          state.mode !== "idle" &&
+          collecting !== undefined &&
+          hints.length === 0 &&
+          bufferableStroke(event)
+        ) {
           bufferedKeys.push(event.key);
           if (bufferedKeys.length > BUFFERED_KEY_LIMIT) bufferedKeys.shift();
           event.preventDefault();

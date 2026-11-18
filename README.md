@@ -137,6 +137,14 @@ to right, so a row rendered right-to-left in the markup still reads `as`, `ad`
 from the left edge. Nothing about this is remembered: the same page always
 produces the same order.
 
+The progressive path keeps that order within each painted batch. A candidate
+measured in a later batch joins the end of the issued stream even if it sits
+above an earlier batch, because labels are frozen the moment they are painted.
+That trades exact global visual order for never moving a badge under the
+reader's fingers. When the DOM order already matches reading order, which is
+the common grid and list case, the slow path ends with the same pairing as the
+fast path; the label length can still differ by one key.
+
 An element keeps the label it had last round. After each round the plugin
 records which label each element carried, keyed by the element's identity (an
 explicit `data-row-key`, the composer marker, or a `data-slot` boundary plus the
@@ -240,13 +248,28 @@ structured chip.
 
 ## Performance on a busy page
 
-A round is two stages with different costs, and neither grows with the square
-of the page. Collection is an interruptible walk: the activation frame scans
-only as many candidates as fit in a fraction of the display frame, and later
-frames resume from where the walk stopped. Labels cannot be issued until the
-total count and the visual order are known, so stage B assigns every label and
-paints the whole batch once, at the end of the scan. Neither stage is on the
-critical path of a stroke:
+A round has three paths, chosen by how long collection takes. A page that
+finishes the walk in the activation frame paints every label at once, exactly
+as before. A page still walking after three animation frames switches to the
+progressive path: the candidates collected so far are painted and become
+typeable immediately, and each later frame appends the batch it just accepted.
+A page that crosses one second stops walking and paints what it has. The
+trigger is a frame count, not a millisecond threshold, so its shape stays the
+same on 60Hz and 143Hz displays; the one second cap is wall clock measured from
+activation. Neither path puts collection or painting on the critical path of a
+stroke.
+
+The slow path has to know how many keys a label takes before the walk ends. It
+uses the raw `querySelectorAll` count taken at activation, which touches no
+layout and is an upper bound of the visible candidates. Labels can therefore
+come out one or more levels longer than the finished round needs (100
+candidates where 50 are visible means three keys instead of two). That is the accepted price of
+showing something early. Deciding the length later would change labels already
+under the reader's fingers, and label drift is the one thing this design
+refuses. Each extra key costs one stroke; the fast path still uses the filtered
+count and keeps the shortest labels.
+
+The cost split:
 
 - The candidate walk is interruptible and budgeted. Every slice checks the
   clock before the next candidate and returns to the next animation frame when
@@ -264,12 +287,17 @@ critical path of a stroke:
   treated as unmeasurable and 16.7ms is used.
 - Stage B is pure array work. Sorting the candidates into reading order and
   assigning one label length for the whole round never reads layout or style,
-  which is what keeps the last slice cheap even on a busy page.
+  which is what keeps the last slice cheap even on a busy page. The
+  progressive path issues labels per batch in the order the batches are
+  painted, so an issued label never moves again; the cost is array work on the
+  new batch only.
 - Badges live on one canvas, not in the DOM. A stroke repaints the round in
   place: the lit/dim split is a function of the typed prefix, so a full redraw
   of 600 badges measured 1.7ms including a forced GPU read, against 32.8ms for
-  the DOM round. There is no per-badge node, no containing-block bookkeeping
-  and no style invalidation for the host page.
+  the DOM round. The progressive path appends a batch without clearing the
+  canvas, so a later frame pays for its new badges instead of redrawing the
+  whole growing prefix. There is no per-badge node, no containing-block
+  bookkeeping and no style invalidation for the host page.
 
 The quantity that answers "how much of a frame does the plugin take" is the
 plugin's own probe: every stage A collect slice and every paint is timed with
@@ -285,9 +313,11 @@ number; `activate.handlerMs` adds the synchronous dispatch cost when the full
 keypress-to-typing span is wanted.
 
 Labels are fixed for the whole round: label, target and rect are snapshotted
-when the round opens, so only the prefix can change inside a round. A new round
-mints new labels, which is what stops a label from staying over a target that
-has moved since.
+when the round opens, so only the prefix can change inside a round. The fast
+path fixes the length from the filtered count at commit; the progressive path
+fixes it from the raw candidate total when it starts painting, which is why it
+can be one or more keys longer. A new round mints new labels, which is what stops a
+label from staying over a target that has moved since.
 
 ## Frame budget bench
 
@@ -346,9 +376,10 @@ For each candidate tier the page lays out a viewport-filling grid of visible
 buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
 discards their readings. Every activation waits until `app.visibleLabels()`
 holds the expected number of painted labels before the page reads them or sends
-the first label stroke: `app.labels()` is complete the moment stage A commits,
-so it would call a round usable while the canvas is still painting it, and a
-fixed frame count would measure a prefix of the round. The wait is bounded at
+the first label stroke. `visibleLabels()` is the canvas truth: on the
+progressive path it grows batch by batch while `labels()` only names the
+painted set, and a fixed frame count would read a prefix of the round. The wait
+is bounded at
 200 animation frames or 3 seconds and fails the tier with `collection did not
 settle` instead of silently comparing a half-round. Warmup is still required:
 without it the first tier pays JIT compilation, first layout and GC warmup and

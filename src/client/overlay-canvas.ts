@@ -87,6 +87,20 @@ export interface CanvasSurface {
    * patch pixels.
    */
   paint(hints: readonly Hint[], bounds: OverlayViewport, pending: string, count: number): void;
+  /**
+   * Draw hints in `[from, to)` without clearing what is already there.
+   *
+   * The slow path appends one collected batch per frame, and a full repaint of
+   * the growing prefix would make each frame pay for every badge again. The
+   * canvas keeps the earlier badges; only the new tail costs anything.
+   */
+  paintRange(
+    hints: readonly Hint[],
+    bounds: OverlayViewport,
+    pending: string,
+    from: number,
+    to: number,
+  ): void;
   clear(): void;
 }
 
@@ -190,6 +204,22 @@ export function createCanvasSurface(
     ctx.restore();
   }
 
+  function drawRange(
+    ctx: CanvasRenderingContext2D,
+    hints: readonly Hint[],
+    bounds: OverlayViewport,
+    pending: string,
+    from: number,
+    to: number,
+  ): void {
+    ctx.textBaseline = "middle";
+    for (let index = from; index < to; index += 1) {
+      const hint = hints[index];
+      if (hint === undefined) break;
+      paintBadge(ctx, hint, bounds, pending);
+    }
+  }
+
   return {
     canvas,
     paint(hints, bounds, pending, count): void {
@@ -204,12 +234,18 @@ export function createCanvasSurface(
         return;
       }
       context.clearRect(0, 0, bounds.width, bounds.height);
-      context.textBaseline = "middle";
-      for (let index = 0; index < count; index += 1) {
-        const hint = hints[index];
-        if (hint === undefined) break;
-        paintBadge(context, hint, bounds, pending);
+      drawRange(context, hints, bounds, pending, 0, count);
+    },
+    paintRange(hints, bounds, pending, from, to): void {
+      resize(bounds);
+      if (context === null) {
+        canvas.textContent = hints
+          .slice(0, to)
+          .map((hint) => hint.label)
+          .join(" ");
+        return;
       }
+      drawRange(context, hints, bounds, pending, from, to);
     },
     clear(): void {
       if (context === null) {
