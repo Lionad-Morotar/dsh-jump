@@ -124,3 +124,40 @@ describe("badge positioning", () => {
     overlay.destroy();
   });
 });
+
+describe("top layer", () => {
+  /**
+   * 目标可能是 popover（峰价提醒一类）或 showModal 打开的对话框，它们整体放在
+   * top layer 上，会盖住任何 z-index 的普通元素。徽章画在它们下面等于不存在，
+   * 用户看得到卡片、看不到标签。容器必须以 manual popover 进场，每轮重新抬一次。
+   */
+  it("enters the top layer as a manual popover and re-raises on a new round", () => {
+    const proto = dom.window.Element.prototype as unknown as Record<string, unknown>;
+    const shown: Element[] = [];
+    proto["showPopover"] = function (this: Element) { shown.push(this) };
+    proto["hidePopover"] = function () {};
+    try {
+      const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+      overlay.render(hintsOf(["as"]));
+      const first = document.querySelector<HTMLElement>(OVERLAY);
+      expect(first?.getAttribute("popover")).toBe("manual");
+      expect(shown).toContain(first);
+      overlay.destroy();
+      overlay.render(hintsOf(["as"]));
+      expect(shown).toHaveLength(2);
+      overlay.destroy();
+    } finally {
+      delete proto["showPopover"];
+      delete proto["hidePopover"];
+    }
+  });
+
+  it("falls back to a plain container when popovers are unavailable", () => {
+    // 没有 showPopover 的宿主里留着 popover 属性会被 UA 样式表按「未打开」藏掉，
+    // 徽章会整轮消失，所以拿不到能力时不能留下这个属性。
+    const overlay = createOverlay({ doc: document, viewport: () => VIEWPORT });
+    overlay.render(hintsOf(["as"]));
+    expect(document.querySelector<HTMLElement>(OVERLAY)?.hasAttribute("popover")).toBe(false);
+    overlay.destroy();
+  });
+});

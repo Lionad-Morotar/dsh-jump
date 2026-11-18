@@ -66,12 +66,43 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     if (container !== undefined) return container;
     const el = doc.createElement("div");
     el.dataset.dshJumpOverlay = "";
-    // Max int z-index plus pointer-events:none: the overlay floats above
-    // everything while never stealing the hover or click it is labeling.
-    el.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none";
+    // Max int z-index plus pointer-events:none: the overlay floats above every
+    // normally-painted element while never stealing the hover or click it is
+    // labeling. The UA's closed-popover box is neutralized explicitly: without
+    // these resets `showPopover()` would bring margin, border, padding and an
+    // opaque background with it.
+    el.style.cssText =
+      "position:fixed;inset:0;margin:0;padding:0;border:0;background:transparent;overflow:visible;" +
+      "z-index:2147483647;pointer-events:none";
     doc.documentElement.append(el);
     container = el;
+    raiseTopLayer(el);
     return el;
+  }
+
+  /**
+   * Put the overlay on the top layer as a manual popover.
+   *
+   * z-index cannot reach past the top layer: a card opened with `showPopover()`
+   * or `showModal()` paints above every normal element no matter how large its
+   * z-index is, and the badge minted for its button ends up hidden behind the
+   * card. Showing the overlay itself as a popover puts it on the same layer;
+   * because it is shown after the card, it lands on top. `manual` keeps it out
+   * of light-dismiss and Escape handling, which belong to the jump round.
+   *
+   * The attribute is only kept when the browser actually opened the popover.
+   * A closed `[popover]` is `display:none` in the UA sheet, so leaving the
+   * attribute behind after a failed call would blank out the whole round.
+   */
+  function raiseTopLayer(el: HTMLElement): void {
+    const popover = el as HTMLElement & { showPopover?: () => void };
+    if (typeof popover.showPopover !== "function") return;
+    el.setAttribute("popover", "manual");
+    try {
+      popover.showPopover();
+    } catch {
+      el.removeAttribute("popover");
+    }
   }
 
   /** One painted run of label text, tagged so the split can be styled by part. */
@@ -174,7 +205,17 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     },
     destroy(): void {
       badges = new Map();
-      container?.remove();
+      const el = container as (HTMLElement & { hidePopover?: () => void }) | undefined;
+      if (el !== undefined && typeof el.hidePopover === "function") {
+        // Leaves the top layer before the node goes away; a detached popover
+        // would otherwise stay registered until the browser cleans it up.
+        try {
+          el.hidePopover();
+        } catch {
+          // Already closed or unsupported: removing the node is enough.
+        }
+      }
+      el?.remove();
       container = undefined;
     },
   };
