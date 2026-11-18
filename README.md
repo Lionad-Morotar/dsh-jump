@@ -85,10 +85,8 @@ The top level of that file must always stay a YAML array (`[]` when empty).
   ……），避免短标签抢走长标签的首击；超过 81 个则整轮升到三键。
 - 激活时先放掉当前焦点，再采集标签。焦点留在输入框里时，下一击会被输入法吃掉；
   放掉之后，从输入框和从按钮激活是同一条路。
-- macOS 上，激活还会记住当前输入源并切到美式键盘（`com.apple.keylayout.ABC`）。
-  `Esc`、打完一个标签、切到别的应用、或插件卸载时还回去。切换由宿主进程调用本机的 `im-select`
-  完成，页面本身切不了输入法。二进制不在、或宿主没有 web 服务时，这一步跳过，
-  标签模式照常打开。
+- 激活先放掉焦点就够：焦点离开输入框后，按键以裸 keydown 到达，输入法不会组合。
+  不碰系统输入源，也就不会有「切回来之后还要手动按 Shift 才能打中文」的问题。
 - 命中的元素决定动的含义：文本输入面（textarea、带光标的 input、
   `contenteditable`）聚焦并把光标落到草稿末尾，其余元素在点击模式下走完整的
   合成指针/鼠标/点击序列，聚焦模式下只调 `focus()`。
@@ -176,14 +174,11 @@ active all keydown events are consumed by the state machine, so typing inside
 a focused input never leaks through.
 
 Activation blurs the focused element before it collects labels, so a letter
-typed next is a label even when the chord was pressed inside a text field. On
-macOS the host process also remembers the current input source and switches to
-`com.apple.keylayout.ABC` for the round, then switches back on Escape, on a
-completed label, or when the plugin unloads. The page cannot do this itself;
-it asks the host over `POST /api/dsh-jump/ime`, and the host runs `im-select`.
-A missing binary or a host without a web server skips the switch. Labels still
-appear. `im-select` is a machine dependency, not a package dependency: install
-it yourself (`brew install im-select`) if you want the switch.
+typed next is a label even when the chord was pressed inside a text field.
+Releasing focus is all it takes: once the field has lost focus, the next
+keydown arrives bare and the input method never starts composing. The system
+input source is never switched, so the old round trip of having to press Shift
+by hand after a round before Chinese input worked again cannot happen.
 
 ## Reference mode
 
@@ -296,16 +291,26 @@ since.
 
 ## Layout
 
-- `src/index.ts` host half: serves `POST /api/dsh-jump/ime` and runs `im-select`
-- `src/host/input-source.ts` one round: remember, switch to ABC, restore
-- `src/host/ime-route.ts` the route, re-attached if the web server appears late
+- `src/index.ts` host half: a mounted no-op entry, kept so the Loader row has a
+  plugin object to load; all behaviour lives in the browser half
 - `src/client/entry.ts` loader adapter: takes the factory's `require`, resolves
   React, then hands the real context to `runtime.ts`
 - `src/client/runtime.ts` composition: one bindings store shared by the listener
   and the settings row
+- `src/client/app.ts` client wiring: folds real key events through `keys.ts`
+  and owns every DOM side effect
 - `src/client/hints.ts` hint collection and label stream
+- `src/client/reach.ts` reachability oracle: candidates a real user cannot see
+  or hit do not get labels
+- `src/client/identity.ts` element identity and the label memory across rounds
+- `src/client/overlay.ts` the label overlay: one fixed container, badge minting
+  and in-place repaint
 - `src/client/target.ts` which action a matched target needs (click vs focus)
 - `src/client/keys.ts` key state machine
+- `src/client/reference.ts` reference mode: element descriptions, the composer
+  chip, and the writer behind it
+- `src/client/notice.ts` one-shot bottom-centre notice when a reference cannot
+  be revealed
 - `src/client/bindings.ts` chord model, platform defaults, validation, formatting
 - `src/client/store.ts` the persisted pair, total on read, normalized on write
 - `src/client/recorder.ts` one keydown into a candidate chord
@@ -314,14 +319,13 @@ since.
 - `src/client/react.ts` the narrowed React slice and the recording listener
 - `src/client/copy.ts` the page's Chinese and English copy
 - `src/client/config.ts` selectors and the label key map
-- `src/client/ime.ts` the page's begin/end notice to the host route
 - `lib/` committed build products (`pnpm run build`)
 
 ## Development
 
 ```sh
 pnpm install
-pnpm test        # vitest, 12 files
+pnpm test        # vitest, 18 files
 pnpm typecheck   # tsc --noEmit
 pnpm run build   # esbuild src -> lib, committed
 ```
@@ -330,9 +334,10 @@ pnpm run build   # esbuild src -> lib, committed
 the package and never runs a build step, so the built files have to be in the
 tarball and in the repository.
 
-The build produces a two-entry package: `lib/index.js` is the host half (the
-input-source route) and `lib/client.js` is the browser half inlined with its
-React imports resolved at load time.
+The build produces a two-entry package: `lib/index.js` is the host half, a
+mounted no-op kept so the Loader row has a plugin object to load, and
+`lib/client.js` is the browser half inlined with its React imports resolved at
+load time.
 
 ## Releasing
 
