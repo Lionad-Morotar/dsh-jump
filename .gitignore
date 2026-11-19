@@ -9,3 +9,6 @@ zRefs/
 # Build output is committed: the Harness profile loads lib/ straight from the
 # installed package and never runs a build step.
 !lib/
+
+# perch 客户端自动生成的项目手册与 MCP 配置，不属于仓库内容
+.perch/
