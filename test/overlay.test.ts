@@ -13,7 +13,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { generateLabels, type Hint } from "../src/client/hints.ts";
 import { BADGE_HEIGHT, BADGE_WIDTH, badgeOrigin } from "../src/client/overlay-canvas.ts";
-import { createOverlay, SYNC_PAINT_LIMIT, type FrameClock, type Overlay } from "../src/client/overlay.ts";
+import {
+  CONFIRM_FADE_IN_MS,
+  CONFIRM_FADE_MS,
+  createOverlay,
+  SYNC_PAINT_LIMIT,
+  type ConfirmTimers,
+  type FrameClock,
+  type Overlay,
+} from "../src/client/overlay.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -727,40 +735,51 @@ describe("no default border", () => {
 });
 
 /**
- * 命中确认框。
+ * 命中确认框：渐入、全亮保持 3 帧、120ms 淡出。
  *
- * 敲完标签后浮层整轮消失，用户看不到刚才打中了哪个元素。确认框在动作派发之后
- * 才出现，只负责「刚才那一下落在哪」，所以它必须是独立元素而不是画在 canvas 上：
- * 画布随轮销毁，而确认要活过这一轮。
+ * 敲完标签浮层整轮消失，用户看不到刚才打中了哪个元素。确认框补上这个回执，
+ * 但它只属于「整个标签打完」那一刻：前缀匹配、敲到一半都不算激活，什么都不该
+ * 出现。时间线用 rAF 数帧而不是毫秒常数，这样 60Hz 和 145Hz 上是同一个视觉
+ * 长度。
  *
- * 断言落在 DOM 形态与几何上：位置、不吃事件、到点消失、不叠。
+ * 断言落在 DOM 形态与 opacity 序列上：jsdom 没有合成器，所以这里读的是绘制层
+ * 每帧写进 style 的值，而不是像素。
  */
 describe("hit confirmation", () => {
   const CONFIRM = "[data-dsh-jump-confirm]";
 
-  /** 手动推进的定时器：jsdom 里没有真实时钟，300ms 只在测试说走时走。 */
-  function fakeTimers(): { setTimeout: (run: () => void, ms: number) => number; clearTimeout: (handle: number) => void; advance(ms: number): void; pending(): number } {
+  /**
+   * 手动推进的帧与定时器。
+   *
+   * jsdom 既没有真实帧也没有真实时钟，确认框的每个阶段都必须由测试说走才走。
+   */
+  function fakeTimers(): ConfirmTimers & {
+    step(ms: number): void;
+    frames(n: number): void;
+  } {
     let nextHandle = 1;
-    const queued = new Map<number, { run: () => void; at: number }>();
     let now = 0;
+    const frames = new Map<number, (time: number) => void>();
     return {
-      setTimeout: (run, ms) => {
+      requestFrame: (run) => {
         const handle = nextHandle++;
-        queued.set(handle, { run, at: now + ms });
+        frames.set(handle, run);
         return handle;
       },
-      clearTimeout: (handle) => {
-        queued.delete(handle);
+      cancelFrame: (handle) => {
+        frames.delete(handle);
       },
-      advance: (ms) => {
+      now: () => now,
+      step: (ms) => {
         now += ms;
-        for (const [handle, entry] of [...queued]) {
-          if (entry.at > now) continue;
-          queued.delete(handle);
-          entry.run();
+      },
+      frames: (n) => {
+        for (let i = 0; i < n; i += 1) {
+          const due = [...frames.entries()];
+          frames.clear();
+          for (const [, run] of due) run(now);
         }
       },
-      pending: () => queued.size,
     };
   }
 
@@ -768,24 +787,80 @@ describe("hit confirmation", () => {
     return document.querySelector<HTMLElement>(CONFIRM);
   }
 
-  it("shows a box over the target and removes it after the duration", () => {
+  function opacityOf(): number {
+    const raw = confirmOf()?.style.opacity ?? "";
+    return raw === "" ? 1 : Number(raw);
+  }
+
+  it("fades in from transparent instead of popping", () => {
     const { overlay } = mount();
     const timers = fakeTimers();
-    const rect = { x: 120, y: 80, w: 60, h: 24 };
+    overlay.confirm({ x: 120, y: 80, w: 60, h: 24 }, { timers });
 
-    overlay.confirm(rect, { timers });
     const box = confirmOf();
     expect(box).not.toBeNull();
     // 框要落在目标上，而不是页角。
-    expect(box?.style.left).toBe(String(rect.x) + "px");
-    expect(box?.style.top).toBe(String(rect.y) + "px");
-    expect(box?.style.width).toBe(String(rect.w) + "px");
-    expect(box?.style.height).toBe(String(rect.h) + "px");
+    expect(box?.style.left).toBe("120px");
+    expect(box?.style.top).toBe("80px");
+    expect(box?.style.width).toBe("60px");
+    expect(box?.style.height).toBe("24px");
+    // 第一帧是透明的：渐入的起点，不是弹出。
+    expect(opacityOf()).toBe(0);
 
-    // 300ms 前还在，到点就没了。
-    timers.advance(299);
-    expect(confirmOf()).not.toBeNull();
-    timers.advance(1);
+    // 渐入中途有中间值。
+    timers.step(CONFIRM_FADE_IN_MS / 2);
+    timers.frames(1);
+    const mid = opacityOf();
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+  });
+
+  it("holds full opacity for exactly three frames, then starts fading", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+
+    // 走完渐入，落到全亮。
+    timers.step(CONFIRM_FADE_IN_MS);
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+
+    // 全亮保持 3 个回调：第 3 个之后仍然是 1。
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+
+    // 第 4 个回调开始下降。
+    timers.step(CONFIRM_FADE_MS / 2);
+    timers.frames(1);
+    const falling = opacityOf();
+    expect(falling).toBeLessThan(1);
+    expect(falling).toBeGreaterThan(0);
+  });
+
+  it("fades out over 120ms and then removes the box", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+
+    // 渐入走完，再数 3 个保持帧，第 4 个回调已经在下落。
+    timers.step(CONFIRM_FADE_IN_MS);
+    timers.frames(1);
+    timers.frames(3);
+    expect(opacityOf()).toBe(1);
+    timers.step(CONFIRM_FADE_MS / 2);
+    timers.frames(1);
+
+    // 淡出中途有中间值。
+    const mid = opacityOf();
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+
+    // 走完 120ms 就归零并当场移除：用户看到的最后一帧是淡出，不是一块停在
+    // 0 透明度的空盒子。
+    timers.step(CONFIRM_FADE_MS);
+    timers.frames(1);
     expect(confirmOf()).toBeNull();
   });
 
@@ -816,9 +891,9 @@ describe("hit confirmation", () => {
 
     expect(document.querySelectorAll(CONFIRM)).toHaveLength(1);
     expect(confirmOf()?.style.left).toBe("40px");
-    // 旧的那条定时器不能把新框提前收走。
-    timers.advance(300);
-    expect(confirmOf()).toBeNull();
+    // 旧框的帧循环不能把新框提前收走。
+    timers.frames(40);
+    expect(confirmOf()).not.toBeNull();
   });
 
   it("clears on demand, for Esc and for a new round", () => {
@@ -827,12 +902,12 @@ describe("hit confirmation", () => {
     overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
     overlay.clearConfirm();
     expect(confirmOf()).toBeNull();
-    // 清掉之后排队的那一枪不能再打一次。
-    timers.advance(300);
+    // 清掉之后排队的那一帧不能再画一次。
+    timers.frames(10);
     expect(confirmOf()).toBeNull();
   });
 
-  it("drops the transition when the reader asked for reduced motion", () => {
+  it("skips both transitions under reduced motion but still holds three frames", () => {
     const { overlay } = mount();
     const timers = fakeTimers();
     const original = dom.window.matchMedia;
@@ -844,26 +919,21 @@ describe("hit confirmation", () => {
     });
     try {
       overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
-      // 减少动态偏好下不做过渡：框直接出现，到点直接消失。
+      // 减少动态偏好下没有渐入：第一帧就是全亮。
+      expect(opacityOf()).toBe(1);
       expect(confirmOf()?.style.transition).toBe("");
-    } finally {
-      (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
-    }
-  });
 
-  it("keeps the transition when motion is allowed", () => {
-    const { overlay } = mount();
-    const timers = fakeTimers();
-    const original = dom.window.matchMedia;
-    (dom.window as unknown as Record<string, unknown>)["matchMedia"] = (query: string) => ({
-      matches: false,
-      media: query,
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-    });
-    try {
-      overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
-      expect(confirmOf()?.style.transition).toContain("opacity");
+      // 保持同样的 3 帧：第 1、2、3 个回调都是全亮。
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+
+      // 第 4 个回调直接消失，没有淡出中间态。
+      timers.frames(1);
+      expect(confirmOf()).toBeNull();
     } finally {
       (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
     }
