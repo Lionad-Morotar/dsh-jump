@@ -126,6 +126,21 @@ describe("clientPlugin", () => {
     expect(doc.querySelector("[data-dsh-jump-overlay]")).toBeNull();
   });
 
+  it("keeps one overlay when the desktop host applies the client twice", () => {
+    const win = dom.window;
+    const button = doc.createElement("button");
+    button.getBoundingClientRect = () =>
+      ({ x: 0, y: 0, width: 10, height: 10, left: 0, top: 0, right: 10, bottom: 10, toJSON: () => ({}) }) as DOMRect;
+    doc.body.append(button);
+    const { ctx } = registry();
+    const first = clientPlugin.apply(ctx);
+    const second = clientPlugin.apply(ctx);
+    win.dispatchEvent(new win.KeyboardEvent("keydown", { key: "h", metaKey: true, bubbles: true, cancelable: true }));
+    expect(doc.querySelectorAll("[data-dsh-jump-overlay]")).toHaveLength(1);
+    second();
+    first();
+  });
+
   it("removes its listener on dispose, leaving the page as it found it", () => {
     const win = dom.window;
     const bare = { get: () => undefined, inject: () => () => undefined };

@@ -42,6 +42,14 @@ function resolveReact(): RowReact | null {
 }
 
 /**
+ * The desktop host applies the client plugin twice against the same page: once
+ * from the profile sync and once from the client mount. A second runtime would
+ * attach a second key listener and draw a second overlay, so the newer apply
+ * owns the page and the older one must be torn down first.
+ */
+let activeDispose: (() => void) | null = null;
+
+/**
  * The object the loader factory returns; the shape mirrors the host half.
  *
  * Cordis calls apply(ctx, config): the context first, this plugin's config
@@ -54,13 +62,22 @@ export const clientPlugin = {
   inject: [] as string[],
 
   apply(ctx: unknown, config?: JumpConfig): () => void {
+    activeDispose?.();
     const runtime = createRuntime({
       ctx: ctx as RuntimeContext,
       platform: platformOf(),
       React: resolveReact(),
       config,
     });
-    return () => runtime.dispose();
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      runtime.dispose();
+      if (activeDispose === dispose) activeDispose = null;
+    };
+    activeDispose = dispose;
+    return dispose;
   },
 };
 

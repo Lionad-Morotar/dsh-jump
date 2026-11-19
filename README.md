@@ -161,15 +161,12 @@ Labels are rendered as an overlay by the client entry; while jump mode is
 active all keydown events are consumed by the state machine, so typing inside
 a focused input never leaks through.
 
-Activation blurs the focused element before it collects labels, so the next
-letter is a label even when the chord was pressed inside a text field. On
-macOS the host process also remembers the current input source, switches to
-`com.apple.keylayout.ABC` for the round, and switches back on Escape, on a
-completed label, or when the plugin unloads. The page cannot do this itself:
-it asks the host over `POST /api/dsh-jump/ime`, and the host runs
-`im-select`. A missing binary or a host without a web server skips the switch
-and labels still appear. `im-select` is a machine dependency, not a package
-one: install it yourself with `brew install im-select`.
+Activation blurs the focused element before it collects labels, so a letter
+typed next is a label even when the chord was pressed inside a text field.
+Releasing focus is all it takes: once the field has lost focus, the next
+keydown arrives bare and the input method never starts composing. The system
+input source is never switched, so the old round trip of having to press Shift
+by hand after a round before Chinese input worked again cannot happen.
 
 ## Reference mode
 
@@ -270,16 +267,26 @@ moved since.
 
 ## Layout
 
-- `src/index.ts` host half: serves `POST /api/dsh-jump/ime` and runs `im-select`
-- `src/host/input-source.ts` one round: remember, switch to ABC, restore
-- `src/host/ime-route.ts` the route, re-attached if the web server appears late
+- `src/index.ts` host half: a mounted no-op entry, kept so the Loader row has a
+  plugin object to load; all behaviour lives in the browser half
 - `src/client/entry.ts` loader adapter: takes the factory's `require`, resolves
   React, then hands the real context to `runtime.ts`
 - `src/client/runtime.ts` composition: one bindings store shared by the listener
   and the settings row
+- `src/client/app.ts` client wiring: folds real key events through `keys.ts`
+  and owns every DOM side effect
 - `src/client/hints.ts` hint collection and label stream
+- `src/client/reach.ts` reachability oracle: candidates a real user cannot see
+  or hit do not get labels
+- `src/client/identity.ts` element identity and the label memory across rounds
+- `src/client/overlay.ts` the label overlay: one fixed container, badge minting
+  and in-place repaint
 - `src/client/target.ts` which action a matched target needs (click vs focus)
 - `src/client/keys.ts` key state machine
+- `src/client/reference.ts` reference mode: element descriptions, the composer
+  chip, and the writer behind it
+- `src/client/notice.ts` one-shot bottom-centre notice when a reference cannot
+  be revealed
 - `src/client/bindings.ts` chord model, platform defaults, validation, formatting
 - `src/client/store.ts` the persisted pair, total on read, normalized on write
 - `src/client/recorder.ts` one keydown into a candidate chord
@@ -288,7 +295,6 @@ moved since.
 - `src/client/react.ts` the narrowed React slice and the recording listener
 - `src/client/copy.ts` the page's Chinese and English copy
 - `src/client/config.ts` selectors and the label key map
-- `src/client/ime.ts` the page's begin/end notice to the host route
 - `lib/` committed build products (`pnpm run build`)
 
 ## Development
@@ -304,9 +310,10 @@ pnpm run build   # esbuild src -> lib, committed
 the package and never runs a build step, so the built files have to be in the
 tarball and in the repository.
 
-The build produces a two-entry package: `lib/index.js` is the host half (the
-input-source route) and `lib/client.js` is the browser half inlined with its
-React imports resolved at load time.
+The build produces a two-entry package: `lib/index.js` is the host half, a
+mounted no-op kept so the Loader row has a plugin object to load, and
+`lib/client.js` is the browser half inlined with its React imports resolved at
+load time.
 
 ## Releasing
 
