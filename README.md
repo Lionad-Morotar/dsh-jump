@@ -16,7 +16,7 @@ focused.
 
 ![dsh-jump active: letter labels covering the sidebar and composer of the DeepSeek Harness web UI](./assets/jump-active.png)
 
-[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [How labels are assigned](#how-labels-are-assigned) · [Performance](#performance-on-a-busy-page) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
+[中文](#中文) · [Install](#install) · [What gets labelled](#what-gets-labelled) · [How labels are assigned](#how-labels-are-assigned) · [Performance](#performance-on-a-busy-page) · [Frame budget bench](#frame-budget-bench) · [v1 boundaries](#v1-boundaries) · [Layout](#layout)
 
 ## Install
 
@@ -137,6 +137,14 @@ to right, so a row rendered right-to-left in the markup still reads `as`, `ad`
 from the left edge. Nothing about this is remembered: the same page always
 produces the same order.
 
+The progressive path keeps that order within each painted batch. A candidate
+measured in a later batch joins the end of the issued stream even if it sits
+above an earlier batch, because labels are frozen the moment they are painted.
+That trades exact global visual order for never moving a badge under the
+reader's fingers. When the DOM order already matches reading order, which is
+the common grid and list case, the slow path ends with the same pairing as the
+fast path; the label length can still differ by one key.
+
 An element keeps the label it had last round. After each round the plugin
 records which label each element carried, keyed by the element's identity (an
 explicit `data-row-key`, the composer marker, or a `data-slot` boundary plus the
@@ -240,33 +248,309 @@ structured chip.
 
 ## Performance on a busy page
 
-A round costs one collection pass and one paint, and both used to grow with the
-square of the page. Measured on a 1841×1274 view with 1189 visible candidates
-over 25k DOM nodes, a round took 72ms to collect and 5.4ms to repaint on every
-stroke of a three-key label. Neither is on the critical path now:
+A round has three paths, chosen by how long collection takes. A page that
+finishes the walk in the activation frame paints every label at once, exactly
+as before. A page still walking after three animation frames switches to the
+progressive path: the candidates collected so far are painted and become
+typeable immediately, and each later frame appends the batch it just accepted.
+A page that crosses one second stops walking and paints what it has. The
+trigger is a frame count, not a millisecond threshold, so its shape stays the
+same on 60Hz and 143Hz displays; the one second cap is wall clock measured from
+activation. Neither path puts collection or painting on the critical path of a
+stroke.
 
-- Containers are decided by ancestor marking. A candidate that contains another
-  candidate is a wrapper and the deepest target wins; comparing every pair is
-  quadratic with an ancestor walk inside it, while walking up from each
-  candidate and marking the candidates it passes costs O(n · depth) and lands
-  on the same set, because `contains` means exactly "is an ancestor of". 72ms
-  to 8ms.
-- Badges are keyed by label and updated in place. The lit/dim split is a
-  function of the typed prefix alone, so a badge whose prefix did not change is
-  not touched at all; only the badges the prefix rules out get an opacity
-  write, and only the few it still reaches are re-segmented. 5.4ms to 0.1ms per
-  stroke.
-- Badges share one containing block. They are `position:absolute` inside a
-  container that is `fixed; inset:0` rather than fixed themselves: the viewport
-  coordinate system is the same, and the browser tracks one containing block
-  instead of one per badge. Rendering was verified pixel-identical against the
-  previous build.
+The slow path has to know how many keys a label takes before the walk ends. It
+uses the raw `querySelectorAll` count taken at activation, which touches no
+layout and is an upper bound of the visible candidates. Labels can therefore
+come out one or more levels longer than the finished round needs (100
+candidates where 50 are visible means three keys instead of two). That is the accepted price of
+showing something early. Deciding the length later would change labels already
+under the reader's fingers, and label drift is the one thing this design
+refuses. Each extra key costs one stroke; the fast path still uses the filtered
+count and keeps the shortest labels.
 
-In-place updating leans on the snapshot rule in
-[v1 boundaries](#v1-boundaries): label, target and rect are fixed when the round
-opens, so only the prefix can change inside a round. A new round mints new
-badges, which is what stops a label from staying over a target that has moved
-since.
+The cost split:
+
+- The candidate walk is interruptible and budgeted. Every slice checks the
+  clock before the next candidate and returns to the next animation frame when
+  its share of the frame is spent, so a 600-candidate page pays a small slice
+  on the activation frame instead of the whole page. A slice is 12% of the
+  measured display budget, clamped to 0.4-1.5ms.
+- The display budget is measured at runtime, not assumed. An idle callback
+  samples 24 animation frames (about 170ms at 143Hz, 400ms at 60Hz) and caches
+  the median, rounded up to 0.1ms. Until the sample lands the slice is computed
+  from a conservative 8ms budget, not the 60Hz fallback: a 143Hz panel must
+  never be handed a 16.7ms slice in the window where the sample is still
+  running. A hidden page starts no sample and a page hidden mid-sample abandons
+  it; a viewport resize drops the cached value and samples again, because an
+  external monitor can change the refresh rate; a median outside 4-40ms is
+  treated as unmeasurable and 16.7ms is used.
+- Stage B is pure array work. Sorting the candidates into reading order and
+  assigning one label length for the whole round never reads layout or style,
+  which is what keeps the last slice cheap even on a busy page. The
+  progressive path issues labels per batch in the order the batches are
+  painted, so an issued label never moves again; the cost is array work on the
+  new batch only.
+- Badges live on one canvas, not in the DOM. A stroke repaints the round in
+  place: the lit/dim split is a function of the typed prefix, so a full redraw
+  of 600 badges measured 1.7ms including a forced GPU read, against 32.8ms for
+  the DOM round. The progressive path appends a batch without clearing the
+  canvas, so a later frame pays for its new badges instead of redrawing the
+  whole growing prefix. There is no per-badge node, no containing-block
+  bookkeeping and no style invalidation for the host page.
+
+The quantity that answers "how much of a frame does the plugin take" is the
+plugin's own probe: every stage A collect slice and every paint is timed with
+two `performance.now()` reads and flushed as one frame-aligned pair. That is
+the acceptance input. Event Timing and LoAF are retained as coarse
+corroboration only: Event Timing floors observation at 16ms, and LoAF reports
+only frames over 50ms, so neither can see a 2ms handler on a 7ms display.
+`timeToUsable` remains a diagnostic: the wall clock from the activation
+dispatch returning to every label of the round being painted, plus the
+animation frames observed in that wait. A background tab throttles animation
+frames and inflates the wall clock, so the frame count is the steadier relative
+number; `activate.handlerMs` adds the synchronous dispatch cost when the full
+keypress-to-typing span is wanted.
+
+Labels are fixed for the whole round: label, target and rect are snapshotted
+when the round opens, so only the prefix can change inside a round. The fast
+path fixes the length from the filtered count at commit; the progressive path
+fixes it from the raw candidate total when it starts painting, which is why it
+can be one or more keys longer. A new round mints new labels, which is what stops a
+label from staying over a target that has moved since.
+
+## Frame budget bench
+
+`bench/measure.mjs` produces the plugin's own per-frame occupancy, plus two
+coarse corroboration readings: long frames attributed to the plugin bundle and
+the latency of a real activation keydown. The plugin probe is the acceptance
+input because only the plugin can see its 1-2ms synchronous work: LoAF has a
+50ms floor and Event Timing a 16ms floor, both far above a 7ms frame budget.
+The bench bundles `src/client/app.ts` with the repo's own esbuild into one
+browser IIFE, writes the measurement page and its external bundle side by
+side, and prints both paths:
+
+```sh
+node bench/measure.mjs                              # or: pnpm bench
+node bench/measure.mjs --candidates 80,300,600,1200 --runs 60
+node bench/measure.mjs --runs 60 --warmup 10 --label before
+node bench/measure.mjs --out temp/bench.html        # keep the page somewhere
+node bench/measure.mjs --label before --archive temp/bench-runs  # save raw JSON
+node bench/measure.mjs --verify-fresh               # refuse any reused result
+node bench/measure.mjs --no-browser                 # generate the page only
+node bench/measure.mjs --check                      # CI-safe self-check, no browser
+```
+
+The bundle is a separate `<script src>` next to the page, never inlined. LoAF
+attribution only reports a `sourceURL` for an external script; an inline bundle
+would make the corroboration reading empty.
+
+When a local Chrome is found, the script drives it over the DevTools protocol
+and gives every candidate tier a brand-new browser context: a new target, new
+storage and a new JS realm, navigated to the page with a random query string.
+Before a reading is accepted, the driver checks that this document was reached
+by a navigation (`performance.getEntriesByType("navigation")[0].type ===
+"navigate"`), that its `timeOrigin` matches the tier it just ran, and that the
+result carries the same random run token. This is what makes two runs of the
+same source comparable: one tier can never read the previous tier's
+`window.__BENCH_RESULT__`. The driver also answers the page's trusted-input
+requests with real CDP key events, because Event Timing ignores synthetic
+events. When Chrome is missing, or `--no-browser` is passed, the script only
+generates and prints the page, then exits 0 and asks for a real browser. Serve
+that page over HTTP and open it in a foreground tab; the page clears
+`window.__BENCH_RESULT__` on load, so a second run in the same tab cannot read
+the first one's JSON.
+
+Headless Chrome with `--disable-gpu` draws the canvas through software raster,
+which is exactly the part whose cost differs from a GPU-composited page. The
+probe still measures the plugin's own synchronous work, so it gives a usable
+regression signal; treat headless numbers as a smoke test rather than GPU
+acceptance evidence. Each tier stamps `judgeable`: true when the display budget
+is finite and `app.perfStats()` produced at least one frame sample, false
+otherwise. A non-judgeable tier reports `verdictAttributed: "smoke-only"`
+instead of `pass` or `fail`. LoAF and Event Timing can be empty on a fast
+machine and no longer affect judgeability. Open the same generated page in a
+real foreground tab when the question is acceptance.
+
+For each candidate tier the page lays out a viewport-filling grid of visible
+buttons, runs `min(10, runs)` full activate → first stroke → Esc cycles, and
+discards their readings. Every activation waits until `app.visibleLabels()`
+holds the expected number of painted labels before the page reads them or sends
+the first label stroke. `visibleLabels()` is the canvas truth: on the
+progressive path it grows batch by batch while `labels()` only names the
+painted set, and a fixed frame count would read a prefix of the round. The wait
+is bounded at
+200 animation frames or 3 seconds and fails the tier with `collection did not
+settle` instead of silently comparing a half-round. Warmup is still required:
+without it the first tier pays JIT compilation, first layout and GC warmup and
+reports a cold start as a tier cost, so `--warmup <n>` only tunes the count.
+Then it times `runs` complete activations, `runs` first label strokes, `runs`
+second label strokes, `runs` complete labels (each on a fresh activation) and
+one Esc exit on a fully inserted round. The second stroke is the phase where
+the dimmed batch matters: on a three-key label it must stay untouched while the
+live prefix splits further (on a two-key tier it is the completing stroke). The
+close reading reports the label count it tore down as `nodes`.
+
+### The acceptance criterion
+
+A tier's `verdictAttributed` is `pass` exactly when
+`pluginFrameMs.p99 <= frameBudgetMs * 0.5`.
+
+`app.perfStats()` returns the plugin's own frame-aligned occupancy:
+`samples.collect` times each stage A slice, `samples.paint` times each canvas
+paint, and both arrays carry one entry per observed frame, so index i of each
+belongs to the same frame and the two values can be added. A frame that runs
+only one stage contributes 0 to the other array. `frames` counts every observed
+frame while the arrays keep the latest 512, dropping the oldest first. The
+measured window starts at the warmup boundary, so cold-start paints and JIT
+cycles stay out of the acceptance reading. The probe costs two
+`performance.now()` reads per stage, allocates nothing per frame in steady
+state, never logs or serializes, and is on by default. A host
+can turn it off with `deps.perfProbe: false`; `perfStats()` then reports empty
+samples and the bench cannot judge that tier.
+
+`pluginFrameMs` is the per-frame sum of the two arrays, summarized to
+`p50`/`p99`/`max` with nearest rank. `pluginCollectMs` and `pluginPaintMs`
+repeat the same summary for each stage separately. If a host ever reports
+arrays of different lengths they are not frame-aligned; the combined reading is
+then null instead of pairing by index, and only the separate summaries stand.
+That is also why the two arrays are flushed as pairs rather than appended per
+call: per-call appends cannot be aligned without inventing frames neither stage
+observed.
+
+LoAF and Event Timing stay in the JSON as `loafEvidence` and
+`eventTimingEvidence`, each with a note saying it is coarse corroboration only.
+LoAF observes only frames over 50ms, so a 2ms plugin handler on a 7ms display
+produces no entry; when it does fire, only `scripts` whose `sourceURL` path is
+the generated bundle are summed, and frames with no plugin script are counted
+as `excludedLongFrames` instead of being blamed on the plugin. Event Timing
+floors observation at 16ms even with `durationThreshold: 0`, so a fast
+activation leaves no sample; it reports `p50`/`p95`/`max` of the keydown's
+input-to-next-paint `duration` when samples exist, with `trustedActivations`
+showing how many came from real key input rather than `dispatchEvent`. Neither
+observer can decide the verdict anymore.
+
+The old differential verdict is kept for trend reading but no longer decides
+acceptance. It compares the active over-budget rate with a blank control window
+on the same tier. That comparison cannot answer whether the plugin ran in the
+hitched frame: a blank page on this machine already misses 45-50% of 7ms frames
+under `fileproviderd` load, so the difference between two unstable rates is
+mostly noise, and the gate fails with zero plugin work. `verdictLegacyNote`
+states this in every tier and in the protocol block.
+
+The tier fields are:
+
+- `frameBudgetMs`: the display budget the app used for this tier. It runs 240
+  animation frames under a continuous animation and takes the median gap,
+  rounded up to 0.1ms, so a 143Hz panel reports about 7.0 rather than a nominal
+  60/120/144 constant. The bench injects this measurement into `createApp`, so
+  the plugin and the gate talk about one budget.
+- `budgetSource`: where that number came from: `injected` (the bench),
+  `published` (a host global), `measured` (the plugin's own sample) or
+  `fallback` (the conservative 8ms / 60Hz assumption).
+- `pluginFrameMs`: `p50`, `p99`, `max`, `samples` and `aligned` of the
+  per-frame collect plus paint sum. This is the acceptance input.
+- `pluginCollectMs` and `pluginPaintMs`: the same shape for each stage alone.
+  Both carry `samples`; `aligned` lives on `pluginFrameMs`.
+- `perfFrames`: how many frames the probe observed in total, including frames
+  already evicted from the 512-frame window.
+- `loafEvidence`: `supported`, `longFrames`, `attributedPluginMs`,
+  `attributedForcedLayoutMs`, `attributedFrames`, `excludedLongFrames`, `worst`
+  and the coarse-corroboration `note`. `worst` is the longest long-frame entry
+  with `duration`, `blockingDuration`, `renderStart` and `startTime`.
+- `eventTimingEvidence`: `supported`, `samples`, `durationMs` with
+  `p50`/`p95`/`max`, and the coarse-corroboration `note`.
+- `trustedActivations`: how many of the tier's activations were driven by real
+  key input rather than `dispatchEvent`. It is the evidence behind an Event
+  Timing sample.
+- `verdictAttributed`: `pass`, `fail`, `smoke-only` or `stale`. Only a
+  judgeable tier can pass or fail; `--verify-fresh` marks an unprovable result
+  `stale` exactly like the legacy verdict.
+- `judgeable`: true when the display budget is finite and `pluginFrameMs` has
+  at least one sample. LoAF and Event Timing are not part of this decision.
+- `verdict`: the legacy differential verdict, kept for trend reading.
+  `verdictLegacyNote` explains why it is not acceptance.
+- `maxFrameMs`, `overBudgetFrames`, `overBudgetPct`, `idleFrameBudgetMs`,
+  `idleOverBudgetFrames`, `idleOverBudgetPct`, `excessOverBudgetPct` and
+  `noiseBandPct`: the raw differential inputs, unchanged so the old trend line
+  can still be recomputed by hand.
+- `timeToUsable`: how long a reader waits before the first label stroke can
+  land. `ms` carries p50/p95/max of the wall clock from the activation
+  dispatch returning to every label of the round being painted; `frames`
+  carries p50/max of the animation frames observed in the same wait. This is a
+  historical diagnostic: it starts after dispatch and waits for paint, while
+  Event Timing starts at the input timestamp and ends at the next paint.
+
+The phase readings are retained unchanged: each phase carries `handlerMs`
+(synchronous `dispatchEvent` cost) and `nextFrameMs` (the gap from dispatch
+return to the second animation frame), and the phase-level `p50`/`p95` mirror
+`handlerMs`. They are useful for tracking a change, but they no longer decide
+acceptance. Percentiles use the nearest rank, not interpolation, so any reading
+can be recomputed from the samples by hand.
+
+Treat a p95 from fewer than 50 samples as a reference only: at 19 or fewer
+samples nearest-rank p95 is literally the maximum, and the bench prints a
+样本偏少 warning below 20. The acceptance gate uses p99, which is even more
+sample-hungry: a tier with a handful of frames can only report what those
+frames did.
+
+`loafEvidence.worst` is the longest long-frame entry recorded during the
+measured window: `duration`, `blockingDuration`, `renderStart` and `startTime`
+in milliseconds. `loafEvidence.supported` is `false` when the browser does not
+expose the entry type; `worst` is then null. Per-frame script attribution is
+not copied into `worst`; it lives in `loafEvidence.attributedPluginMs` and
+`loafEvidence.excludedLongFrames`.
+
+Every button on the measurement grid lives under `data-slot="bench.grid"` and
+carries an `aria-label`, so `identityKey` produces non-empty keys and the label
+memory recall and write-back run for real. Each tier reports `identityKeys`
+(identity-oracle calls over all activation rounds of that tier),
+`identityKeysPerRound` (the measured unit: one activation, through
+`collectHints`'s injectable `identity` dependency), `identityRounds` (the
+activations actually dispatched) and `identityPath` (`active` only when those
+calls produced keys the memory recorded). The per-round count is checked
+against `app.labels().length` after the round settles, so a drifted fixture
+fails the tier instead of reporting a number nobody measured; `--check` also
+proves that a partial read (300 hints against 96 painted labels) is rejected,
+and that a round which never reaches its expected count fails with
+`collection did not settle` rather than passing as a zero-label round.
+
+`--verify-fresh` makes the freshness contract fatal. The automated Chrome path
+already checks every tier; the flag records the requirement in the protocol and
+turns any violation into `verdict: "stale"` and `verdictAttributed: "stale"`
+with a non-zero exit. The page itself performs the same check at the end of
+each tier: `window.__BENCH_RESULT__` must not have existed before the page ran,
+the document must have `navigation.type === "navigate"`, and the result
+timestamp must be later than the navigation start. In page-only mode the JSON
+carries the `stale` verdict even though the process cannot exit for the reader.
+
+`--archive <dir>` writes the aggregated JSON the page produced to
+`<dir>/dsh-jump-bench-<label>-<stamp>.json` (stamp in UTC), creating the
+directory if needed. The file name carries the label, and an unlabelled run is
+archived as `unlabeled`. Two archive runs share one automated protocol, which
+is what makes them comparable to each other. Archive mode needs a local Chrome
+(`CHROME_PATH` overrides the usual install paths) because the page itself
+cannot write files and the repo ships no third-party browser driver.
+
+`--check` needs no browser: it bundles the app, asserts the generated page
+still carries every measurement hook (including `perfStats`, `pluginFrameMs`,
+`pluginCollectMs`, `pluginPaintMs`, `budgetSource`, `loafEvidence`,
+`eventTimingEvidence`, `verdictAttributed`, `judgeable`, `verdictLegacyNote`,
+`frameBudgetMs`, `timeToUsable`, `secondStroke`, `close`, `identityKeys` and
+`identityPath`), and proves the plugin occupancy arithmetic on a fixed series:
+collect and paint pairs add per frame, p50/p99/max are nearest-rank over the
+sums, 600 frames keep the newest 512, an empty window reports nulls, and
+mismatched array lengths are not added. It also proves the LoAF corroboration
+arithmetic (vendor scripts are not summed, a long frame without a plugin script
+is excluded, two plugin slices in one frame add up). It pins the
+`verdictAttributed` boundaries (p99 at exactly half the budget passes, one
+hundredth over fails, a missing plugin sample fails), the `judgeable` rule
+(plugin samples decide, a missing budget or empty samples is false), the
+percentile and frame-budget implementations, the legacy idle-control
+arithmetic, the identity calibration, both settle limits, the freshness
+contract, archive naming and a JSON round-trip. It fails if the page or the
+script imports anything outside the local toolchain allowlist
+(`node:child_process` is there only for the local Chrome driver).
 
 ## v1 boundaries
 

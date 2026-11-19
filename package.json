@@ -99,6 +99,7 @@
     "screenshots.json"
   ],
   "scripts": {
+    "bench": "node bench/measure.mjs",
     "build": "node scripts/build.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",

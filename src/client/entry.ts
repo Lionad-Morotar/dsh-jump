@@ -50,6 +50,42 @@ function resolveReact(): RowReact | null {
 let activeDispose: (() => void) | null = null;
 
 /**
+ * Page-level runtime registry, shared by every copy of this module.
+ *
+ * `activeDispose` only covers a second apply inside one module instance. A host
+ * that evaluates the client factory again gets a second module scope with its
+ * own `activeDispose`, so the module-level fast path alone leaves two runtimes
+ * on one page, each with its own listener and overlay. The registry therefore
+ * lives on globalThis under a registered symbol, which is the one thing two
+ * evaluations of the same source agree on, and it keys runtimes by document so
+ * a page that goes away is not kept alive by the guard itself.
+ */
+const RUNTIME_SLOTS_KEY = Symbol.for("dsh-jump.runtime-slots");
+
+interface RuntimeSlots {
+  /** Document -> the dispose of the runtime that currently owns it. */
+  readonly live: WeakMap<Document, () => void>;
+}
+
+function isRuntimeSlots(value: unknown): value is RuntimeSlots {
+  return typeof value === "object" && value !== null && (value as { live?: unknown }).live instanceof WeakMap;
+}
+
+function runtimeSlots(): RuntimeSlots {
+  const host = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  const existing = host[RUNTIME_SLOTS_KEY];
+  if (isRuntimeSlots(existing)) return existing;
+  const created: RuntimeSlots = { live: new WeakMap() };
+  host[RUNTIME_SLOTS_KEY] = created;
+  return created;
+}
+
+/** The page this runtime draws on; Node hosts and bare test stubs have none. */
+function pageDocument(): Document | null {
+  return typeof globalThis.document === "undefined" ? null : globalThis.document;
+}
+
+/**
  * The object the loader factory returns; the shape mirrors the host half.
  *
  * Cordis calls apply(ctx, config): the context first, this plugin's config
@@ -63,6 +99,11 @@ export const clientPlugin = {
 
   apply(ctx: unknown, config?: JumpConfig): () => void {
     activeDispose?.();
+    const doc = pageDocument();
+    const slots = doc === null ? null : runtimeSlots();
+    // Whoever holds the page goes first, including a copy of this plugin that
+    // came from another module instance and knows nothing about activeDispose.
+    if (slots !== null && doc !== null) slots.live.get(doc)?.();
     const runtime = createRuntime({
       ctx: ctx as RuntimeContext,
       platform: platformOf(),
@@ -75,8 +116,12 @@ export const clientPlugin = {
       disposed = true;
       runtime.dispose();
       if (activeDispose === dispose) activeDispose = null;
+      // A runtime applied after this one may already hold the document; only
+      // the entry this dispose owns leaves the registry.
+      if (slots !== null && doc !== null && slots.live.get(doc) === dispose) slots.live.delete(doc);
     };
     activeDispose = dispose;
+    if (slots !== null && doc !== null) slots.live.set(doc, dispose);
     return dispose;
   },
 };

@@ -151,6 +151,18 @@ describe("recall", () => {
     expect(recallLabels(memory, [first, second], 1).size).toBe(0);
   });
 
+  it("uses the caller's key map instead of reading the element again", () => {
+    // 调用侧已经为这一轮算过键，召回必须用那份结果：元素自身的 data-row-key
+    // 是 real，按它查不到记忆。
+    const memory = createLabelMemory();
+    memory.record("ghost", "as");
+    const el = document.createElement("button");
+    el.setAttribute("data-row-key", "real");
+    const keys = new Map<Element, string>([[el, "ghost"]]);
+
+    expect([...recallLabels(memory, [el], 2, keys)]).toEqual([[el, "as"]]);
+  });
+
   it("never recalls a keyless element", () => {
     const memory = createLabelMemory();
     memory.record("", "a");

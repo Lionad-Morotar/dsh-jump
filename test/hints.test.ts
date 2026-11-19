@@ -8,7 +8,7 @@
 import { JSDOM } from "jsdom";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { collectHints } from "../src/client/hints.ts";
+import { collectHints, createHintScan, keysPerLabel } from "../src/client/hints.ts";
 import { createLabelMemory } from "../src/client/identity.ts";
 import { CANDIDATE_SELECTOR, HOME_ROW_KEYS } from "../src/client/config.ts";
 
@@ -246,6 +246,33 @@ describe("label memory across rounds", () => {
     expect(labelOf(second, intruder)).toBe("sd");
   });
 
+  it("computes one identity per candidate and reuses it for recall and record", () => {
+    const memory = createLabelMemory();
+    const els = keyed(10);
+    const asked: Element[] = [];
+    // 键故意与 DOM 无关：召回若绕过注入的取值自己重读元素，第二轮的记忆就找不回来。
+    const identity = (el: Element): string => {
+      asked.push(el);
+      const index = els.indexOf(el);
+      return index === -1 ? "" : "id-" + String(index);
+    };
+
+    collectHints(select(...els), VIEWPORT, { isVisible: visible, memory, identity });
+    expect(asked).toEqual(els);
+    // 写回也必须落在同一批键上：按元素自身键记录的话这里查不到。
+    expect(memory.lookup("id-4")).toBe("ah");
+    expect(memory.lookup("k4")).toBeUndefined();
+
+    const intruder = document.createElement("button");
+    place(intruder, 5, 0);
+    document.body.append(intruder);
+
+    asked.length = 0;
+    const second = collectHints(select(intruder, ...els), VIEWPORT, { isVisible: visible, memory, identity });
+    expect(asked).toHaveLength(els.length + 1);
+    expect(labelOf(second, els[4] as Element)).toBe("ah");
+  });
+
   it("refuses a two-key memory when this round is single-key", () => {
     const memory = createLabelMemory();
     const els = keyed(10);
@@ -369,5 +396,122 @@ describe("nesting dedupe over a busy page", () => {
     }
     const hints = collectHints(select(...els), VIEWPORT, { isVisible: visible });
     expect(hints).toHaveLength(600);
+  });
+});
+
+describe("分块采集", () => {
+  /** 一排按钮，按 DOM 顺序与视觉顺序相反摆放也能区分遍历顺序。 */
+  function grid(count: number): Element[] {
+    const els: Element[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const el = document.createElement("button");
+      place(el, (i % 30) * 12, Math.floor(i / 30) * 12);
+      document.body.append(el);
+      els.push(el);
+    }
+    return els;
+  }
+
+  /**
+   * 把一次扫描切到 `slices` 块跑完。
+   *
+   * `now` 每被读一次就走 1ms，预算因此按「时间」而不是按元素数停：块数不由
+   * 调用方硬编码，和真实调度器用同一套判据。
+   */
+  function chunkedLabels(els: Element[], slices: number): { labels: string[]; calls: number } {
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    let tick = 0;
+    let calls = 0;
+    const budget = slices === 1 ? Number.POSITIVE_INFINITY : (els.length * 2) / slices;
+    while (!scan.advance(budget, () => tick++)) calls += 1;
+    calls += 1;
+    return { labels: scan.finish().map((hint) => hint.label), calls };
+  }
+
+  it("分一块与分多块得到完全相同的标签序列", () => {
+    const els = grid(90);
+    const one = chunkedLabels(els, 1);
+    const five = chunkedLabels(els, 5);
+    expect(five.calls).toBeGreaterThan(2);
+    expect(five.labels).toEqual(one.labels);
+    expect(five.labels).toHaveLength(90);
+  });
+
+  it("82 个候选分块补齐后整轮仍是三键，不会停在两键", () => {
+    // 81 是两键容量的边界；分块中间态如果提前定长度，就会先发两键标签。
+    const els = grid(82);
+    const { labels } = chunkedLabels(els, 5);
+    expect(new Set(labels.map((label) => label.length))).toEqual(new Set([3]));
+    expect(new Set(labels).size).toBe(82);
+  });
+
+  it("阶段 A 的可见性遍历按视觉近似序（y 再 x），不是 DOM 序", () => {
+    // DOM 里先放右下、后放左上；廉价的 y/x 近似要先把左上送进可见性判定。
+    const bottom = document.createElement("button");
+    place(bottom, 200, 100);
+    const topRight = document.createElement("button");
+    place(topRight, 200, 0);
+    const topLeft = document.createElement("button");
+    place(topLeft, 0, 0);
+    document.body.append(bottom, topRight, topLeft);
+    const asked: Element[] = [];
+    const scan = createHintScan(select(bottom, topRight, topLeft), VIEWPORT, {
+      isVisible: (el) => {
+        asked.push(el);
+        return true;
+      },
+    });
+    scan.advance(Number.POSITIVE_INFINITY, () => 0);
+    expect(asked).toEqual([topLeft, topRight, bottom]);
+    expect(scan.finish().map((hint) => hint.element)).toEqual([topLeft, topRight, bottom]);
+  });
+
+  it("预算用尽时停在块边界，扫描进度可续", () => {
+    const els = grid(60);
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    let tick = 0;
+    const first = scan.advance(1, () => tick++);
+    expect(first).toBe(false);
+    expect(scan.scanned).toBeLessThan(els.length);
+    while (!scan.advance(1, () => tick++)) {
+      // 逐块推进直到阶段 A 完成。
+    }
+    expect(scan.scanned).toBe(els.length);
+    expect(scan.finish()).toHaveLength(60);
+  });
+});
+
+describe("渐进标签锁定", () => {
+  it("先锁定长度再逐批发放，已发标签在收尾后原样保留", () => {
+    const els = [...Array(7)].map((_, index) => {
+      const el = document.createElement("button");
+      place(el, index * 20, 0);
+      document.body.append(el);
+      return el;
+    });
+    let time = 0;
+    const now = (): number => {
+      time += 1;
+      return time;
+    };
+    const scan = createHintScan(select(...els), VIEWPORT, { isVisible: visible });
+    scan.lockLabelLength(3);
+    expect(scan.advance(2, now)).toBe(false);
+
+    const first = scan.harvest();
+    expect(first.added.length).toBeGreaterThan(0);
+    expect(first.added.every((hint) => hint.label.length === 3)).toBe(true);
+    const issued = new Map(first.added.map((hint) => [hint.element, hint.label]));
+
+    while (!scan.advance(2, now)) scan.harvest();
+    const all = scan.finish();
+    expect(all).toHaveLength(7);
+    for (const hint of all) {
+      if (issued.has(hint.element)) expect(hint.label).toBe(issued.get(hint.element));
+    }
+  });
+
+  it("锁定长度按候选总数取档，总数跨过容量就变长", () => {
+    expect([9, 10, 81, 82].map((count) => keysPerLabel(count))).toEqual([1, 2, 2, 3]);
   });
 });
