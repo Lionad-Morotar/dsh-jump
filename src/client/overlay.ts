@@ -44,19 +44,37 @@ export interface ProgressiveRender {
 }
 
 /**
- * Timer seam for the hit confirmation.
+ * Timer and frame seams for the hit confirmation.
  *
- * The confirmation outlives the round that produced it, so its 300ms cannot ride
- * on the frame clock: a frame callback would be cancelled with the round. Tests
- * supply a stepper so the box only disappears when the test says so.
+ * The confirmation outlives the round that produced it, so its timeline cannot
+ * ride on the round's frame clock: that clock is cancelled with the round. It
+ * counts its own frames instead, which is also what makes the hold exactly three
+ * callbacks at any refresh rate. Tests supply a stepper for both.
  */
 export interface ConfirmTimers {
-  setTimeout(run: () => void, ms: number): number;
-  clearTimeout(handle: number): void;
+  requestFrame(run: (time: number) => void): number;
+  cancelFrame(handle: number): void;
+  /** The clock the frame callbacks are stamped with. */
+  now(): number;
 }
 
-/** How long the confirmation box stays on screen. */
-export const CONFIRM_MS = 300;
+/**
+ * Fade-in length, in milliseconds.
+ *
+ * Long enough to read as a fade rather than a pop (a single frame at 60Hz is
+ * 16.7ms, so 48ms is about three frames), short enough that the receipt still
+ * lands while the reader is looking at where they clicked.
+ */
+export const CONFIRM_FADE_IN_MS = 48;
+/** Fade-out length; the slice fixes this one. */
+export const CONFIRM_FADE_MS = 120;
+/**
+ * How many animation frames the box stays fully lit.
+ *
+ * Counted in callbacks, not milliseconds: three frames is the same visual length
+ * on a 60Hz and a 145Hz display, which a millisecond constant would not be.
+ */
+const CONFIRM_HOLD_FRAMES = 3;
 
 export interface Overlay {
   /** Repaint the round; a pending prefix keeps its badges lit and dims the rest. */
@@ -129,8 +147,6 @@ const FALLBACK_FIRST_BATCH = 1000;
 
 /** The confirmation ring reuses the badge yellow, so it reads as the same UI. */
 const CONFIRM_COLOR = "#ffd60a";
-/** Fade-out only; the box appears instantly so the receipt is never delayed. */
-const CONFIRM_FADE_MS = 120;
 
 /**
  * How long an excluded badge takes to reach the dim alpha.
@@ -229,8 +245,9 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
         })();
   let surface: CanvasSurface | undefined;
   let round: Round | undefined;
-  let confirmation: { element: HTMLElement; handle: number } | undefined;
-  /** Timers of the live confirmation; the caller's seam wins over the host's. */
+  /** The live confirmation: its element and the frame callback driving it. */
+  let confirmation: { element: HTMLElement; handle: number | undefined } | undefined;
+  /** Timers and frames of the live confirmation; the caller's seam wins. */
   let confirmTimers: ConfirmTimers | undefined;
   /**
    * Badges currently fading out, keyed by the hint they belong to.
@@ -251,20 +268,21 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
   let fadeHandle: number | undefined;
 
   /**
-   * The host's timers, or a no-op pair where the document has no window.
+   * The host's frames, or no-ops where the document has no window.
    *
    * A detached document (jsdom without a window, a torn-down iframe) has no
-   * `setTimeout`; the confirmation then simply never schedules its own removal
-   * instead of throwing on the way out of a successful hit.
+   * `requestAnimationFrame`; the confirmation then simply never advances instead
+   * of throwing on the way out of a successful hit.
    */
   function hostTimers(): ConfirmTimers {
     const view = doc.defaultView;
-    if (view === null || typeof view.setTimeout !== "function") {
-      return { setTimeout: () => 0, clearTimeout: () => undefined };
+    if (view === null || typeof view.requestAnimationFrame !== "function") {
+      return { requestFrame: () => 0, cancelFrame: () => undefined, now: () => 0 };
     }
     return {
-      setTimeout: (run, ms) => view.setTimeout(run, ms) as unknown as number,
-      clearTimeout: (handle) => view.clearTimeout(handle),
+      requestFrame: (run) => view.requestAnimationFrame(run),
+      cancelFrame: (handle) => view.cancelAnimationFrame(handle),
+      now: () => view.performance?.now() ?? Date.now(),
     };
   }
 
@@ -285,12 +303,12 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
     }
   }
 
-  /** Take the live confirmation off the page and cancel its removal. */
+  /** Take the live confirmation off the page and stop its timeline. */
   function dropConfirmation(): void {
     if (confirmation === undefined) return;
     const { element, handle } = confirmation;
     confirmation = undefined;
-    (confirmTimers ?? hostTimers()).clearTimeout(handle);
+    if (handle !== undefined) (confirmTimers ?? hostTimers()).cancelFrame(handle);
     element.remove();
   }
 
@@ -644,14 +662,17 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
       // The box is a visual receipt for something that already happened; a
       // screen reader announcing it would replay the action it confirms.
       element.setAttribute("aria-hidden", "true");
-      const fade = motionAllowed();
+      // Opacity is written per frame rather than handed to a CSS transition:
+      // the hold has to be exactly three animation callbacks, and a transition
+      // would run on the compositor's clock where this code cannot count it.
+      const animate = motionAllowed();
       element.style.cssText =
         "position:fixed;box-sizing:border-box;pointer-events:none;" +
         "z-index:2147483647;border:2px solid " +
         CONFIRM_COLOR +
-        ";border-radius:3px;" +
-        (fade ? "transition:opacity " + String(CONFIRM_FADE_MS) + "ms ease-out;" : "") +
-        "left:" +
+        ";border-radius:3px;opacity:" +
+        (animate ? "0" : "1") +
+        ";left:" +
         String(rect.x) +
         "px;top:" +
         String(rect.y) +
@@ -661,14 +682,69 @@ export function createOverlay(deps: OverlayDeps = {}): Overlay {
         String(rect.h) +
         "px";
       doc.documentElement.append(element);
-      const handle = timers.setTimeout(() => {
-        // Only the live box may remove itself: a replaced confirmation must not
-        // be torn down early by the timer of the one it replaced.
-        if (confirmation?.element !== element) return;
-        confirmation = undefined;
-        element.remove();
-      }, CONFIRM_MS);
-      confirmation = { element, handle };
+      const live = { element, handle: undefined as number | undefined };
+      confirmation = live;
+
+      // Timeline: fade in, hold N frames, fade out, remove. Driven from one
+      // frame callback so a slow frame cannot skip the hold, and the loop stops
+      // itself once the box is gone.
+      let phase: "in" | "hold" | "out" = animate ? "in" : "hold";
+      // The fade-in is anchored at the moment the box was created, not at the
+      // first callback: the reader already sees the box in that frame, so the
+      // animation has started whether or not a frame has landed yet.
+      let phaseStarted = timers.now();
+      // The fade-in completion frame is the first held frame, which is what
+      // makes the hold exactly three callbacks instead of four.
+      let heldFrames = 0;
+      let lastTime = phaseStarted;
+
+      const tick = (time: number): void => {
+        // A replaced or cleared confirmation must not keep painting.
+        if (confirmation !== live) return;
+
+        if (phase === "in") {
+          const progress = Math.min(1, (time - phaseStarted) / CONFIRM_FADE_IN_MS);
+          element.style.opacity = String(progress);
+          if (progress >= 1) {
+            phase = "hold";
+            // The frame that completes the fade-in is the first held frame, so
+            // the hold covers exactly CONFIRM_HOLD_FRAMES callbacks in total.
+            heldFrames = 1;
+          }
+        } else if (phase === "hold") {
+          if (heldFrames >= CONFIRM_HOLD_FRAMES) {
+            // Anchored at the last held frame, which is the last moment the box
+            // was drawn at full opacity.
+            phaseStarted = lastTime;
+            if (!animate) {
+              // Reduced motion: no fade-out either, the box just goes.
+              confirmation = undefined;
+              element.remove();
+              return;
+            }
+            phase = "out";
+            // Fall through so this very callback is already descending instead
+            // of spending one more frame at full opacity.
+          } else {
+            heldFrames += 1;
+            element.style.opacity = "1";
+          }
+        }
+
+        if (phase === "out") {
+          const progress = Math.min(1, (time - phaseStarted) / CONFIRM_FADE_MS);
+          element.style.opacity = String(1 - progress);
+          if (progress >= 1) {
+            confirmation = undefined;
+            element.remove();
+            return;
+          }
+        }
+        lastTime = time;
+        live.handle = timers.requestFrame(tick);
+      };
+
+      live.handle = timers.requestFrame(tick);
     },
     clearConfirm(): void {
       dropConfirmation();

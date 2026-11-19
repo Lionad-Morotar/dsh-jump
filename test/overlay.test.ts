@@ -13,7 +13,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { generateLabels, type Hint } from "../src/client/hints.ts";
 import { BADGE_HEIGHT, BADGE_WIDTH, badgeOrigin } from "../src/client/overlay-canvas.ts";
-import { createOverlay, SYNC_PAINT_LIMIT, type FrameClock, type Overlay } from "../src/client/overlay.ts";
+import {
+  CONFIRM_FADE_IN_MS,
+  CONFIRM_FADE_MS,
+  createOverlay,
+  SYNC_PAINT_LIMIT,
+  type ConfirmTimers,
+  type FrameClock,
+  type Overlay,
+} from "../src/client/overlay.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://127.0.0.1/" });
 const { document } = dom.window;
@@ -57,39 +65,10 @@ interface RecordedText {
   readonly alpha: number;
 }
 
-/** 一次描边的快照：颜色、线宽，以及这条路径上攒下的矩形。 */
-interface RecordedOutline {
-  readonly stroke: string;
-  readonly lineWidth: number;
-  readonly rects: readonly { readonly x: number; readonly y: number; readonly w: number; readonly h: number }[];
-}
-
-/** `rgba(...)` 的透明度；`#rrggbb` 这类不透明写法算 1。 */
-function alphaOf(color: string): number {
-  const parts = color.match(/^rgba?\(([^)]+)\)$/);
-  if (parts === null) return 1;
-  const fields = (parts[1] ?? "").split(",").map((field) => field.trim());
-  return fields.length < 4 ? 1 : Number(fields[3]);
-}
-
-/** 描边是否圈住了元素本体：不要求逐像素相等，只要求覆盖它的盒子。 */
-function covers(
-  outline: { x: number; y: number; w: number; h: number },
-  rect: { x: number; y: number; w: number; h: number },
-): boolean {
-  return (
-    outline.x <= rect.x &&
-    outline.y <= rect.y &&
-    outline.x + outline.w >= rect.x + rect.w &&
-    outline.y + outline.h >= rect.y + rect.h
-  );
-}
-
 interface Recorder {
   readonly context: CanvasRenderingContext2D;
   readonly ops: DrawOp[];
   texts(): RecordedText[];
-  outlines(): RecordedOutline[];
   clears(): number;
 }
 
@@ -190,26 +169,6 @@ function recorder(): Recorder {
           weight: op.font.split(" ")[0] ?? "",
           alpha: op.alpha,
         })),
-    outlines: () => {
-      const found: RecordedOutline[] = [];
-      let path: { x: number; y: number; w: number; h: number }[] = [];
-      for (const op of ops) {
-        if (op.kind === "beginPath") {
-          path = [];
-          continue;
-        }
-        if (op.kind === "rect") {
-          const [x, y, w, h] = op.args as number[];
-          path.push({ x: x ?? 0, y: y ?? 0, w: w ?? 0, h: h ?? 0 });
-          continue;
-        }
-        if (op.kind === "stroke") {
-          found.push({ stroke: op.stroke, lineWidth: op.lineWidth, rects: path });
-          path = [];
-        }
-      }
-      return found;
-    },
     clears: () => ops.filter((op) => op.kind === "clearRect").length,
   };
 }
@@ -709,123 +668,55 @@ describe("appending a later batch", () => {
 });
 
 /**
- * 目标本体描边。
+ * 页面上不该有默认边框。
  *
- * 徽章只说明「有个标签」，不说明标签属于哪个元素：一屏 155 枚徽章时，用户得靠
- * 位置猜。描边把「这个元素能被跳到」直接画在元素身上，并随前缀分成淡/重两档。
- * 断言落在绘制调用上（画在哪、多粗、什么透明度），因为 jsdom 没有像素。
+ * 曾经给每个候选画过淡描边、给命中前缀的换黄色加重，用户否掉了这个设计：
+ * 任何时候都不该有默认边框，敲到一半（abc 匹配到 ab）也不算激活。所以这里
+ * 断言的是「一次绘制里没有任何 stroke 调用」，而不是某种描边的样子。
  */
-describe("target outline", () => {
-  /**
-   * 一次绘制里每个元素拿到的描边。
-   *
-   * 按矩形归并而不是按 stroke 调用归并：一次 stroke 画几个矩形是绘制层的实现
-   * 自由，用户看到的只是「这个元素上有一圈线」。
-   */
-  function ringsOf(recorded: Recorder, hints: readonly Hint[]): Map<Hint, RecordedOutline> {
-    const rings = new Map<Hint, RecordedOutline>();
-    for (const outline of recorded.outlines()) {
-      for (const hint of hints) {
-        if (rings.has(hint)) continue;
-        if (outline.rects.some((rect) => covers(rect, hint.rect))) rings.set(hint, outline);
-      }
-    }
-    return rings;
+describe("no default border", () => {
+  /** 一次绘制里所有 stroke 调用；用户看到的任何边框都必须经过它。 */
+  function strokes(recorded: Recorder): number {
+    return recorded.ops.filter((op) => op.kind === "stroke").length;
   }
 
-  function ringOf(recorded: Recorder, hint: Hint): RecordedOutline | undefined {
-    return ringsOf(recorded, [hint]).get(hint);
-  }
-
-  it("rings every candidate at its own rect on activation", () => {
+  it("draws no border for a fresh round", () => {
     const { overlay, recorder: recorded } = mount();
-    const hints = hintsOf(["as", "sd", "fj"]);
-    overlay.render(hints);
-
-    const rings = ringsOf(recorded, hints);
-    // 没有前缀时全部候选都是淡描边，没有一个算「当前匹配」。
-    expect(rings.size).toBe(hints.length);
-    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
+    overlay.render(hintsOf(["as", "sd", "fj"]));
+    expect(recorded.texts().length).toBeGreaterThan(0);
+    // 徽章照画，边框一个都不许有。
+    expect(strokes(recorded)).toBe(0);
   });
 
-  it("draws the ring on the element, not on the badge", () => {
-    const { overlay, recorder: recorded } = mount();
-    // 元素在 (400,300) 且远大于徽章；描边必须跟着元素走。
-    const hint: Hint = {
-      element: document.createElement("button"),
-      label: "as",
-      rect: { x: 400, y: 300, w: 120, h: 40 },
-    };
-    overlay.render([hint]);
-
-    const ring = ringOf(recorded, hint);
-    expect(ring).toBeDefined();
-    const rect = ring!.rects.find((candidate) => covers(candidate, hint.rect));
-    expect(rect).toBeDefined();
-    // 24x16 的徽章盒子盖不住 120x40 的元素，所以这条断言能区分描边与徽章。
-    expect(rect!.w).toBeGreaterThanOrEqual(hint.rect.w);
-    expect(rect!.h).toBeGreaterThanOrEqual(hint.rect.h);
-  });
-
-  it("thickens the matching rings and drops the rest back to faint", () => {
+  it("draws no border after a prefix narrows the round", () => {
     const { overlay, recorder: recorded } = mount();
     const hints = hintsOf(["as", "sd"]);
     overlay.render(hints);
-    const faint = ringOf(recorded, hints[0]!);
-    expect(faint).toBeDefined();
-    const mark = recorded.outlines().length;
-
     overlay.render(hints, "a");
-
-    // 只看这一笔新画的描边：as 还匹配，sd 被前缀排除。
-    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
-    const matching = ringOf(stroke, hints[0]!);
-    const excluded = ringOf(stroke, hints[1]!);
-    expect(matching).toBeDefined();
-    expect(excluded).toBeDefined();
-    expect(alphaOf(matching!.stroke)).toBeGreaterThan(alphaOf(excluded!.stroke));
-    expect(matching!.lineWidth).toBeGreaterThan(excluded!.lineWidth);
-    expect(matching!.lineWidth).toBeGreaterThan(faint!.lineWidth);
+    // abc 匹配到 ab 这类半截前缀同样不算激活，什么都不该出现。
+    expect(strokes(recorded)).toBe(0);
   });
 
-  it("returns an excluded ring to faint when the prefix is cleared", () => {
-    const { overlay, recorder: recorded } = mount();
-    const hints = hintsOf(["as", "sd"]);
-    overlay.render(hints, "a");
-    const mark = recorded.outlines().length;
-
-    overlay.render(hints, "");
-
-    // 死键回退：两枚都回到淡描边，没有一枚还留在重档。
-    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
-    const rings = ringsOf(stroke, hints);
-    expect(rings.size).toBe(hints.length);
-    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
-  });
-
-  it("paints the ring for a batch appended mid-round", () => {
+  it("draws no border for a batch appended mid-round", () => {
     const { overlay, recorder: recorded } = mount();
     overlay.append(hintsOf(["a", "s"]));
-    const mark = recorded.outlines().length;
-    const batch = hintsOf(["d", "f"]);
-    overlay.append(batch);
-
-    // 慢路径只补画新增的一批，但新增的那几个同样要带上描边。
-    const stroke: Recorder = { ...recorded, outlines: () => recorded.outlines().slice(mark) };
-    const rings = ringsOf(stroke, batch);
-    expect(rings.size).toBe(batch.length);
-    for (const ring of rings.values()) expect(alphaOf(ring.stroke)).toBeLessThan(1);
+    overlay.append(hintsOf(["d", "f"]));
+    expect(strokes(recorded)).toBe(0);
   });
 
-  it("leaves no ring behind after destroy", () => {
-    const { overlay } = mount();
-    overlay.render(hintsOf(["as"]));
-    overlay.destroy();
-    // 描边与徽章同在一张 canvas 上，canvas 走了描边就跟着走。
-    expect(overlayCanvas()).toBeNull();
+  it("draws no border during the exclusion fade", () => {
+    const clock = frameClock();
+    const { overlay, recorder: recorded } = mount({ clock });
+    const hints = hintsOf(["as", "sd"]);
+    overlay.render(hints);
+    overlay.render(hints, "a");
+    clock.step(40);
+    clock.step(40);
+    // 淡出只改徽章的透明度，不该顺手画回一圈边框。
+    expect(strokes(recorded)).toBe(0);
   });
 
-  it("does not touch the host element's class or style", () => {
+  it("still leaves the host element's class and style alone", () => {
     const { overlay } = mount();
     const element = document.createElement("button");
     element.className = "host-button primary";
@@ -837,47 +728,58 @@ describe("target outline", () => {
     overlay.render([hint], "a");
     overlay.destroy();
 
-    // 描边画在 canvas 上，宿主元素必须一个字节都没动。
+    // 边框没了，但「不污染宿主」这条契约还在。
     expect(element.className).toBe(before.className);
     expect(element.getAttribute("style")).toBe(before.style);
   });
 });
 
 /**
- * 命中确认框。
+ * 命中确认框：渐入、全亮保持 3 帧、120ms 淡出。
  *
- * 敲完标签后浮层整轮消失，用户看不到刚才打中了哪个元素。确认框在动作派发之后
- * 才出现，只负责「刚才那一下落在哪」，所以它必须是独立元素而不是画在 canvas 上：
- * 画布随轮销毁，而确认要活过这一轮。
+ * 敲完标签浮层整轮消失，用户看不到刚才打中了哪个元素。确认框补上这个回执，
+ * 但它只属于「整个标签打完」那一刻：前缀匹配、敲到一半都不算激活，什么都不该
+ * 出现。时间线用 rAF 数帧而不是毫秒常数，这样 60Hz 和 145Hz 上是同一个视觉
+ * 长度。
  *
- * 断言落在 DOM 形态与几何上：位置、不吃事件、到点消失、不叠。
+ * 断言落在 DOM 形态与 opacity 序列上：jsdom 没有合成器，所以这里读的是绘制层
+ * 每帧写进 style 的值，而不是像素。
  */
 describe("hit confirmation", () => {
   const CONFIRM = "[data-dsh-jump-confirm]";
 
-  /** 手动推进的定时器：jsdom 里没有真实时钟，300ms 只在测试说走时走。 */
-  function fakeTimers(): { setTimeout: (run: () => void, ms: number) => number; clearTimeout: (handle: number) => void; advance(ms: number): void; pending(): number } {
+  /**
+   * 手动推进的帧与定时器。
+   *
+   * jsdom 既没有真实帧也没有真实时钟，确认框的每个阶段都必须由测试说走才走。
+   */
+  function fakeTimers(): ConfirmTimers & {
+    step(ms: number): void;
+    frames(n: number): void;
+  } {
     let nextHandle = 1;
-    const queued = new Map<number, { run: () => void; at: number }>();
     let now = 0;
+    const frames = new Map<number, (time: number) => void>();
     return {
-      setTimeout: (run, ms) => {
+      requestFrame: (run) => {
         const handle = nextHandle++;
-        queued.set(handle, { run, at: now + ms });
+        frames.set(handle, run);
         return handle;
       },
-      clearTimeout: (handle) => {
-        queued.delete(handle);
+      cancelFrame: (handle) => {
+        frames.delete(handle);
       },
-      advance: (ms) => {
+      now: () => now,
+      step: (ms) => {
         now += ms;
-        for (const [handle, entry] of [...queued]) {
-          if (entry.at > now) continue;
-          queued.delete(handle);
-          entry.run();
+      },
+      frames: (n) => {
+        for (let i = 0; i < n; i += 1) {
+          const due = [...frames.entries()];
+          frames.clear();
+          for (const [, run] of due) run(now);
         }
       },
-      pending: () => queued.size,
     };
   }
 
@@ -885,24 +787,80 @@ describe("hit confirmation", () => {
     return document.querySelector<HTMLElement>(CONFIRM);
   }
 
-  it("shows a box over the target and removes it after the duration", () => {
+  function opacityOf(): number {
+    const raw = confirmOf()?.style.opacity ?? "";
+    return raw === "" ? 1 : Number(raw);
+  }
+
+  it("fades in from transparent instead of popping", () => {
     const { overlay } = mount();
     const timers = fakeTimers();
-    const rect = { x: 120, y: 80, w: 60, h: 24 };
+    overlay.confirm({ x: 120, y: 80, w: 60, h: 24 }, { timers });
 
-    overlay.confirm(rect, { timers });
     const box = confirmOf();
     expect(box).not.toBeNull();
     // 框要落在目标上，而不是页角。
-    expect(box?.style.left).toBe(String(rect.x) + "px");
-    expect(box?.style.top).toBe(String(rect.y) + "px");
-    expect(box?.style.width).toBe(String(rect.w) + "px");
-    expect(box?.style.height).toBe(String(rect.h) + "px");
+    expect(box?.style.left).toBe("120px");
+    expect(box?.style.top).toBe("80px");
+    expect(box?.style.width).toBe("60px");
+    expect(box?.style.height).toBe("24px");
+    // 第一帧是透明的：渐入的起点，不是弹出。
+    expect(opacityOf()).toBe(0);
 
-    // 300ms 前还在，到点就没了。
-    timers.advance(299);
-    expect(confirmOf()).not.toBeNull();
-    timers.advance(1);
+    // 渐入中途有中间值。
+    timers.step(CONFIRM_FADE_IN_MS / 2);
+    timers.frames(1);
+    const mid = opacityOf();
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+  });
+
+  it("holds full opacity for exactly three frames, then starts fading", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+
+    // 走完渐入，落到全亮。
+    timers.step(CONFIRM_FADE_IN_MS);
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+
+    // 全亮保持 3 个回调：第 3 个之后仍然是 1。
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+    timers.frames(1);
+    expect(opacityOf()).toBe(1);
+
+    // 第 4 个回调开始下降。
+    timers.step(CONFIRM_FADE_MS / 2);
+    timers.frames(1);
+    const falling = opacityOf();
+    expect(falling).toBeLessThan(1);
+    expect(falling).toBeGreaterThan(0);
+  });
+
+  it("fades out over 120ms and then removes the box", () => {
+    const { overlay } = mount();
+    const timers = fakeTimers();
+    overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
+
+    // 渐入走完，再数 3 个保持帧，第 4 个回调已经在下落。
+    timers.step(CONFIRM_FADE_IN_MS);
+    timers.frames(1);
+    timers.frames(3);
+    expect(opacityOf()).toBe(1);
+    timers.step(CONFIRM_FADE_MS / 2);
+    timers.frames(1);
+
+    // 淡出中途有中间值。
+    const mid = opacityOf();
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+
+    // 走完 120ms 就归零并当场移除：用户看到的最后一帧是淡出，不是一块停在
+    // 0 透明度的空盒子。
+    timers.step(CONFIRM_FADE_MS);
+    timers.frames(1);
     expect(confirmOf()).toBeNull();
   });
 
@@ -933,9 +891,9 @@ describe("hit confirmation", () => {
 
     expect(document.querySelectorAll(CONFIRM)).toHaveLength(1);
     expect(confirmOf()?.style.left).toBe("40px");
-    // 旧的那条定时器不能把新框提前收走。
-    timers.advance(300);
-    expect(confirmOf()).toBeNull();
+    // 旧框的帧循环不能把新框提前收走。
+    timers.frames(40);
+    expect(confirmOf()).not.toBeNull();
   });
 
   it("clears on demand, for Esc and for a new round", () => {
@@ -944,12 +902,12 @@ describe("hit confirmation", () => {
     overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
     overlay.clearConfirm();
     expect(confirmOf()).toBeNull();
-    // 清掉之后排队的那一枪不能再打一次。
-    timers.advance(300);
+    // 清掉之后排队的那一帧不能再画一次。
+    timers.frames(10);
     expect(confirmOf()).toBeNull();
   });
 
-  it("drops the transition when the reader asked for reduced motion", () => {
+  it("skips both transitions under reduced motion but still holds three frames", () => {
     const { overlay } = mount();
     const timers = fakeTimers();
     const original = dom.window.matchMedia;
@@ -961,26 +919,21 @@ describe("hit confirmation", () => {
     });
     try {
       overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
-      // 减少动态偏好下不做过渡：框直接出现，到点直接消失。
+      // 减少动态偏好下没有渐入：第一帧就是全亮。
+      expect(opacityOf()).toBe(1);
       expect(confirmOf()?.style.transition).toBe("");
-    } finally {
-      (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
-    }
-  });
 
-  it("keeps the transition when motion is allowed", () => {
-    const { overlay } = mount();
-    const timers = fakeTimers();
-    const original = dom.window.matchMedia;
-    (dom.window as unknown as Record<string, unknown>)["matchMedia"] = (query: string) => ({
-      matches: false,
-      media: query,
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-    });
-    try {
-      overlay.confirm({ x: 10, y: 10, w: 20, h: 20 }, { timers });
-      expect(confirmOf()?.style.transition).toContain("opacity");
+      // 保持同样的 3 帧：第 1、2、3 个回调都是全亮。
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+      timers.frames(1);
+      expect(opacityOf()).toBe(1);
+
+      // 第 4 个回调直接消失，没有淡出中间态。
+      timers.frames(1);
+      expect(confirmOf()).toBeNull();
     } finally {
       (dom.window as unknown as Record<string, unknown>)["matchMedia"] = original;
     }

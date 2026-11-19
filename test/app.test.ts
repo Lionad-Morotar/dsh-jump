@@ -9,7 +9,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp, type JumpApp, type JumpWindow } from "../src/client/app.ts";
-import type { FrameClock } from "../src/client/overlay.ts";
+import { CONFIRM_FADE_IN_MS, CONFIRM_FADE_MS, type ConfirmTimers, type FrameClock } from "../src/client/overlay.ts";
 import { generateLabels } from "../src/client/hints.ts";
 import { createDefaultBindings, type JumpBindings } from "../src/client/bindings.ts";
 
@@ -159,6 +159,9 @@ beforeEach(() => {
   // 浮层挂在 documentElement 上，body 清空带不走它；上一轮漏下的容器会让
   // overlayRoot() 找到错误的节点。
   doc.querySelector("[data-dsh-jump-overlay]")?.remove();
+  // 确认框同样挂在 documentElement 上，且活过它那一轮；漏下的框会让下一个
+  // 用例读到上一个用例的回执。
+  doc.querySelectorAll("[data-dsh-jump-confirm]").forEach((stale) => stale.remove());
   canvasOps = [];
   (doc.activeElement as HTMLElement | null)?.blur?.();
 });
@@ -2144,7 +2147,7 @@ describe("条件回退：快路径、慢路径与硬上限", () => {
 });
 
 /**
- * 命中确认：动作先派发，确认后出现。
+ * 命中确认：动作先派发，确认后出现，且只在整个标签打完时出现。
  *
  * 用户敲完标签后浮层整轮消失，看不到刚才打中了哪个元素。确认框补上这个回执，
  * 但它绝不能挡在动作前面：先点，再报。这里用调用顺序断言，不用时间戳，因为
@@ -2157,30 +2160,29 @@ describe("hit confirmation", () => {
     return doc.querySelector(CONFIRM);
   }
 
-  /** 手动推进的定时器，让 300ms 只在测试说走时走。 */
-  function fakeTimers(): {
-    setTimeout: (run: () => void, ms: number) => number;
-    clearTimeout: (handle: number) => void;
-    advance(ms: number): void;
-  } {
+  /** 手动推进的帧与定时器，让确认框的每个阶段只在测试说走时走。 */
+  function fakeTimers(): ConfirmTimers & { frames(n: number): void; step(ms: number): void } {
     let nextHandle = 1;
-    const queued = new Map<number, { run: () => void; at: number }>();
     let now = 0;
+    const frames = new Map<number, (time: number) => void>();
     return {
-      setTimeout: (run, ms) => {
+      requestFrame: (run) => {
         const handle = nextHandle++;
-        queued.set(handle, { run, at: now + ms });
+        frames.set(handle, run);
         return handle;
       },
-      clearTimeout: (handle) => {
-        queued.delete(handle);
+      cancelFrame: (handle) => {
+        frames.delete(handle);
       },
-      advance: (ms) => {
+      now: () => now,
+      step: (ms) => {
         now += ms;
-        for (const [handle, entry] of [...queued]) {
-          if (entry.at > now) continue;
-          queued.delete(handle);
-          entry.run();
+      },
+      frames: (n) => {
+        for (let i = 0; i < n; i += 1) {
+          const due = [...frames.entries()];
+          frames.clear();
+          for (const [, run] of due) run(now);
         }
       },
     };
@@ -2208,6 +2210,30 @@ describe("hit confirmation", () => {
     teardown();
   });
 
+  it("shows nothing while the label is only half typed", () => {
+    const els = buttons(12);
+    const timers = fakeTimers();
+    const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
+    activate();
+
+    // 两键轮里敲第一个键只是前缀匹配，不是激活。
+    win.dispatchEvent(keydown({ key: "a" }));
+    expect(confirmOf()).toBeNull();
+    timers.frames(4);
+    expect(confirmOf()).toBeNull();
+
+    // 敲一个不存在的键把前缀清掉，同样不该出现。
+    win.dispatchEvent(keydown({ key: "z" }));
+    expect(confirmOf()).toBeNull();
+
+    // 只有把整个标签打完才出现。
+    win.dispatchEvent(keydown({ key: "a" }));
+    win.dispatchEvent(keydown({ key: "d" }));
+    expect(confirmOf()).not.toBeNull();
+    expect(els.length).toBeGreaterThan(0);
+    teardown();
+  });
+
   it("places the box on the target that was hit", () => {
     const els = buttons(12);
     const timers = fakeTimers();
@@ -2225,7 +2251,7 @@ describe("hit confirmation", () => {
     teardown();
   });
 
-  it("removes the box after the duration", () => {
+  it("removes the box once the timeline finishes", () => {
     buttons(12);
     const timers = fakeTimers();
     const teardown = createApp({ window: win, isVisible: () => true, confirmTimers: timers }).apply();
@@ -2234,7 +2260,11 @@ describe("hit confirmation", () => {
     win.dispatchEvent(keydown({ key: "d" }));
     expect(confirmOf()).not.toBeNull();
 
-    timers.advance(300);
+    // 渐入、3 帧保持、120ms 淡出，走完就没了。
+    timers.step(CONFIRM_FADE_IN_MS);
+    timers.frames(4);
+    timers.step(CONFIRM_FADE_MS);
+    timers.frames(2);
     expect(confirmOf()).toBeNull();
     teardown();
   });
@@ -2248,7 +2278,7 @@ describe("hit confirmation", () => {
     win.dispatchEvent(keydown({ key: "d" }));
     expect(confirmOf()).not.toBeNull();
 
-    // 300ms 内重新激活：旧确认立刻清掉，不能叠成两个。
+    // 窗口内重新激活：旧确认立刻清掉，不能叠成两个。
     activate();
     expect(doc.querySelectorAll(CONFIRM)).toHaveLength(0);
     teardown();

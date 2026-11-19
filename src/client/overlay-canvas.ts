@@ -1,7 +1,7 @@
 /**
- * Canvas painting for one label round: target outlines, badge geometry, text
- * segmentation and the draw calls. Everything here is a pure function of
- * (hints, prefix, viewport), so the overlay above only owns when to paint.
+ * Canvas painting for one label round: badge geometry, text segmentation and the
+ * draw calls. Everything here is a pure function of (hints, prefix, viewport),
+ * so the overlay above only owns when to paint.
  *
  * The badge contract is the one the DOM badges shipped: a 24x16 box with a 3px
  * radius, the Vimium yellow fill, black 11px monospace text, 1px/3px padding,
@@ -11,10 +11,9 @@
  * style read now would be a new dependency on the host's token names, not a
  * port of the existing look.
  *
- * The outline is drawn on this same canvas rather than on the targets: a
- * `className` or inline style on the host element would outlive the round and
- * fight the page's own state, and one repaint then has to cover both layers
- * anyway.
+ * Nothing here strokes. A target gets no default border: the badges are the only
+ * thing this layer draws, and a border on every candidate turned a page of 155
+ * targets into a wall of rectangles.
  */
 import type { Hint, HintRect } from "./hints.ts";
 
@@ -46,33 +45,6 @@ export const DIM_ALPHA = 0.3;
  * look, which is what a host with no frames gets.
  */
 export type BadgeAlpha = (hint: Hint, matched: boolean) => number;
-
-/**
- * Target outline, in two tiers.
- *
- * The faint ring has to survive 155 of them at once without becoming a wall, so
- * it is a neutral grey at low alpha: neutral because the host page may be light
- * or dark and the ring has to read on both, and low because the ring is
- * background information, not the thing being read. The matching ring reuses
- * the badge yellow, which is what makes "this one still counts" legible at a
- * glance, and doubles the width so the difference survives at badge scale.
- */
-const OUTLINE_FAINT = "rgba(128,128,136,0.45)";
-const OUTLINE_FAINT_WIDTH = 1;
-const OUTLINE_STRONG = BADGE_FILL;
-const OUTLINE_STRONG_WIDTH = 2;
-
-/**
- * Whether the live prefix narrows this label down to a current match.
- *
- * Deliberately not the badge's rule. An empty prefix matches every label as a
- * string, which is right for badge dimming (nothing is ruled out yet, so
- * everything stays lit) but wrong for the outline: it would put all 155 targets
- * in the strong tier and leave the reader no way to see how many remain.
- */
-function narrowsTo(label: string, pending: string): boolean {
-  return pending !== "" && label.startsWith(pending);
-}
 
 export interface BadgeOrigin {
   readonly x: number;
@@ -248,59 +220,6 @@ export function createCanvasSurface(
     ctx.restore();
   }
 
-  /**
-   * Stroke one tier of outlines as a single path.
-   *
-   * One `stroke()` for the whole tier, not one per target: 155 candidates would
-   * otherwise be 155 raster calls per repaint, and every prefix stroke repaints
-   * the round. The path is offset outward by half the line width so the ring
-   * sits against the element's edge instead of covering its content.
-   */
-  function strokeRing(
-    ctx: CanvasRenderingContext2D,
-    rects: readonly HintRect[],
-    color: string,
-    width: number,
-  ): void {
-    if (rects.length === 0) return;
-    const half = width / 2;
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    for (const rect of rects) {
-      ctx.rect(rect.x - half, rect.y - half, rect.w + width, rect.h + width);
-    }
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  /**
-   * Ring every painted target, faint unless the live prefix still reaches it.
-   *
-   * The two tiers are collected first and stroked after, so a repaint costs two
-   * raster calls no matter how the round splits between them.
-   */
-  function paintOutlines(
-    ctx: CanvasRenderingContext2D,
-    hints: readonly Hint[],
-    pending: string,
-    from: number,
-    to: number,
-  ): void {
-    const faint: HintRect[] = [];
-    const strong: HintRect[] = [];
-    for (let index = from; index < to; index += 1) {
-      const hint = hints[index];
-      if (hint === undefined) break;
-      // A zero-area rect has no edge to stroke and would draw a dot.
-      if (hint.rect.w <= 0 || hint.rect.h <= 0) continue;
-      (narrowsTo(hint.label, pending) ? strong : faint).push(hint.rect);
-    }
-    strokeRing(ctx, faint, OUTLINE_FAINT, OUTLINE_FAINT_WIDTH);
-    strokeRing(ctx, strong, OUTLINE_STRONG, OUTLINE_STRONG_WIDTH);
-  }
-
   function drawRange(
     ctx: CanvasRenderingContext2D,
     hints: readonly Hint[],
@@ -311,9 +230,6 @@ export function createCanvasSurface(
     alpha?: BadgeAlpha,
   ): void {
     ctx.textBaseline = "middle";
-    // Outlines first: a badge sits on the target's corner and has to stay
-    // readable over the ring it belongs to.
-    paintOutlines(ctx, hints, pending, from, to);
     for (let index = from; index < to; index += 1) {
       const hint = hints[index];
       if (hint === undefined) break;
