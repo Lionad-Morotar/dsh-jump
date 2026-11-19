@@ -58,14 +58,6 @@ export interface AppDeps {
   /** Visibility oracle injected by tests; browsers get the default below. */
   isVisible?: (element: Element) => boolean;
   /**
-   * Told when a label round opens and when it closes.
-   *
-   * The page cannot change the system input source itself. The runtime turns
-   * these two moments into a request the host process can act on. Absent in
-   * tests that do not care, and a no-op must not change navigation.
-   */
-  onRound?: (phase: "begin" | "end") => void;
-  /**
    * What reference mode does with the picked element.
    *
    * Injected rather than imported so the DOM layer stays free of the composer:
@@ -623,7 +615,6 @@ export function createApp(deps: AppDeps = {}): JumpApp {
   // A caller without a store gets one fixed pair for this app's lifetime.
   const fixed = createDefaultBindings(platform);
   const bindings: BindingSource = deps.bindings ?? { get: () => fixed };
-  const onRound = deps.onRound ?? (() => undefined);
   // One table for the page load: it is what lets a label stay on its element
   // across activations, and it dies with the module instance, so a reload
   // starts clean.
@@ -692,7 +683,6 @@ export function createApp(deps: AppDeps = {}): JumpApp {
     apply(): () => void {
       const state = createKeyState();
       let hints: Hint[] = [];
-      let roundOpen = false;
       const collectClock = deps.frameClock ?? defaultFrameClock(win.document);
       const injectedBudget = injectedFrameBudget(deps.frameBudgetMs);
       const publishedBudget = publishedFrameBudget();
@@ -1037,20 +1027,6 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         return hints;
       }
 
-      const openRound = (): void => {
-        if (roundOpen) return;
-        roundOpen = true;
-        // A round starting inside the confirmation window replaces the receipt:
-        // two boxes on screen would point at two different targets.
-        overlay.clearConfirm();
-        onRound("begin");
-      };
-      const closeRound = (): void => {
-        if (!roundOpen) return;
-        roundOpen = false;
-        onRound("end");
-      };
-
       /**
        * End the round on a completed label and act on its target.
        *
@@ -1063,7 +1039,6 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         hints = [];
         cancelCollection();
         overlay.destroy();
-        closeRound();
         const mode = state.mode;
         state.mode = "idle";
         if (hit === undefined) return;
@@ -1205,7 +1180,9 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           action.type === "activate-focus" ||
           action.type === "activate-reference"
         ) {
-          openRound();
+          // A round starting inside the confirmation window replaces the
+          // receipt: two boxes would point at two different targets.
+          overlay.clearConfirm();
           hints = collectRound();
           return;
         }
@@ -1213,7 +1190,6 @@ export function createApp(deps: AppDeps = {}): JumpApp {
           hints = [];
           cancelCollection();
           overlay.destroy();
-          closeRound();
           return;
         }
         if (state.pending !== "") {
@@ -1227,18 +1203,17 @@ export function createApp(deps: AppDeps = {}): JumpApp {
         completeLabel(before + action.key);
       };
 
-      /** Drop the live round and give the input source back. */
+      /** Drop the live round and take its badges and receipt off the page. */
       function endRound(): void {
         hints = [];
         cancelCollection();
         overlay.destroy();
         state.mode = "idle";
         state.pending = "";
-        closeRound();
       }
 
-      // 切到别的应用时这一轮不再有人敲标签，但输入法是全系统的，英文会跟过去。
-      // 隐藏即结束，比等一分钟的兜底更早把输入源还回去。
+      // 页面隐藏后 keydown 不再到达，残留的模式与 overlay 会在回到页面后
+      // 把下一击当成标签补完，所以隐藏即清场。
       const onVisibility = (): void => {
         if (win.document.visibilityState === "hidden") {
           endRound();
